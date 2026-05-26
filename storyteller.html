@@ -8721,24 +8721,6 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
   // Emit ONE step per matching seat (so dual-FT etc. both show).
   const steps = [];
   let stepNum = 0;
-  // Scarlet Woman: if conditions are met at the start of any non-first night,
-  // synthesize a promotion step before the normal order. After the ST confirms
-  // promotion, SW's role changes and detectScarletWomanPromotion returns null
-  // on subsequent renders so the step disappears.
-  if (!isFirstNight) {
-    const sw = detectScarletWomanPromotion(seats);
-    if (sw) {
-      stepNum += 1;
-      steps.push({
-        type: 'sw-promote',
-        stepNum,
-        char: CHAR_BY_ID['scarletwoman'] || { id: 'scarletwoman', name: 'Scarlet Woman', team: 'minion' },
-        swSeat: sw.swSeat,
-        deadDemonSeat: sw.deadDemonSeat,
-        demonRoleId: sw.demonRoleId,
-      });
-    }
-  }
   for (const id of orderList) {
     if (NIGHT_CEREMONIES[id]) {
       steps.push({ type: 'ceremony', id, label: NIGHT_CEREMONIES[id] });
@@ -8746,6 +8728,27 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
     }
     const c = CHAR_BY_ID[id];
     if (!c) continue;
+    // Special case: Scarlet Woman — when promotion conditions are met this
+    // night, emit a synthetic sw-promote step in her natural night-order slot
+    // (instead of the default manual "handle in person" row). The substitution
+    // disappears automatically on subsequent renders once the SW's role has
+    // been swapped to the demon's, since detectScarletWomanPromotion then
+    // returns null.
+    if (id === 'scarletwoman' && !isFirstNight) {
+      const sw = detectScarletWomanPromotion(seats);
+      if (sw) {
+        stepNum += 1;
+        steps.push({
+          type: 'sw-promote',
+          stepNum,
+          char: CHAR_BY_ID['scarletwoman'] || { id: 'scarletwoman', name: 'Scarlet Woman', team: 'minion' },
+          swSeat: sw.swSeat,
+          deadDemonSeat: sw.deadDemonSeat,
+          demonRoleId: sw.demonRoleId,
+        });
+        continue;
+      }
+    }
     const matched = seatsByPerceived[id] || [];
     const isExtra = extraSet.has(id);
     if (matched.length === 0 && !isExtra) continue;
@@ -8833,12 +8836,20 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                     )}
                   </div>
                 </li>
-              ) : (
-                <li key={i} className={`card rounded p-2 flex items-start gap-2 ${s.seat?.isDead ? 'opacity-50' : ''} ${automation && s.prompt?.status === 'awaiting' ? 'border-amber-500 ring-1 ring-amber-700/40' : ''} ${automation && s.prompt?.status === 'question' ? 'border-red-500 ring-1 ring-red-700/40' : ''}`}>
+              ) : (() => {
+                // For requiresDeath roles (Ravenkeeper), dim when ALIVE or when
+                // a 'No ability' reminder is already present (ability used).
+                // Otherwise dim when dead (the usual case).
+                const noAbility = (s.seat?.reminders || []).some(r => r && /no ability/i.test(String(r.label || '')));
+                const dim = s.requiresDeath
+                  ? (!s.seat?.isDead || noAbility)
+                  : !!s.seat?.isDead;
+                return (
+                <li key={i} className={`card rounded p-2 flex items-start gap-2 ${dim ? 'opacity-50' : ''} ${automation && s.prompt?.status === 'awaiting' ? 'border-amber-500 ring-1 ring-amber-700/40' : ''} ${automation && s.prompt?.status === 'question' ? 'border-red-500 ring-1 ring-red-700/40' : ''}`}>
                   <span className="text-stone-500 text-xs tabular-nums w-6 text-center pt-0.5">{s.stepNum}</span>
                   {iconUrl(s.char.id) && (
                     <img src={iconUrl(s.char.id)} alt=""
-                      className={`w-10 h-10 rounded-full border border-stone-700 object-cover flex-shrink-0 ${s.seat?.isDead ? 'grayscale' : ''}`} />
+                      className={`w-10 h-10 rounded-full border border-stone-700 object-cover flex-shrink-0 ${dim ? 'grayscale' : ''}`} />
                   )}
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
@@ -8868,7 +8879,8 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                     )}
                   </div>
                 </li>
-              ))}
+                );
+              })())}
             </ol>
           )}
 
