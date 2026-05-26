@@ -1235,7 +1235,7 @@ function App() {
     // confirm marking them dead (with any detected protections shown).
     if (label === 'Dead') {
       const seat = seats.find(s => s.seatNum === seatNum);
-      if (seat && !seat.isDead) setDeathConfirmSeat(seatNum);
+      if (seat && !seat.isDead) queueDeathConfirm(seatNum, charId);
     }
   };
 
@@ -1437,16 +1437,21 @@ function App() {
   // (manually or via automation), we queue the seatNum here so the ST sees a
   // confirm-kill prompt. Single seat at a time — overwriting is fine since
   // each death is independent and overwriting just shows the latest victim.
-  const [deathConfirmSeat, setDeathConfirmSeat] = useState(null);
+  // Shape: { seatNum, causeCharId } | null. causeCharId lets the modal
+  // filter protections (Monk Safe doesn't apply to Slayer kills, etc.).
+  const [deathConfirmInfo, setDeathConfirmInfo] = useState(null);
+  const queueDeathConfirm = (seatNum, causeCharId) => {
+    setDeathConfirmInfo({ seatNum, causeCharId: causeCharId || null });
+  };
   const confirmDeath = () => {
-    if (deathConfirmSeat == null) return;
+    if (!deathConfirmInfo) return;
     const seats = state.grimoire.seats.map(s =>
-      s.seatNum === deathConfirmSeat ? { ...s, isDead: true } : s
+      s.seatNum === deathConfirmInfo.seatNum ? { ...s, isDead: true } : s
     );
     update({ grimoire: { ...state.grimoire, seats } });
-    setDeathConfirmSeat(null);
+    setDeathConfirmInfo(null);
   };
-  const dismissDeathConfirm = () => setDeathConfirmSeat(null);
+  const dismissDeathConfirm = () => setDeathConfirmInfo(null);
   const dismissResponsePopup = (seatNum) => {
     setDismissedResponses(prev => {
       const next = new Set(prev);
@@ -1551,7 +1556,7 @@ function App() {
             next.__seatsCopy = seatsCopy;
             // Queue a death-confirm prompt for auto-placed Dead reminders.
             if (p.reminderLabel === 'Dead' && !tseat.isDead) {
-              newDeathConfirms.push(tnum);
+              newDeathConfirms.push({ seatNum: tnum, causeCharId: p.roleId });
             }
           }
         } else if (isInfo && p.reminderLabel) {
@@ -1681,7 +1686,7 @@ function App() {
     // queue conceptually — overwriting deathConfirmSeat is harmless since each
     // dismiss returns to null and the next reminder placement will re-queue).
     if (newDeathConfirms.length) {
-      setDeathConfirmSeat(newDeathConfirms[0]);
+      queueDeathConfirm(newDeathConfirms[0].seatNum, newDeathConfirms[0].causeCharId);
     }
   }, [JSON.stringify(state.grimoire.nightPrompts || {})]);
 
@@ -2028,6 +2033,15 @@ function App() {
     const targetLabel = _seatLabel(target);
     const roleName = (CHAR_BY_ID[roleId] || {}).name || label;
     if (alreadyUsed && isReal) {
+      addCornerPrompt({
+        kind: 'warn',
+        title: `${roleName} already used`,
+        body: `${claimantLabel} IS the ${roleName} but the ability has already been used. No effect on ${targetLabel}.`,
+        actions: [{ label: 'Got it', primary: true }],
+      });
+      return;
+    }
+    if (false && alreadyUsed && isReal) {
       pushDayBanner({
         kind: 'info',
         text: `${claimantLabel} claimed ${roleName} on ${targetLabel} — they're the ${roleName} but the ability has already been used (No ability marker present). Nothing happens.`,
@@ -2106,17 +2120,23 @@ function App() {
     if (nominee.actualRoleId !== 'virgin') return;
     const virginAlreadyUsed = (nominee.reminders || []).some(r => r && /no ability/i.test(String(r.label || '')));
     if (virginAlreadyUsed) return;
+    // Per rules: "1st time you are nominated" — the ability is consumed by
+    // the first nomination regardless of who nominated. Mark used now so a
+    // later Townsfolk nomination won't re-trigger.
+    _placeReminderInline(nomineeSeatNum, 'virgin', 'No ability');
     const nominatorTeam = (CHAR_BY_ID[nominator.actualRoleId] || {}).team;
     const nominatorAfflicted = isDrunkOrPoisoned(nominee);
     const isRecluse = nominator.actualRoleId === 'recluse';
     const isTownsfolk = nominatorTeam === 'townsfolk';
     if (!isTownsfolk && !isRecluse) {
-      // Non-townsfolk nominator (and not Recluse) — ability doesn't fire.
+      // Non-townsfolk (and not Recluse) — no execution. Audit banner.
+      pushDayBanner({
+        kind: 'info',
+        text: `${_seatLabel(nominator)} (${nominatorTeam || 'no role'}) nominated the Virgin (${_seatLabel(nominee)}) — not a Townsfolk, no execution. Virgin ability consumed.`,
+      });
       return;
     }
     const fire = () => {
-      // Mark Virgin as used.
-      _placeReminderInline(nomineeSeatNum, 'virgin', 'No ability');
       // Execute the nominator → place Dead → triggers death-confirm.
       addReminder(nominatorSeatNum, 'virgin', 'Dead');
       addCornerPrompt({
@@ -2127,12 +2147,10 @@ function App() {
       });
     };
     if (nominatorAfflicted) {
-      // Virgin drunk/poisoned — ability malfunctions.
       pushDayBanner({
         kind: 'info',
         text: `${_seatLabel(nominator)} nominated the Virgin (${_seatLabel(nominee)}) — Virgin is drunk/poisoned, ability does not fire.`,
       });
-      _placeReminderInline(nomineeSeatNum, 'virgin', 'No ability');
       return;
     }
     if (isRecluse) {
@@ -2464,10 +2482,11 @@ function App() {
         />
       )}
 
-      {deathConfirmSeat != null && localOverlayStep == null && localGrimoireSeat == null && (
+      {deathConfirmInfo != null && localOverlayStep == null && localGrimoireSeat == null && (
         <DeathConfirmModal
-          seat={(state.grimoire.seats || []).find(s => s.seatNum === deathConfirmSeat)}
+          seat={(state.grimoire.seats || []).find(s => s.seatNum === deathConfirmInfo.seatNum)}
           seats={state.grimoire.seats || []}
+          causeCharId={deathConfirmInfo.causeCharId}
           onConfirm={confirmDeath}
           onDismiss={dismissDeathConfirm}
         />
@@ -5695,6 +5714,25 @@ function DayTabs({ days, viewingDayIndex, onSelect }) {
 function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onSetViewingDay, onJumpToGrimoire,
                             onResolveClaimAndKill, onResolveMutantClaim }) {
   const grim = state.grimoire;
+  const [activeAbility, setActiveAbility] = useState(null);
+  const [pendingClaimant, setPendingClaimant] = useState(null);
+  const resetAbility = () => { setActiveAbility(null); setPendingClaimant(null); };
+  const handleAbilityTap = (seatNum) => {
+    if (!activeAbility) return;
+    if (activeAbility.kind === 'claim-only') {
+      onResolveMutantClaim && onResolveMutantClaim({ claimantSeatNum: seatNum });
+      resetAbility();
+    } else if (activeAbility.kind === 'claim-target') {
+      if (pendingClaimant == null) setPendingClaimant(seatNum);
+      else {
+        onResolveClaimAndKill && onResolveClaimAndKill({
+          roleId: activeAbility.id, label: activeAbility.label,
+          claimantSeatNum: pendingClaimant, targetSeatNum: seatNum,
+        });
+        resetAbility();
+      }
+    }
+  };
 
   if (!grim.gameStarted) {
     return (
@@ -5734,11 +5772,11 @@ function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onS
       />
 
       {!isPast && !!(state.features?.automation) && (
-        <DayAbilitiesSection
+        <DayAbilitiesBar
           scriptCharIds={state.characterIds || []}
-          seats={liveSeats}
-          onResolveClaimAndKill={onResolveClaimAndKill}
-          onResolveMutantClaim={onResolveMutantClaim}
+          activeAbility={activeAbility}
+          onSelect={(ab) => { setActiveAbility(ab); setPendingClaimant(null); }}
+          onCancel={resetAbility}
         />
       )}
 
@@ -5746,6 +5784,10 @@ function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onS
         <CircularNominator
           seats={liveSeats}
           onNominate={(nomSeat, voteSeat) => onAdd(viewingIdx, nomSeat, voteSeat)}
+          abilityMode={activeAbility}
+          abilityPendingSeat={pendingClaimant}
+          onAbilityTap={handleAbilityTap}
+          onCancelAbility={resetAbility}
         />
       )}
 
@@ -5814,7 +5856,7 @@ function DayVotingFlags({ day, readOnly, onChange }) {
 // Circular seat picker for creating a nomination. Same geometry as the grimoire,
 // but no center "Town Square" piece and no roles — just seat # + name on each disc.
 // Two-tap flow: tap nominator → tap nominee (or the same seat for self-nom).
-function CircularNominator({ seats, onNominate }) {
+function CircularNominator({ seats, onNominate, abilityMode = null, abilityPendingSeat = null, onAbilityTap, onCancelAbility }) {
   const [picked, setPicked] = useState(null); // seatNum of the first tap
   const N = Math.max(1, seats.length);
   const tokenRadiusPct = N >= 15 ? 44 : N >= 13 ? 42 : N >= 11 ? 40 : 38;
@@ -5824,6 +5866,10 @@ function CircularNominator({ seats, onNominate }) {
   const tokenWidthStyle = `min(120px, ${tokenWidthPct.toFixed(1)}%)`;
 
   const handleTap = (seatNum) => {
+    if (abilityMode) {
+      onAbilityTap && onAbilityTap(seatNum);
+      return;
+    }
     if (picked == null) {
       setPicked(seatNum);
       return;
@@ -5832,19 +5878,31 @@ function CircularNominator({ seats, onNominate }) {
     onNominate(picked, seatNum);
     setPicked(null);
   };
+  const highlighted = abilityMode ? abilityPendingSeat : picked;
 
   return (
-    <section className="parchment rounded-lg p-3 sm:p-4">
+    <section className={`parchment rounded-lg p-3 sm:p-4 ${abilityMode ? 'border-amber-500/70 ring-1 ring-amber-700/30' : ''}`}>
       <div className="flex items-baseline justify-between mb-2 gap-2 flex-wrap">
         <div>
-          <h3 className="text-amber-200 font-semibold">New nomination</h3>
+          <h3 className="text-amber-200 font-semibold">
+            {abilityMode ? `${abilityMode.label} — ${abilityPendingSeat == null ? 'pick claimant' : (abilityMode.kind === 'claim-target' ? 'pick target' : '…')}` : 'New nomination'}
+          </h3>
           <p className="text-xs text-stone-400">
-            {picked == null
-              ? 'Tap the player who is nominating.'
-              : <>Now tap the player being nominated <span className="text-stone-500">(or tap {seatLabel(seats.find(s => s.seatNum === picked))} again to self-nominate)</span>.</>}
+            {abilityMode
+              ? (abilityPendingSeat == null
+                  ? `Tap the player who is claiming to be the ${abilityMode.roleName}.`
+                  : (abilityMode.kind === 'claim-target' ? 'Now tap the player they are targeting.' : 'Resolving…'))
+              : (picked == null
+                  ? 'Tap the player who is nominating.'
+                  : <>Now tap the player being nominated <span className="text-stone-500">(or tap {seatLabel(seats.find(s => s.seatNum === picked))} again to self-nominate)</span>.</>)}
           </p>
         </div>
-        {picked != null && (
+        {abilityMode ? (
+          <button onClick={() => onCancelAbility && onCancelAbility()}
+            className="text-xs px-3 py-1.5 rounded pill hover:border-red-500 hover:text-red-300">
+            Cancel ability
+          </button>
+        ) : picked != null && (
           <button onClick={() => setPicked(null)}
             className="text-xs px-3 py-1.5 rounded pill hover:border-amber-500 hover:text-amber-200">
             Cancel
@@ -5856,7 +5914,7 @@ function CircularNominator({ seats, onNominate }) {
           const angle = (i / N) * 2 * Math.PI - Math.PI / 2;
           const tx = 50 + tokenRadiusPct * Math.cos(angle);
           const ty = 50 + tokenRadiusPct * Math.sin(angle);
-          const isPicked = picked === seat.seatNum;
+          const isPicked = highlighted === seat.seatNum;
           return (
             <button key={seat.seatNum}
               onClick={() => handleTap(seat.seatNum)}
@@ -7496,11 +7554,15 @@ function detectScarletWomanPromotion(seats) {
   return { swSeat, deadDemonSeat, demonRoleId: deadDemonSeat.actualRoleId, aliveCount };
 }
 
-function checkDeathProtection(seat, allSeats) {
+function checkDeathProtection(seat, allSeats, causeCharId) {
   if (!seat) return { reasons: [], afflicted: false };
   const reasons = [];
+  // Cause filtering: Monk/Innkeeper/Angel "Safe", Soldier, Mayor only apply
+  // to demon-team causes. Sailor/Fool/Tea Lady apply to any cause.
+  const _causeChar = causeCharId ? CHAR_BY_ID[causeCharId] : null;
+  const isDemonCause = !causeCharId || _causeChar?.team === 'demon';
   // Reminder-based: Monk / Innkeeper / Angel "Safe" or "Protect" tokens.
-  for (const r of (seat.reminders || [])) {
+  for (const r of (isDemonCause ? (seat.reminders || []) : [])) {
     if (!r) continue;
     const label = String(r.label || '');
     if (r.charId === 'monk' && /safe/i.test(label)) reasons.push("Monk \u2018Safe\u2019 reminder \u2014 protected from Demon kills");
@@ -7509,9 +7571,9 @@ function checkDeathProtection(seat, allSeats) {
   }
   // Role-based:
   const role = seat.actualRoleId;
-  if (role === 'soldier')   reasons.push("Soldier role \u2014 cannot die at night to the Demon");
+  if (isDemonCause && role === 'soldier') reasons.push("Soldier role \u2014 cannot die at night to the Demon");
   if (role === 'sailor')    reasons.push("Sailor role \u2014 cannot die");
-  if (role === 'mayor')     reasons.push("Mayor role \u2014 night death may be redirected to another player (ST choice)");
+  if (isDemonCause && role === 'mayor') reasons.push("Mayor role \u2014 night death may be redirected to another player (ST choice)");
   if (role === 'fool') {
     // Fool's first save is the absence of a 'No ability' tracker reminder.
     const used = (seat.reminders || []).some(r => r && r.charId === 'fool' && /no ability/i.test(String(r.label || '')));
@@ -8156,7 +8218,51 @@ function STCornerPrompts({ prompts, onAction, onDismiss }) {
   );
 }
 
-// ---------------- Day Abilities Section (Nominations tab) ----------------
+// ---------------- Day Abilities Bar (Nominations tab, v2) ----------------
+//
+// Compact horizontal row of role buttons. Clicking selects an ability — the
+// CircularNominator below switches to ability mode and clicks in the circle
+// resolve as claimant + (optional) target.
+function DayAbilitiesBar({ scriptCharIds, activeAbility, onSelect, onCancel }) {
+  const inScript = new Set(scriptCharIds || []);
+  const available = DAY_ABILITY_ROLES.filter(r => inScript.has(r.id));
+  if (available.length === 0) return null;
+  return (
+    <section className={`parchment rounded-lg p-3 sm:p-4 ${activeAbility ? 'border-amber-500/70 ring-1 ring-amber-700/30' : 'border-amber-700/40'}`}>
+      <div className="flex items-baseline justify-between gap-2 mb-2 flex-wrap">
+        <div>
+          <h3 className="text-amber-200 font-semibold text-sm">Day-phase abilities</h3>
+          <p className="text-[10px] text-stone-500 mt-0.5">
+            Click a role when publicly claimed, then pick the player(s) in the circle below.
+          </p>
+        </div>
+        {activeAbility && (
+          <button onClick={onCancel}
+            className="text-xs px-3 py-1 rounded pill hover:border-red-500 hover:text-red-300">Cancel</button>
+        )}
+      </div>
+      <ul className="flex flex-wrap gap-1.5">
+        {available.map(r => {
+          const isActive = activeAbility?.id === r.id;
+          return (
+            <li key={r.id}>
+              <button onClick={() => isActive ? onCancel() : onSelect({ id: r.id, kind: r.kind, label: r.label, roleName: (CHAR_BY_ID[r.id] || {}).name || r.id })}
+                className={`card rounded px-2.5 py-1.5 flex items-center gap-2 text-sm transition
+                  ${isActive ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}`}>
+                {iconUrl(r.icon) && (
+                  <img src={iconUrl(r.icon)} alt="" className="w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                )}
+                <span className="text-amber-200 font-medium leading-tight">{r.label}</span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
+// ---------------- Day Abilities Section (LEGACY — no longer rendered) ----------------
 //
 // Renders above New Nomination on the Nominations tab when features.automation
 // is enabled. Lists role buttons for in-script day-phase abilities the ST
@@ -8402,10 +8508,10 @@ function NightToastStack({ toasts, onDismiss }) {
 // so the ST can decide whether the death actually applies before marking
 // seat.isDead = true. Marking dead means the night phase will skip the seat
 // on subsequent wakes.
-function DeathConfirmModal({ seat, seats, onConfirm, onDismiss }) {
+function DeathConfirmModal({ seat, seats, causeCharId, onConfirm, onDismiss }) {
   if (!seat) return null;
   const c = CHAR_BY_ID[seat.actualRoleId];
-  const { reasons, afflicted } = checkDeathProtection(seat, seats);
+  const { reasons, afflicted } = checkDeathProtection(seat, seats, causeCharId);
   const protected_ = reasons.length > 0;
   return (
     <div className="fixed inset-0 z-50 bg-stone-950/85 flex items-start sm:items-center justify-center p-2 sm:p-4 overflow-y-auto">
