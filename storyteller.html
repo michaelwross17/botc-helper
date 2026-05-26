@@ -1377,6 +1377,41 @@ function App() {
   // resolves (i.e. status leaves 'awaiting-st-response').
   const [dismissedResponses, setDismissedResponses] = useState(new Set());
 
+  // Local Spy grimoire overlay state. Two phases: 'input' (full grimoire +
+  // Got it button for the local player) → 'confirmed' (return-phone-to-ST
+  // screen — only the ST taps Return). The prompt status flips to 'submitted'
+  // when the ST taps Return so the death-confirm style two-phase privacy is
+  // preserved (local player never sees the grimoire after Got it).
+  const [localGrimoireSeat,  setLocalGrimoireSeat]  = useState(null);
+  const [localGrimoirePhase, setLocalGrimoirePhase] = useState('input');
+  const ackLocalGrimoire = () => setLocalGrimoirePhase('confirmed');
+  const returnLocalGrimoire = () => {
+    const seat = localGrimoireSeat;
+    setLocalGrimoireSeat(null);
+    setLocalGrimoirePhase('input');
+    if (seat != null) {
+      const np = { ...(state.grimoire.nightPrompts || {}) };
+      const cur = np[seat];
+      if (cur && cur.action === 'show-grimoire' && cur.status === 'awaiting') {
+        np[seat] = { ...cur, status: 'submitted', decidedAt: Date.now() };
+        update({ grimoire: { ...state.grimoire, nightPrompts: np } });
+      }
+    }
+  };
+  const cancelLocalGrimoire = () => {
+    // ST aborts before the local player taps Got it — drop the prompt entirely.
+    const seat = localGrimoireSeat;
+    setLocalGrimoireSeat(null);
+    setLocalGrimoirePhase('input');
+    if (seat != null) {
+      const np = { ...(state.grimoire.nightPrompts || {}) };
+      if (np[seat] && np[seat].action === 'show-grimoire') {
+        delete np[seat];
+        update({ grimoire: { ...state.grimoire, nightPrompts: np } });
+      }
+    }
+  };
+
   // Death-confirm modal: when a Dead reminder is placed on a non-dead seat
   // (manually or via automation), we queue the seatNum here so the ST sees a
   // confirm-kill prompt. Single seat at a time — overwriting is fine since
@@ -1402,6 +1437,7 @@ function App() {
   // grimoireShownToSeat by tapping Got it on their phone, transition any
   // matching show-grimoire prompt from 'awaiting' to 'submitted' so the
   // night-phase row marks done and the toast fires via the normal effect.
+  // Skips local seats — those are handled by the LocalGrimoireOverlay flow.
   useEffect(() => {
     if (!loaded || isSpectator) return;
     const np = state.grimoire.nightPrompts || {};
@@ -1410,6 +1446,8 @@ function App() {
     for (const [k, p] of Object.entries(np)) {
       if (!p || p.action !== 'show-grimoire' || p.status !== 'awaiting') continue;
       const seatNum = Number(k);
+      const seat = (state.grimoire.seats || []).find(s => s.seatNum === seatNum);
+      if (seat?.isLocal) continue; // local handled by LocalGrimoireOverlay
       if (shown !== seatNum) {
         updated = updated || { ...np };
         updated[k] = { ...p, status: 'submitted', decidedAt: Date.now() };
@@ -1816,13 +1854,14 @@ function App() {
     update({ grimoire: { ...state.grimoire, grimoireShownToSeat: null } });
   };
 
-  // Night-phase Spy automation: send the grimoire AND track via nightPrompts
-  // so the night-phase row shows status (awaiting / done). A separate effect
-  // (below) detects when the player taps Got it (grimoireShownToSeat clears)
-  // and transitions the prompt to 'submitted' for toast + done.
+  // Night-phase Spy automation: track the prompt status via nightPrompts +
+  // dispatch the actual grimoire presentation based on whether the seat is
+  // remote (use the existing grimoireShownToSeat → player overlay flow) or
+  // LOCAL (open a two-phase LocalGrimoireOverlay on the ST device).
   const startShowGrimoire = (seatNum, step) => {
     if (!seatNum) return;
     const g = state.grimoire;
+    const seat = (g.seats || []).find(s => s.seatNum === seatNum);
     const np = { ...(g.nightPrompts || {}) };
     np[seatNum] = {
       roleId:        step?.char?.id || 'spy',
@@ -1835,8 +1874,17 @@ function App() {
       infoPayload:   null,
       startedAt:     Date.now(),
       nightIdx:      (g.viewingDayIndex || 0),
+      isLocal:       !!seat?.isLocal,
     };
-    update({ grimoire: { ...g, nightPrompts: np, grimoireShownToSeat: seatNum } });
+    if (seat?.isLocal) {
+      // Local: nothing to send to a phone — open the overlay on this device.
+      update({ grimoire: { ...g, nightPrompts: np } });
+      setLocalGrimoireSeat(seatNum);
+      setLocalGrimoirePhase('input');
+    } else {
+      // Remote: reuses the existing player-side GrimoireSnapshotOverlay flow.
+      update({ grimoire: { ...g, nightPrompts: np, grimoireShownToSeat: seatNum } });
+    }
   };
 
   // Update one of the two Town Square freeform notes ('above' | 'below').
@@ -2171,11 +2219,22 @@ function App() {
         />
       )}
 
+      {localGrimoireSeat != null && (
+        <LocalGrimoireOverlay
+          seat={(state.grimoire.seats || []).find(s => s.seatNum === localGrimoireSeat)}
+          grimoire={state.grimoire}
+          phase={localGrimoirePhase}
+          onAck={ackLocalGrimoire}
+          onReturn={returnLocalGrimoire}
+          onCancel={cancelLocalGrimoire}
+        />
+      )}
+
       {/* Death-confirm modal — deferred while a LocalNightPromptOverlay is
           open so the local player (holding the ST phone) doesn't see who died
           or any attached role/protection info. The modal appears as soon as
           the ST taps "Return to storyteller" and the local overlay closes. */}
-      {deathConfirmSeat != null && localOverlayStep == null && (
+      {deathConfirmSeat != null && localOverlayStep == null && localGrimoireSeat == null && (
         <DeathConfirmModal
           seat={(state.grimoire.seats || []).find(s => s.seatNum === deathConfirmSeat)}
           seats={state.grimoire.seats || []}
@@ -8489,6 +8548,161 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
                 ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40'
                 : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
             Send to player's phone →
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------- Mini Reminder Token (compact display for snapshots) ----------------
+//
+// Used inside LocalGrimoireOverlay (and could be reused elsewhere). Mirrors
+// the player.html MiniReminderToken — small round icon + char name + label.
+function STMiniReminderToken({ reminder }) {
+  const rc = CHAR_BY_ID[reminder.charId];
+  const img = iconUrl(reminder.charId);
+  return (
+    <div className="card rounded p-1.5 flex items-center gap-2" style={{ minWidth: 0 }}>
+      <div className="relative inline-block flex-shrink-0" style={{ width: 32, height: 32, aspectRatio: '1 / 1' }}>
+        <div className="rounded-full overflow-hidden border border-amber-700/70 bg-stone-900 w-full h-full"
+          style={{ backgroundImage: 'url(data/tokens/character-token-noise.webp)', backgroundSize: 'cover' }}>
+          {img && <img src={img} alt="" className="w-full h-full object-cover opacity-90" draggable={false} />}
+        </div>
+      </div>
+      <div className="min-w-0 leading-tight">
+        <div className={`text-[10px] font-medium truncate team-${rc?.team || 'townsfolk'}`}>
+          {rc?.name || reminder.charId}
+        </div>
+        <div className="text-[10px] text-amber-100 truncate">{reminder.label}</div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------- Local Grimoire Overlay (Spy on ST device) ----------------
+//
+// Fullscreen overlay shown on the ST device when a LOCAL seat's Spy step is
+// started. Two phases mirroring LocalNightPromptOverlay:
+//   'input'     → full grimoire snapshot + Got it button (local player taps)
+//   'confirmed' → "Choice recorded — return phone to storyteller" + Return
+//                  button (only the ST taps Return; player never sees the
+//                  grimoire after Got it). Fully opaque background.
+// The submitted-prompt status flip happens on Return so the toast appears
+// after the ST takes the phone back.
+function LocalGrimoireOverlay({ seat, grimoire, phase, onAck, onReturn, onCancel }) {
+  if (!seat) return null;
+  const seats = grimoire?.seats || [];
+  const bluffs = (grimoire?.demonBluffs || []).filter(Boolean);
+
+  if (phase === 'confirmed') {
+    return (
+      <div className="fixed inset-0 z-50 bg-stone-950 overflow-y-auto p-3 sm:p-4">
+        <div className="max-w-md mx-auto space-y-4 py-4">
+          <section className="parchment rounded-lg p-6 sm:p-8 text-center space-y-4 border-2 border-emerald-700/70">
+            <div className="text-6xl">✓</div>
+            <div className="text-emerald-300 text-2xl font-bold">Acknowledged</div>
+            <p className="text-sm text-stone-300">
+              Thanks, <span className="text-amber-200 font-semibold">{seat.playerName || `seat #${seat.seatNum}`}</span>.
+              Please return the phone to the storyteller.
+            </p>
+            <div className="text-xs text-stone-500 pt-3 border-t border-stone-800">
+              Seat #{seat.seatNum}
+            </div>
+          </section>
+
+          <button onClick={onReturn}
+            className="w-full py-3 rounded-lg text-base font-semibold bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40">
+            Return to storyteller →
+          </button>
+          <p className="text-[10px] text-stone-500 text-center">
+            Storyteller-only — do not tap if you are the local player.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // 'input' phase — show the full grimoire snapshot.
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-950 overflow-y-auto">
+      <div className="max-w-md mx-auto p-4 space-y-4">
+        <header className="text-center py-2">
+          <div className="text-purple-300 uppercase text-[10px] tracking-widest">🏠 Local player</div>
+          <div className="text-amber-300 uppercase text-xs tracking-widest mt-1">Grimoire snapshot</div>
+          <div className="text-stone-400 text-xs mt-1">
+            Hand the phone to <span className="text-amber-200 font-semibold">{seat.playerName || `seat #${seat.seatNum}`}</span>.
+            They can study the grimoire, then tap Got it.
+          </div>
+        </header>
+
+        <section className="space-y-1.5">
+          {seats.map(s => {
+            const actual = CHAR_BY_ID[s.actualRoleId];
+            const perceived = CHAR_BY_ID[s.perceivedRoleId];
+            const misregistered = s.actualRoleId !== s.perceivedRoleId;
+            return (
+              <div key={s.seatNum}
+                className={`card rounded p-2 flex items-start gap-2 ${s.isDead ? 'opacity-50' : ''}`}>
+                <div className="flex-shrink-0 flex items-baseline gap-1.5">
+                  <span className="text-amber-200/80 text-sm font-bold">#{s.seatNum}</span>
+                  {(s.playerName || '').trim() && (
+                    <span className="text-xs text-stone-300 truncate max-w-[80px]">{s.playerName}</span>
+                  )}
+                </div>
+                {iconUrl(s.actualRoleId) && (
+                  <img src={iconUrl(s.actualRoleId)} alt=""
+                    className={`w-10 h-10 rounded-full border border-stone-700 object-cover flex-shrink-0 ${s.isDead ? 'grayscale' : ''}`} />
+                )}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className={`font-medium text-sm team-${actual?.team || 'townsfolk'}`}>{actual?.name || '?'}</span>
+                    {s.isDead && <span className="text-[10px] uppercase text-red-400">dead</span>}
+                  </div>
+                  {misregistered && perceived && (
+                    <div className="text-[10px] italic text-stone-400">thinks they are {perceived.name}</div>
+                  )}
+                  {s.reminders && s.reminders.length > 0 && (
+                    <div className="flex flex-wrap gap-1 mt-1">
+                      {s.reminders.map((r, i) => (
+                        <STMiniReminderToken key={i} reminder={r} />
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </section>
+
+        {bluffs.length > 0 && (
+          <section className="card rounded p-3">
+            <div className="text-[10px] uppercase tracking-wider text-amber-300 mb-2">Demon bluffs</div>
+            <div className="grid grid-cols-3 gap-2">
+              {bluffs.map((bId, i) => {
+                const bc = CHAR_BY_ID[bId];
+                return (
+                  <div key={i} className="text-center">
+                    {iconUrl(bId) && (
+                      <img src={iconUrl(bId)} alt=""
+                        className="w-12 h-12 rounded-full border border-amber-700/60 object-cover mx-auto" />
+                    )}
+                    <div className={`text-[11px] font-medium mt-1 team-${bc?.team || 'townsfolk'}`}>{bc?.name || '?'}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        )}
+
+        <div className="sticky bottom-0 pt-2 pb-4 bg-gradient-to-t from-stone-950 via-stone-950 to-transparent space-y-2">
+          <button onClick={onAck}
+            className="w-full py-3 rounded-lg text-base font-semibold bg-emerald-600 hover:bg-emerald-500 text-stone-950 shadow-lg shadow-emerald-900/40">
+            ✓ Got it
+          </button>
+          <button onClick={onCancel}
+            className="w-full py-2 rounded-lg text-xs font-medium bg-stone-800 hover:bg-stone-700 text-stone-300 border border-stone-700">
+            Cancel (storyteller — aborts the prompt)
           </button>
         </div>
       </div>
