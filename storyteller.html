@@ -701,6 +701,8 @@ const DEFAULT_STATE = {
     minionBluffs: {},                  // keyed by seatNum: { [seatNum]: [charId, charId, charId] } — only used when Snitch is in play
     travellers: [],                    // [{ travellerNum, insertAfterSeat, charId, alignment, playerName, claims, roleDealt, playerStatus, isDead, reminders }]
     travellerSeq: 0,                   // monotonic counter so traveller numbers (T#1, T#2) never reuse after a removal
+    setupRemindersDone: {},            // { '<reminder-id>': true } — ST manually marked done
+    setupRemindersSkipped: false,      // ST explicitly skipped any remaining setup reminders
   },
 };
 
@@ -850,6 +852,18 @@ function App() {
     setLoaded(false);
     lastSavedRef.current = '';
     setRoomCodeState(code);
+  };
+
+  // Mark a one-time setup reminder as done (e.g. ST placed the Red Herring on a
+  // Good player). The banner watches state.grimoire.setupRemindersDone for the
+  // item's id and also derives "auto-done" from grimoire reminders being present.
+  const markSetupReminder = (id, done = true) => {
+    const cur = { ...(state.grimoire.setupRemindersDone || {}) };
+    if (done) cur[id] = true; else delete cur[id];
+    update({ grimoire: { ...state.grimoire, setupRemindersDone: cur } });
+  };
+  const setSetupRemindersSkipped = (v) => {
+    update({ grimoire: { ...state.grimoire, setupRemindersSkipped: !!v } });
   };
 
   // Transient UI state — not persisted.
@@ -1218,6 +1232,17 @@ function App() {
   const clearAllNightPrompts = () => {
     update({ grimoire: { ...state.grimoire, nightPrompts: {} } });
   };
+  // ST responds to a two-step prompt (Fortune Teller). Player has already
+  // submitted targets — now ST sets the infoPayload and flips status to
+  // 'awaiting' so the player phone picks up the result.
+  const respondToNightPrompt = (seatNum, infoPayload) => {
+    if (!seatNum) return;
+    const np = { ...(state.grimoire.nightPrompts || {}) };
+    const p = np[seatNum];
+    if (!p) return;
+    np[seatNum] = { ...p, status: 'awaiting', infoPayload, respondedAt: Date.now() };
+    update({ grimoire: { ...state.grimoire, nightPrompts: np } });
+  };
 
   // Local-player overlay: when a step's seat is isLocal, the prompt is handled
   // entirely on the ST device. We do NOT write an 'awaiting' prompt to Firebase
@@ -1294,27 +1319,67 @@ function App() {
       if (p.status === 'submitted') {
         const seat = state.grimoire.seats.find(s => s.seatNum === seatNum);
         const targets = Array.isArray(p.targets) ? p.targets : (p.targets ? [p.targets] : []);
-        // Auto-place reminder on each target (if a reminder is configured).
-        // Info-role prompts have an infoPayload + no targets — they should NOT
-        // place reminders automatically (the reminderLabel is the ST's memory
-        // aid; placement belongs to the ST since the answer depends on which
-        // seat is the true match).
+        // Auto-place reminders.
+        // For TARGET actions (no infoPayload): place p.reminderLabel on each
+        //   chosen target (Poisoner → 'Poisoned' on chosen seat, etc.).
+        // For INFO actions (infoPayload present): branch on the info type.
+        //   - seats+role: find the seat in info.seats whose actualRoleId
+        //     matches the chosen role; place the reminder there (the "true"
+        //     target). If no match (e.g. FT/Wash/Lib/Inv was drunk/poisoned
+        //     and ST gave false info), surface a "place manually" follow-up.
+        //   - role:    place reminder on the receiver's seat (e.g.
+        //              Undertaker sees a role → 'Saw' reminder on the U.).
+        //   - yesno:   place reminder on the receiver's seat labelled YES/NO.
+        //   - number:  place reminder on the receiver's seat labelled with
+        //              the digit (Chef '1', Empath '2', etc.) — the icon is
+        //              still the role's icon so the source is clear.
         const isInfo = !!p.infoPayload;
-        if (p.reminderLabel && !isInfo) {
+        let manualNotePlease = null;          // toast suffix if we couldn't auto-place
+        if (!isInfo && p.reminderLabel) {
           for (const tnum of targets) {
             const tseat = state.grimoire.seats.find(s => s.seatNum === tnum);
             if (!tseat) continue;
             const already = (tseat.reminders || []).some(r =>
               r.charId === p.roleId && r.label === p.reminderLabel && r.fromPrompt);
             if (already) continue;
-            // Splice the reminder in via direct seat mutation so we batch all
-            // target placements + the status flip into one update() call.
             const seatsCopy = (next.__seatsCopy || state.grimoire.seats).map(s =>
               s.seatNum === tnum
                 ? { ...s, reminders: [...(s.reminders || []), { charId: p.roleId, label: p.reminderLabel, fromPrompt: true }] }
                 : s
             );
             next.__seatsCopy = seatsCopy;
+          }
+        } else if (isInfo && p.reminderLabel) {
+          const info = p.infoPayload || {};
+          // Helper: append a reminder to the given seat number.
+          const placeOn = (targetSeatNum, label) => {
+            const seatsCopy = (next.__seatsCopy || state.grimoire.seats).map(s =>
+              s.seatNum === targetSeatNum
+                ? { ...s, reminders: [...(s.reminders || []), { charId: p.roleId, label, fromPrompt: true }] }
+                : s
+            );
+            next.__seatsCopy = seatsCopy;
+          };
+          if (info.type === 'seats+role') {
+            const matchSeat = (info.seats || [])
+              .map(n => state.grimoire.seats.find(s => s.seatNum === n))
+              .filter(Boolean)
+              .find(s => s.actualRoleId === info.roleId);
+            if (matchSeat) {
+              const already = (matchSeat.reminders || []).some(r =>
+                r.charId === p.roleId && r.label === p.reminderLabel && r.fromPrompt);
+              if (!already) placeOn(matchSeat.seatNum, p.reminderLabel);
+            } else if (!info.none) {
+              manualNotePlease = `place "${p.reminderLabel}" manually — info given doesn\'t match any in-play seat (player likely drunk/poisoned).`;
+            }
+          } else if (info.type === 'role') {
+            const rName = (CHAR_BY_ID[info.roleId] || {}).name || info.roleId || '';
+            const label = rName || p.reminderLabel;
+            placeOn(seatNum, label);
+          } else if (info.type === 'number') {
+            placeOn(seatNum, String(info.number));
+          } else if (info.type === 'yesno') {
+            placeOn(seatNum, info.yes ? 'YES' : 'NO');
           }
         }
         next[seatStr] = { ...p, status: 'done', doneAt: Date.now() };
@@ -1327,6 +1392,7 @@ function App() {
         const isInfoToast = !!p.infoPayload;
         // For info prompts, summarize what was shown rather than what was picked.
         let toastText;
+        const manualSuffix = manualNotePlease ? ` · ${manualNotePlease}` : '';
         if (isInfoToast) {
           const info = p.infoPayload || {};
           const seatList = (info.seats || []).map(n => {
@@ -1346,7 +1412,7 @@ function App() {
             shown = `about #${info.askSeat}${askS?.playerName ? ' ' + askS.playerName : ''} → ${names}`;
           }
           else shown = JSON.stringify(info);
-          toastText = `${charName} (seat #${seatNum}${seat?.playerName ? ' · ' + seat.playerName : ''}) acknowledged: ${shown}`;
+          toastText = `${charName} (seat #${seatNum}${seat?.playerName ? ' · ' + seat.playerName : ''}) acknowledged: ${shown}${manualSuffix}`;
         } else {
           toastText = `${charName} (seat #${seatNum}${seat?.playerName ? ' · ' + seat.playerName : ''}) chose ${targetLabels || '—'}${p.reminderLabel ? ` · "${p.reminderLabel}" placed` : ''}`;
         }
@@ -1815,6 +1881,9 @@ function App() {
           onMarkStepDone={markStepDone}
           onClearAllNightPrompts={clearAllNightPrompts}
           onOpenLocalPrompt={openLocalPrompt}
+          onMarkSetupReminder={markSetupReminder}
+          onSkipSetupReminders={setSetupRemindersSkipped}
+          onRespondToNightPrompt={respondToNightPrompt}
           forceReadOnly={isSpectator}
           state={state}
           swapSourceSeat={swapSourceSeat}
@@ -3035,6 +3104,7 @@ function eligibleSeatsForPending(roleId, seats) {
 function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
                         nightToasts = [], onDismissNightToast,
                         onStartNightPrompt, onCancelNightPrompt, onMarkStepDone, onClearAllNightPrompts, onOpenLocalPrompt,
+                        onMarkSetupReminder, onSkipSetupReminders, onRespondToNightPrompt,
                         onSeatTap, onCancelSwap, onPickupAssignment, onCancelAssignment,
                         onUndoAssignmentByCharId, onUnassignPending,
                         onToggleDead, onToggleAlignment, onSwap,
@@ -3195,9 +3265,27 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         <KazaliPicksBanner picks={grim.kazaliPicks} seats={grim.seats} />
       )}
 
+      {!grim.gameStarted && !readOnly && (
+        <SetupRemindersBanner
+          seats={grim.seats}
+          remindersDone={grim.setupRemindersDone || {}}
+          skipped={!!grim.setupRemindersSkipped}
+          onMark={onMarkSetupReminder}
+          onSkip={onSkipSetupReminders}
+        />
+      )}
+
       {nightToasts.length > 0 && (
         <NightToastStack toasts={nightToasts} onDismiss={onDismissNightToast} />
       )}
+
+      {/* ST-response modal: rendered at the top of the grimoire whenever any
+          prompt is awaiting an ST response (Fortune Teller etc.). */}
+      <STResponseInline
+        prompts={grim.nightPrompts || {}}
+        seats={grim.seats || []}
+        onSend={onRespondToNightPrompt}
+      />
 
       <GrimoireToolbar
         view={state.grimoireView}
@@ -3367,6 +3455,12 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         daysCount={(grim.days || []).length}
         onBegin={onBeginGame}
         onAdvance={onAdvanceToNight}
+        setupReady={(() => {
+          if (grim.setupRemindersSkipped) return true;
+          const items = listSetupReminders(grim.seats || [], grim.setupRemindersDone || {});
+          return items.every(it => it.done);
+        })()}
+        setupBlockReason="Complete or skip the setup reminders above before starting."
       />
 
       {pickerSeat != null && (
@@ -6075,27 +6169,30 @@ function BigRoleToken({ charId, compact }) {
 }
 
 // Begin Game / Go to Night phase control at the bottom of the grimoire page.
-function BeginOrAdvanceButton({ seats, gameStarted, daysCount, onBegin, onAdvance }) {
+function BeginOrAdvanceButton({ seats, gameStarted, daysCount, onBegin, onAdvance, setupReady = true, setupBlockReason = '' }) {
   const acceptedCount = (seats || []).filter(s => s.playerStatus === 'accepted').length;
   const allAccepted = acceptedCount === seats.length && seats.length > 0;
   const currentLabel = `Night ${daysCount} / Day ${daysCount + 1}`;
   const nextLabel    = `Night ${daysCount + 1} / Day ${daysCount + 2}`;
 
   if (!gameStarted) {
+    const canBegin = allAccepted && setupReady;
     return (
       <section className="parchment rounded-lg p-4">
         <button onClick={onBegin}
-          disabled={!allAccepted}
+          disabled={!canBegin}
           className={`w-full py-3 rounded-lg text-base font-semibold transition
-            ${allAccepted
+            ${canBegin
               ? 'bg-emerald-600 hover:bg-emerald-500 text-stone-950 shadow-lg shadow-emerald-900/40'
               : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
           Begin Game →
         </button>
         <p className="text-xs text-center text-stone-500 mt-2">
-          {allAccepted
-            ? <>All players have accepted their roles. Click to start <span className="text-amber-300">{currentLabel}</span>.</>
-            : <>Waiting on {seats.length - acceptedCount} player{seats.length - acceptedCount === 1 ? '' : 's'} to accept their role.</>}
+          {!allAccepted
+            ? <>Waiting on {seats.length - acceptedCount} player{seats.length - acceptedCount === 1 ? '' : 's'} to accept their role.</>
+            : !setupReady
+              ? <>{setupBlockReason || 'Complete or skip the setup reminders above before starting.'}</>
+              : <>All players have accepted their roles. Click to start <span className="text-amber-300">{currentLabel}</span>.</>}
         </p>
       </section>
     );
@@ -6618,7 +6715,8 @@ const NIGHT_ACTIONS = {
   monk:          { action: 'target1',     reminder: 'Safe',        instruction: 'Choose a player to protect from the Demon tonight.', eligible: 'others', phase: 'other' },
   butler:        { action: 'target1',     reminder: 'Master',      instruction: 'Choose your Master. Tomorrow you can only vote when they vote.', eligible: 'others' },
   imp:           { action: 'target1self', reminder: 'Dead',        instruction: 'Choose a player to kill. (Choose yourself to pass the demon to a Minion.)', phase: 'other' },
-  fortuneteller: { action: 'target2',     reminder: 'Chose',       instruction: 'Choose 2 players. You will learn if either is the Demon.' },
+  fortuneteller: { action: 'target2+yesno', reminder: 'Chose',     instruction: 'Choose 2 players. You will learn if either is the Demon.',
+                   responseConfig: { yesLabel: 'YES — one of them registers as the Demon', noLabel: 'NO — neither is the Demon' } },
   ravenkeeper:   { action: 'target1',     reminder: 'Chose',       instruction: 'You died tonight. Choose a player — you will learn their character.', phase: 'other' },
   washerwoman:   { action: 'info-st',     reminder: 'Townsfolk',   instruction: 'You learn that one of 2 players is a particular Townsfolk.', phase: 'first',
                    infoType: 'seats+role', infoConfig: { numSeats: 2, roleTeam: 'townsfolk', allowNone: false, prefix: 'One of these players is the' } },
@@ -6837,7 +6935,7 @@ function infoSuggestion(roleId, mySeat, seats, ctx) {
 // reminder / fire toast) is not yet implemented. The Start button currently
 // shows a placeholder confirming what *would* happen. Phase B replaces this
 // placeholder with the real flow.
-function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onMarkDone: onMarkDoneProp, onOpenInfoPicker, onOpenLocalPrompt }) {
+function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onMarkDone: onMarkDoneProp, onOpenInfoPicker, onOpenLocalPrompt, gameStarted = false }) {
   const { action, seat, instruction, reminderLabel, prompt } = step;
   if (readOnly) return null;
   if (!seat) return (
@@ -6846,6 +6944,11 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
   if (seat.isDead && action !== 'manual') return (
     <div className="mt-1.5 text-[11px] text-stone-500 italic">Seat is dead — skip.</div>
   );
+  if (!gameStarted) {
+    return (
+      <div className="mt-1.5 text-[11px] text-stone-500 italic">Click "Begin Game" first before sending night prompts.</div>
+    );
+  }
   // (Local-player UI: same controls as remote, but Start opens an on-ST overlay
   // — see the dispatch in onStart below. We still annotate the row visually.)
 
@@ -6946,6 +7049,219 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
         )}
       </div>
     </div>
+  );
+}
+
+// ---------------- Setup Reminders ----------------
+//
+// One-time tasks the ST should do at game setup (before clicking Begin Game).
+// Currently: Fortune Teller "Red Herring" placement. The list is derived from
+// the current seats — items are auto-detected as done when the relevant
+// reminder is present on a seat, OR the ST can mark them manually.
+function listSetupReminders(seats, doneMap) {
+  const items = [];
+  const ftSeat = (seats || []).find(s => s.actualRoleId === 'fortuneteller');
+  if (ftSeat) {
+    const auto = (seats || []).some(s => (s.reminders || []).some(r =>
+      r && r.charId === 'fortuneteller' && /red\s*herring/i.test(r.label || '')
+    ));
+    const manual = !!doneMap['fortuneteller-redherring'];
+    items.push({
+      id: 'fortuneteller-redherring',
+      title: 'Place the Red Herring',
+      description: 'Place the "Red Herring" reminder on any Good player. The Fortune Teller will register them as the Demon.',
+      icon: 'fortuneteller',
+      done: auto || manual,
+      autoDetected: auto,
+    });
+  }
+  return items;
+}
+
+function SetupRemindersBanner({ seats, remindersDone, skipped, onMark, onSkip }) {
+  const items = listSetupReminders(seats, remindersDone);
+  if (items.length === 0) return null;
+  const allDone = items.every(it => it.done);
+  return (
+    <section className={`parchment rounded-lg p-3 sm:p-4 border-2 ${allDone || skipped ? 'border-emerald-700/60 bg-emerald-950/20' : 'border-amber-700/70 bg-amber-950/15'}`}>
+      <div className="flex items-baseline justify-between gap-2 mb-2">
+        <h3 className={`font-semibold text-sm ${allDone || skipped ? 'text-emerald-200' : 'text-amber-200'}`}>
+          {allDone ? '✓ Setup reminders' : skipped ? '⏭ Setup reminders skipped' : 'Setup reminders'}
+        </h3>
+        <span className="text-[11px] text-stone-400">
+          {items.filter(it => it.done).length} / {items.length} done
+        </span>
+      </div>
+      <ul className="space-y-1.5">
+        {items.map(it => (
+          <li key={it.id} className={`card rounded p-2 flex items-start gap-2 ${it.done ? 'opacity-70' : ''}`}>
+            {iconUrl(it.icon) && (
+              <img src={iconUrl(it.icon)} alt=""
+                className="w-9 h-9 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+            )}
+            <div className="flex-1 min-w-0">
+              <div className={`text-sm font-medium ${it.done ? 'text-emerald-300 line-through' : 'text-amber-200'}`}>
+                {it.title}
+              </div>
+              <div className="text-xs text-stone-400 mt-0.5">{it.description}</div>
+            </div>
+            <button onClick={() => onMark(it.id, !it.done)}
+              disabled={it.autoDetected}
+              title={it.autoDetected ? 'Auto-detected from grimoire reminders' : undefined}
+              className={`text-[11px] px-2 py-1 rounded transition flex-shrink-0
+                ${it.done
+                  ? 'pill text-emerald-300 cursor-default'
+                  : 'pill hover:border-amber-500 hover:text-amber-200'}
+                ${it.autoDetected ? 'cursor-not-allowed' : ''}`}>
+              {it.done ? '✓ Done' : 'Mark done'}
+            </button>
+          </li>
+        ))}
+      </ul>
+      {!allDone && (
+        <div className="mt-2 pt-2 border-t border-stone-800 flex items-center justify-between gap-2">
+          <span className="text-[10px] text-stone-500">
+            Setup reminders block Begin Game until done or skipped.
+          </span>
+          <button onClick={() => onSkip(!skipped)}
+            className={`text-[11px] px-2 py-1 rounded pill
+              ${skipped ? 'border-amber-500 text-amber-200' : 'hover:border-amber-500 hover:text-amber-200 text-stone-300'}`}>
+            {skipped ? '↺ Un-skip' : 'Skip remaining'}
+          </button>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ---------------- ST Response Inline (Fortune Teller etc.) ----------------
+//
+// Renders at the top of the grimoire whenever any night prompt has status
+// 'awaiting-st-response' — i.e. a two-step action where the player has picked
+// their targets and now the ST needs to respond with info. Currently only
+// Fortune Teller uses this (action='target2+yesno'), but the component is
+// designed generically.
+function STResponseInline({ prompts, seats, onSend }) {
+  const pending = Object.entries(prompts || {})
+    .filter(([_, p]) => p && p.status === 'awaiting-st-response')
+    .map(([k, p]) => ({ seatNum: Number(k), prompt: p }));
+  if (pending.length === 0) return null;
+  return (
+    <div className="space-y-2">
+      {pending.map(({ seatNum, prompt }) => (
+        <STResponseCard key={seatNum}
+          seatNum={seatNum}
+          prompt={prompt}
+          seats={seats}
+          onSend={(payload) => onSend(seatNum, payload)}
+        />
+      ))}
+    </div>
+  );
+}
+
+function STResponseCard({ seatNum, prompt, seats, onSend }) {
+  const c = CHAR_BY_ID[prompt.roleId];
+  const mySeat = seats.find(s => s.seatNum === seatNum);
+  const targets = Array.isArray(prompt.targets) ? prompt.targets : [];
+  const targetSeats = targets.map(n => seats.find(s => s.seatNum === n)).filter(Boolean);
+  const ftDrunkOrPoisoned = isDrunkOrPoisoned(mySeat);
+  // Auto-suggest YES if any target is demon-team or has a Red Herring reminder.
+  const yesReason = [];
+  for (const ts of targetSeats) {
+    const team = (CHAR_BY_ID[ts.actualRoleId] || {}).team;
+    if (team === 'demon') yesReason.push(`#${ts.seatNum} is the ${CHAR_BY_ID[ts.actualRoleId]?.name}`);
+    const hasRH = (ts.reminders || []).some(r => r && r.charId === 'fortuneteller' && /red\s*herring/i.test(r.label || ''));
+    if (hasRH) yesReason.push(`#${ts.seatNum} is the Red Herring`);
+  }
+  const recluseAmong = targetSeats.some(ts => (CHAR_BY_ID[ts.actualRoleId] || {}).id === 'recluse');
+  const suggestedYes = yesReason.length > 0;
+
+  return (
+    <section className="parchment rounded-lg p-3 sm:p-4 border-2 border-amber-600/70 bg-amber-950/15 space-y-3">
+      <div className="flex items-center gap-3">
+        {iconUrl(prompt.roleId) && (
+          <img src={iconUrl(prompt.roleId)} alt=""
+            className="w-12 h-12 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
+        )}
+        <div className="flex-1 min-w-0">
+          <div className={`text-xs uppercase tracking-wider team-${c?.team || 'townsfolk'}`}>{c?.team || 'role'}</div>
+          <div className="text-amber-200 text-lg font-bold leading-tight">
+            {c?.name || prompt.roleId} — needs your response
+          </div>
+          <div className="text-xs text-stone-400 mt-0.5">
+            seat #{seatNum}{mySeat?.playerName ? ' · ' + mySeat.playerName : ''}
+          </div>
+        </div>
+      </div>
+
+      {ftDrunkOrPoisoned && (
+        <div className="rounded-md p-2.5 border-2 border-red-600/70 bg-red-950/40 text-red-100 text-xs">
+          <span className="font-semibold">⚠ Drunk or poisoned</span> — you may give false info.
+        </div>
+      )}
+
+      <div>
+        <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">
+          Players chosen
+        </div>
+        <ul className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+          {targetSeats.map(ts => {
+            const rc = CHAR_BY_ID[ts.actualRoleId];
+            const isDemon = rc?.team === 'demon';
+            const hasRH = (ts.reminders || []).some(r => r && r.charId === 'fortuneteller' && /red\s*herring/i.test(r.label || ''));
+            const isRecluse = rc?.id === 'recluse';
+            return (
+              <li key={ts.seatNum} className="card rounded p-2 flex items-start gap-2">
+                <span className="text-amber-200/80 text-xs w-6 text-center flex-shrink-0 pt-1">#{ts.seatNum}</span>
+                {iconUrl(ts.actualRoleId) && (
+                  <img src={iconUrl(ts.actualRoleId)} alt=""
+                    className="w-9 h-9 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                )}
+                <div className="flex-1 min-w-0 leading-tight">
+                  <div className="text-sm truncate">{ts.playerName || <span className="text-stone-500 italic">—</span>}</div>
+                  <div className={`text-[10px] uppercase tracking-wider truncate ${rc ? `team-${rc.team}` : 'text-stone-500'}`}>
+                    {rc?.name || '(no role)'}
+                  </div>
+                  {(isDemon || hasRH || isRecluse) && (
+                    <div className="text-[10px] mt-0.5 space-x-1">
+                      {isDemon && <span className="text-red-300">⚑ Demon</span>}
+                      {hasRH && <span className="text-amber-300">⚑ Red Herring</span>}
+                      {isRecluse && <span className="text-stone-300">⚑ Recluse — may register as Demon</span>}
+                    </div>
+                  )}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+
+      <div>
+        <div className="flex items-baseline justify-between gap-2 mb-1.5">
+          <span className="text-xs uppercase tracking-wider text-amber-300">Send the answer</span>
+          <span className="text-[10px] text-stone-400">
+            Suggested: <span className={suggestedYes ? 'text-emerald-300 font-bold' : 'text-red-300 font-bold'}>
+              {suggestedYes ? 'YES' : 'NO'}
+            </span>
+            {recluseAmong && !suggestedYes && <span className="text-stone-500"> (or YES via Recluse)</span>}
+          </span>
+        </div>
+        {yesReason.length > 0 && (
+          <div className="text-[10px] text-stone-400 mb-1.5">Reason: {yesReason.join('; ')}.</div>
+        )}
+        <div className="grid grid-cols-2 gap-3">
+          <button onClick={() => onSend({ type: 'yesno', yes: true })}
+            className="py-3 rounded-lg text-base font-bold transition bg-emerald-700 hover:bg-emerald-600 text-stone-100">
+            Send YES →
+          </button>
+          <button onClick={() => onSend({ type: 'yesno', yes: false })}
+            className="py-3 rounded-lg text-base font-bold transition bg-red-700 hover:bg-red-600 text-stone-100">
+            Send NO →
+          </button>
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -7756,40 +8072,63 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
   const nightNum = viewingDayIndex || 0;
   const isFirstNight = nightNum === 0;
   const orderList = isFirstNight ? nightOrder.firstNight : nightOrder.otherNight;
-  // Build the set of in-play character IDs and a death lookup from the displayed seats.
-  const inPlayMap = {};
+  // Wake-order lookup is keyed by PERCEIVED role, not actual role, so that
+  // Drunk-as-FT (actualRoleId='drunk', perceivedRoleId='fortuneteller') wakes
+  // as the Fortune Teller — the player thinks they have FT's ability and would
+  // notice if they were skipped. Same for Marionette-as-X and Lunatic-as-Demon.
+  // We use an ARRAY per role so a real FT + a Drunk-as-FT both get their own
+  // night-phase rows (independent prompts keyed by seatNum).
+  const seatsByPerceived = {};
   for (const s of (seats || [])) {
-    if (s.actualRoleId) inPlayMap[s.actualRoleId] = s;
+    if (!s.perceivedRoleId) continue;
+    if (!seatsByPerceived[s.perceivedRoleId]) seatsByPerceived[s.perceivedRoleId] = [];
+    seatsByPerceived[s.perceivedRoleId].push(s);
+  }
+  // For jinxes we use ACTUAL roles — jinxes are mechanical interactions between
+  // real abilities, not what players think they have.
+  const actualInPlay = new Set();
+  for (const s of (seats || [])) {
+    if (s.actualRoleId) actualInPlay.add(s.actualRoleId);
   }
   // No-seat in-play characters (e.g. Lil' Monsta — a token passed each night, not on any
   // seat). These still need a wake step in the night order.
   const extraSet = new Set(extraCharIds || []);
   // Build the displayable steps: ceremonies always; characters only if in play.
+  // Emit ONE step per matching seat (so dual-FT etc. both show).
   const steps = [];
   let stepNum = 0;
   for (const id of orderList) {
     if (NIGHT_CEREMONIES[id]) {
       steps.push({ type: 'ceremony', id, label: NIGHT_CEREMONIES[id] });
-    } else {
-      const c = CHAR_BY_ID[id];
-      if (!c) continue;
-      const seat = inPlayMap[id];
-      const isExtra = extraSet.has(id);
-      if (!seat && !isExtra) continue;
+      continue;
+    }
+    const c = CHAR_BY_ID[id];
+    if (!c) continue;
+    const matched = seatsByPerceived[id] || [];
+    const isExtra = extraSet.has(id);
+    if (matched.length === 0 && !isExtra) continue;
+    const reminder = (isFirstNight ? c.firstNightReminder : c.otherNightReminder) || '';
+    const def = nightActionFor(id);
+    const phaseOk = def.phase === 'both' || (def.phase === 'first' && isFirstNight) || (def.phase === 'other' && !isFirstNight);
+    const effectiveAction = phaseOk ? def.action : 'manual';
+    if (matched.length === 0 && isExtra) {
+      // No-seat assignment (Lil' Monsta).
       stepNum += 1;
-      const reminder = (isFirstNight ? c.firstNightReminder : c.otherNightReminder) || '';
-      // For automation: resolve the action descriptor; phase-restricted roles fall back to manual.
-      const def = nightActionFor(id);
-      const phaseOk = def.phase === 'both' || (def.phase === 'first' && isFirstNight) || (def.phase === 'other' && !isFirstNight);
-      const effectiveAction = phaseOk ? def.action : 'manual';
-      const prompt = seat ? nightPrompts[seat.seatNum] : null;
-      steps.push({ type: 'char', stepNum, char: c, seat, reminder, isExtra,
+      steps.push({ type: 'char', stepNum, char: c, seat: null, reminder, isExtra,
                    action: effectiveAction, instruction: def.instruction, reminderLabel: def.reminder,
-                   prompt });
+                   prompt: null });
+    } else {
+      for (const seat of matched) {
+        stepNum += 1;
+        const prompt = nightPrompts[seat.seatNum];
+        steps.push({ type: 'char', stepNum, char: c, seat, reminder, isExtra,
+                     action: effectiveAction, instruction: def.instruction, reminderLabel: def.reminder,
+                     prompt });
+      }
     }
   }
   // Active jinxes (same logic as JinxSection but scoped to in-play characters).
-  const inPlayIds = [...Object.keys(inPlayMap), ...extraSet];
+  const inPlayIds = [...actualInPlay, ...extraSet];
   const jinxes = getActiveJinxes(inPlayIds);
 
   return (
@@ -7850,6 +8189,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                         onMarkDone={onMarkDone}
                         onOpenInfoPicker={openInfoPicker}
                         onOpenLocalPrompt={onOpenLocalPrompt}
+                        gameStarted={gameStarted}
                       />
                     )}
                   </div>

@@ -365,7 +365,7 @@ function App() {
       // Night automation: if the ST has issued a prompt to our seat, the player
       // sees a full-screen NightPromptScreen instead of the resting AcceptedScreen.
       const myPrompt = (grim.nightPrompts || {})[mySeat.seatNum];
-      if (myPrompt && (myPrompt.status === 'awaiting' || myPrompt.status === 'question')) {
+      if (myPrompt && (myPrompt.status === 'awaiting' || myPrompt.status === 'question' || myPrompt.status === 'awaiting-st-response')) {
         return <NightPromptScreen
           mySeat={mySeat}
           seats={grim.seats}
@@ -374,7 +374,14 @@ function App() {
             const next = loadGame() || game;
             if (!next?.grimoire) return;
             const np = { ...(next.grimoire.nightPrompts || {}) };
-            np[mySeat.seatNum] = { ...np[mySeat.seatNum], status: 'submitted', targets, decidedAt: Date.now() };
+            const curr = np[mySeat.seatNum] || {};
+            // Two-step actions (Fortune Teller etc.) leave the prompt in
+            // 'awaiting-st-response' so the ST can pick the info to return.
+            // For info acks (Got it on an info display) the prompt already has
+            // an infoPayload — those go straight to 'submitted'.
+            const isTwoStep = curr.action === 'target2+yesno' && !curr.infoPayload;
+            const newStatus = isTwoStep ? 'awaiting-st-response' : 'submitted';
+            np[mySeat.seatNum] = { ...curr, status: newStatus, targets, decidedAt: Date.now() };
             next.grimoire.nightPrompts = np;
             saveGame(next);
             setGame(next);
@@ -1276,6 +1283,26 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion }) {
       onAck={() => onSubmit([])}
       onQuestion={onQuestion}
     />;
+  }
+  // Two-step actions: after submitting targets, wait for the ST's response.
+  if (prompt.status === 'awaiting-st-response') {
+    const c = CHAR_BY_ID[prompt.roleId];
+    return (
+      <ScreenShell>
+        <section className="parchment rounded-lg p-6 text-center space-y-4 border-2 border-amber-700/60">
+          <div className="text-5xl">⌛</div>
+          <div className="text-amber-200 text-xl font-bold">Choice recorded</div>
+          <p className="text-sm text-stone-300">
+            The storyteller is reviewing your choice as the{' '}
+            <span className="text-amber-200 font-semibold">{c?.name || prompt.roleId}</span>.
+          </p>
+          <p className="text-xs text-stone-500">Keep your eyes closed — the answer will appear here in a moment.</p>
+          <div className="text-xs text-amber-200/80 pt-3 border-t border-stone-800">
+            Seat #{mySeat.seatNum}{mySeat.playerName ? ' · ' + mySeat.playerName : ''}
+          </div>
+        </section>
+      </ScreenShell>
+    );
   }
   const isTwo = prompt.action === 'target2';
   const need = isTwo ? 2 : 1;
