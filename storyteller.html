@@ -1218,6 +1218,47 @@ function App() {
   const clearAllNightPrompts = () => {
     update({ grimoire: { ...state.grimoire, nightPrompts: {} } });
   };
+
+  // Local-player overlay: when a step's seat is isLocal, the prompt is handled
+  // entirely on the ST device. We do NOT write an 'awaiting' prompt to Firebase
+  // (no phone is going to read it); instead we render an overlay locally and
+  // only write the 'submitted' prompt when the ST (acting as the local player)
+  // taps Submit / Got it. The submitted prompt triggers the same downstream
+  // effect that handles reminder placement + toast.
+  //
+  // localOverlayStep is the step descriptor (from NightPhaseSection). If the
+  // user picked info first (Washerwoman / etc.), we also carry infoPayload so
+  // the overlay shows the info-display variant instead of the picker.
+  const [localOverlayStep, setLocalOverlayStep] = useState(null);
+  const openLocalPrompt = (step, infoPayload) => {
+    setLocalOverlayStep({ step, infoPayload: infoPayload || null });
+  };
+  const closeLocalPrompt = () => setLocalOverlayStep(null);
+  // Submit a local prompt — writes status='submitted' directly (skip 'awaiting'
+  // since there's no remote phone to listen). `targets` for picker actions,
+  // `infoPayload` echoed back for info actions.
+  const submitLocalPrompt = (targets) => {
+    if (!localOverlayStep) return;
+    const { step, infoPayload } = localOverlayStep;
+    const seatNum = step.seat.seatNum;
+    const np = { ...(state.grimoire.nightPrompts || {}) };
+    np[seatNum] = {
+      roleId:        step.char.id,
+      action:        step.action,
+      instruction:   step.instruction || '',
+      reminderLabel: step.reminderLabel || '',
+      eligible:      (NIGHT_ACTIONS[step.char.id] && NIGHT_ACTIONS[step.char.id].eligible) || 'all',
+      status:        'submitted',
+      targets:       targets || null,
+      infoPayload:   infoPayload || null,
+      startedAt:     Date.now(),
+      decidedAt:     Date.now(),
+      isLocal:       true,
+      nightIdx:      (state.grimoire.viewingDayIndex || 0),
+    };
+    update({ grimoire: { ...state.grimoire, nightPrompts: np } });
+    setLocalOverlayStep(null);
+  };
   // Acknowledge a question (player tapped Question instead of Submit): the
   // prompt stays visible on the player's phone with a "waiting for ST" message
   // until the ST cancels it. ST clicks the toast to dismiss.
@@ -1765,6 +1806,7 @@ function App() {
           onCancelNightPrompt={cancelNightPrompt}
           onMarkStepDone={markStepDone}
           onClearAllNightPrompts={clearAllNightPrompts}
+          onOpenLocalPrompt={openLocalPrompt}
           forceReadOnly={isSpectator}
           state={state}
           swapSourceSeat={swapSourceSeat}
@@ -1821,6 +1863,16 @@ function App() {
       <footer className="text-xs text-stone-500 pt-6 border-t border-stone-800/60">
         Saved automatically to this browser. Stage 1 — storyteller setup. Player phones come in Stage 2.
       </footer>
+
+      {localOverlayStep && (
+        <LocalNightPromptOverlay
+          step={localOverlayStep.step}
+          infoPayload={localOverlayStep.infoPayload}
+          seats={state.grimoire.seats || []}
+          onSubmit={submitLocalPrompt}
+          onClose={closeLocalPrompt}
+        />
+      )}
 
       {showRoleForSeat != null && (() => {
         const seat = state.grimoire.seats.find(s => s.seatNum === showRoleForSeat);
@@ -2960,7 +3012,7 @@ function eligibleSeatsForPending(roleId, seats) {
 
 function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
                         nightToasts = [], onDismissNightToast,
-                        onStartNightPrompt, onCancelNightPrompt, onMarkStepDone, onClearAllNightPrompts,
+                        onStartNightPrompt, onCancelNightPrompt, onMarkStepDone, onClearAllNightPrompts, onOpenLocalPrompt,
                         onSeatTap, onCancelSwap, onPickupAssignment, onCancelAssignment,
                         onUndoAssignmentByCharId, onUnassignPending,
                         onToggleDead, onToggleAlignment, onSwap,
@@ -3276,6 +3328,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         onMarkDone={onMarkStepDone}
         onClearAllPrompts={onClearAllNightPrompts}
         scriptCharIds={state.characterIds || []}
+        onOpenLocalPrompt={onOpenLocalPrompt}
       />
 
       <DealRolesButton
@@ -6616,7 +6669,7 @@ function nightActionFor(roleId) {
 // reminder / fire toast) is not yet implemented. The Start button currently
 // shows a placeholder confirming what *would* happen. Phase B replaces this
 // placeholder with the real flow.
-function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onMarkDone: onMarkDoneProp, onOpenInfoPicker }) {
+function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onMarkDone: onMarkDoneProp, onOpenInfoPicker, onOpenLocalPrompt }) {
   const { action, seat, instruction, reminderLabel, prompt } = step;
   if (readOnly) return null;
   if (!seat) return (
@@ -6625,19 +6678,8 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
   if (seat.isDead && action !== 'manual') return (
     <div className="mt-1.5 text-[11px] text-stone-500 italic">Seat is dead — skip.</div>
   );
-  if (seat.isLocal) {
-    // Local players are handled by the ST overlay (Phase D). For now show a hint.
-    // We still let the ST Mark done to advance the highlight.
-    return (
-      <div className="mt-2 pt-2 border-t border-stone-800/70 text-[11px] text-purple-300 italic flex items-center justify-between gap-2">
-        <span>🏠 Local player — handle on this device (overlay coming in Phase D).</span>
-        <button onClick={() => onMarkDoneProp && onMarkDoneProp(seat.seatNum)}
-          className="text-[11px] px-2.5 py-1 rounded pill hover:border-amber-500 hover:text-amber-200 not-italic">
-          Mark done
-        </button>
-      </div>
-    );
-  }
+  // (Local-player UI: same controls as remote, but Start opens an on-ST overlay
+  // — see the dispatch in onStart below. We still annotate the row visually.)
 
   const actionLabel = ({
     target1:     'Asks for 1 player',
@@ -6650,7 +6692,15 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
 
   const onStart = () => {
     if (action === 'info-st') {
+      // Info flow always goes through the InfoPickerModal first; that modal
+      // routes to a local overlay (if applicable) on Send.
       onOpenInfoPicker && onOpenInfoPicker(step);
+      return;
+    }
+    if (seat.isLocal) {
+      // Local target action — skip the awaiting-on-Firebase step and open the
+      // on-ST overlay so the phoneless player can pick on this device.
+      onOpenLocalPrompt && onOpenLocalPrompt(step);
       return;
     }
     onStartPrompt && onStartPrompt(seat.seatNum, step);
@@ -6990,6 +7040,193 @@ function InfoPickerModal({ step, seats, scriptCharIds, onClose, onSend }) {
   );
 }
 
+// ---------------- Local Night Prompt Overlay (local-player handling) ----------------
+//
+// Full-screen overlay rendered on the ST device when a local-player (🏠) step
+// is started. Dispatches on infoPayload:
+//   - infoPayload present  → render the info-display variant (mirrors player's
+//                            NightInfoScreen) with a single "Got it" button
+//   - infoPayload absent   → render the seat-picker variant (mirrors player's
+//                            NightPromptScreen) with Submit/Cancel
+// No Question button — for local players the ST IS the storyteller.
+function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }) {
+  const c = CHAR_BY_ID[step.char.id];
+  const mySeat = step.seat;
+  const isInfo = !!infoPayload;
+  const isTwo = step.action === 'target2';
+  const need = isTwo ? 2 : 1;
+  const eligible = (NIGHT_ACTIONS[step.char.id] && NIGHT_ACTIONS[step.char.id].eligible) || 'all';
+  const eligibleSeats = (seats || []).filter(s => {
+    if (!s) return false;
+    const isSelf = s.seatNum === mySeat.seatNum;
+    if (eligible === 'others' && isSelf) return false;
+    if (eligible === 'self' && !isSelf) return false;
+    if (step.action !== 'target1any' && s.isDead) return false;
+    return true;
+  });
+  const [picked, setPicked] = useState([]);
+  const togglePick = (seatNum) => {
+    setPicked(prev => {
+      if (prev.includes(seatNum)) return prev.filter(n => n !== seatNum);
+      if (prev.length >= need) return [...prev.slice(1), seatNum];
+      return [...prev, seatNum];
+    });
+  };
+  const canSubmit = isInfo ? true : picked.length === need;
+
+  // Build the info display body — same visual logic as player's NightInfoScreen.
+  let infoBody = null;
+  if (isInfo) {
+    const info = infoPayload || {};
+    const seatBy = Object.fromEntries((seats || []).map(s => [s.seatNum, s]));
+    if (info.type === 'seats+role') {
+      const role = info.roleId ? CHAR_BY_ID[info.roleId] : null;
+      if (info.none) {
+        infoBody = (
+          <div className="text-center space-y-3">
+            <div className="text-amber-200 text-xl font-bold">No such role in play.</div>
+          </div>
+        );
+      } else {
+        const pickedSeats = (info.seats || []).map(n => seatBy[n]).filter(Boolean);
+        infoBody = (
+          <div className="space-y-4">
+            <div className="text-center text-sm text-stone-300">One of these players is the:</div>
+            {role && (
+              <div className="flex flex-col items-center gap-1">
+                {iconUrl(role.id) && (
+                  <img src={iconUrl(role.id)} alt="" className="w-24 h-24 rounded-full border-2 border-amber-700 object-cover" />
+                )}
+                <div className={`text-2xl font-bold team-${role.team}`}>{role.name}</div>
+              </div>
+            )}
+            <ul className="grid grid-cols-2 gap-2">
+              {pickedSeats.map(s => (
+                <li key={s.seatNum} className="card rounded p-3 text-center">
+                  <div className="text-amber-200/80 text-xs">seat #{s.seatNum}</div>
+                  <div className="text-base text-amber-100 font-semibold truncate">
+                    {s.playerName || <span className="text-stone-500 italic">—</span>}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+        );
+      }
+    } else if (info.type === 'role') {
+      const role = info.roleId ? CHAR_BY_ID[info.roleId] : null;
+      infoBody = (
+        <div className="text-center space-y-3">
+          <div className="text-sm text-stone-300">The executed player was:</div>
+          {role ? (
+            <div className="flex flex-col items-center gap-2">
+              {iconUrl(role.id) && (
+                <img src={iconUrl(role.id)} alt="" className="w-28 h-28 rounded-full border-2 border-amber-700 object-cover" />
+              )}
+              <div className={`text-3xl font-bold team-${role.team}`}>{role.name}</div>
+            </div>
+          ) : <div className="text-stone-400 italic">(none)</div>}
+        </div>
+      );
+    } else if (info.type === 'number') {
+      infoBody = (
+        <div className="text-center space-y-2">
+          <div className="text-sm text-stone-300">You learn the number:</div>
+          <div className="text-7xl font-extrabold text-amber-200 leading-none my-2">{info.number}</div>
+        </div>
+      );
+    } else if (info.type === 'yesno') {
+      infoBody = (
+        <div className="text-center space-y-2">
+          <div className={`text-6xl font-extrabold leading-none my-2 ${info.yes ? 'text-emerald-300' : 'text-red-300'}`}>
+            {info.yes ? 'YES' : 'NO'}
+          </div>
+        </div>
+      );
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-950/95 overflow-y-auto p-3 sm:p-4">
+      <div className="max-w-md mx-auto space-y-4 py-4">
+        <div className="text-center text-xs uppercase tracking-wider text-purple-300">
+          🏠 Local player — show this to {mySeat.playerName || `seat #${mySeat.seatNum}`}
+        </div>
+
+        <section className="parchment rounded-lg p-4 sm:p-5 space-y-3 border-2 border-amber-600/70">
+          <div className="flex items-center gap-3">
+            {iconUrl(step.char.id) && (
+              <img src={iconUrl(step.char.id)} alt=""
+                className="w-14 h-14 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
+            )}
+            <div className="min-w-0">
+              <div className={`text-xs uppercase tracking-wider team-${c?.team || 'townsfolk'}`}>{c?.team || 'role'}</div>
+              <div className="text-amber-200 text-lg font-bold">{c?.name || step.char.id}</div>
+            </div>
+          </div>
+          <div className="text-sm text-stone-200 leading-relaxed border-l-2 border-amber-700/50 pl-3">
+            {step.instruction || c?.ability}
+          </div>
+        </section>
+
+        {isInfo ? (
+          <section className="parchment rounded-lg p-5">
+            {infoBody}
+          </section>
+        ) : (
+          <section className="parchment rounded-lg p-3 sm:p-4 space-y-2">
+            <div className="flex items-baseline justify-between gap-2">
+              <h3 className="text-amber-200 font-semibold text-sm">
+                Choose {isTwo ? '2 players' : '1 player'}
+              </h3>
+              <span className="text-xs text-stone-400">{picked.length} of {need} chosen</span>
+            </div>
+            <ul className="grid grid-cols-2 gap-1.5">
+              {eligibleSeats.map(s => {
+                const isMe = s.seatNum === mySeat.seatNum;
+                const isPicked = picked.includes(s.seatNum);
+                return (
+                  <li key={s.seatNum}>
+                    <button onClick={() => togglePick(s.seatNum)}
+                      className={`w-full card rounded px-2.5 py-2 flex items-center gap-2 text-left transition
+                        ${isPicked ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}
+                        ${s.isDead ? 'opacity-60' : ''}`}>
+                      <span className="text-amber-200/80 text-xs w-7 text-center font-semibold">#{s.seatNum}</span>
+                      <span className="flex-1 min-w-0 truncate text-sm">
+                        {s.playerName || <span className="text-stone-500 italic">(no name)</span>}
+                        {isMe && <span className="ml-1 text-[10px] text-amber-300/80">· you</span>}
+                      </span>
+                      {isPicked && <span className="text-amber-300 text-sm leading-none">✓</span>}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </section>
+        )}
+
+        <div className="grid grid-cols-2 gap-2 pt-1">
+          <button onClick={onClose}
+            className="py-3 rounded-lg text-base font-semibold bg-stone-800 hover:bg-stone-700 text-stone-300 border border-stone-700">
+            Cancel
+          </button>
+          <button onClick={() => onSubmit(isInfo ? [] : picked)}
+            disabled={!canSubmit}
+            className={`py-3 rounded-lg text-base font-semibold transition
+              ${canSubmit
+                ? 'bg-emerald-600 hover:bg-emerald-500 text-stone-950 shadow-lg shadow-emerald-900/40'
+                : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+            {isInfo ? 'Got it' : 'Submit'}
+          </button>
+        </div>
+        <p className="text-[10px] text-stone-500 text-center">
+          Hand the phone to the local player to {isInfo ? 'acknowledge' : 'make their choice'}.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 // ---------------- Night Phase Section ----------------
 
 // Labels for the abstract "ceremonies" that appear in the official night order
@@ -7004,7 +7241,7 @@ const NIGHT_CEREMONIES = {
 function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted, extraCharIds = [],
                               automation = false, nightPrompts = {}, readOnly = false,
                               onStartPrompt, onCancelPrompt, onMarkDone, onClearAllPrompts,
-                              scriptCharIds = [] }) {
+                              scriptCharIds = [], onOpenLocalPrompt }) {
   // Auto-expand when automation is on so the ST sees the interactive panel immediately.
   const [collapsed, setCollapsed] = useState(!automation);
   useEffect(() => { if (automation) setCollapsed(false); }, [automation]);
@@ -7110,6 +7347,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                         onCancelPrompt={onCancelPrompt}
                         onMarkDone={onMarkDone}
                         onOpenInfoPicker={openInfoPicker}
+                        onOpenLocalPrompt={onOpenLocalPrompt}
                       />
                     )}
                   </div>
@@ -7163,7 +7401,13 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
           scriptCharIds={scriptCharIds}
           onClose={closeInfoPicker}
           onSend={(payload) => {
-            onStartPrompt && onStartPrompt(infoPickerStep.seat.seatNum, infoPickerStep, payload);
+            // For local players, don't push to a phone — open the on-ST overlay
+            // with the chosen info so the local player can tap Got it on this device.
+            if (infoPickerStep.seat?.isLocal) {
+              onOpenLocalPrompt && onOpenLocalPrompt(infoPickerStep, payload);
+            } else {
+              onStartPrompt && onStartPrompt(infoPickerStep.seat.seatNum, infoPickerStep, payload);
+            }
             closeInfoPicker();
           }}
         />
