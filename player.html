@@ -1110,12 +1110,147 @@ function KazaliPicksScreen({ mySeat, game, onSubmit }) {
   );
 }
 
+// Full-screen INFO display for info roles. Reads prompt.infoPayload (set by the
+// ST in InfoPickerModal) and renders the appropriate visual:
+//   - 'seats+role'  → role icon + name, then 2 seat cards labeled "One of these"
+//   - 'role'        → role icon + name only
+//   - 'number'      → big numeric display with the configured label
+//   - 'yesno'       → big YES or NO with the configured statement
+// Tap "Got it" to acknowledge (parent submits a status='submitted' with no
+// targets so the ST gets a toast). Question still flags the ST.
+function NightInfoScreen({ mySeat, seats, prompt, onAck, onQuestion }) {
+  const c = CHAR_BY_ID[prompt.roleId];
+  const info = prompt.infoPayload || {};
+  const seatBy = Object.fromEntries((seats || []).map(s => [s.seatNum, s]));
+
+  let body;
+  if (info.type === 'seats+role') {
+    const role = info.roleId ? CHAR_BY_ID[info.roleId] : null;
+    if (info.none) {
+      body = (
+        <div className="text-center space-y-3">
+          <div className="text-amber-200 text-xl font-bold">No such role in play.</div>
+          <p className="text-sm text-stone-300">There are none of the relevant character in play tonight.</p>
+        </div>
+      );
+    } else {
+      const pickedSeats = (info.seats || []).map(n => seatBy[n]).filter(Boolean);
+      body = (
+        <div className="space-y-4">
+          <div className="text-center text-sm text-stone-300">One of these players is the:</div>
+          {role && (
+            <div className="flex flex-col items-center gap-1">
+              {iconUrl(role.id) && (
+                <img src={iconUrl(role.id)} alt="" className="w-24 h-24 rounded-full border-2 border-amber-700 object-cover" />
+              )}
+              <div className={`text-2xl font-bold team-${role.team}`}>{role.name}</div>
+            </div>
+          )}
+          <ul className="grid grid-cols-2 gap-2">
+            {pickedSeats.map(s => (
+              <li key={s.seatNum} className="card rounded p-3 text-center">
+                <div className="text-amber-200/80 text-xs">seat #{s.seatNum}</div>
+                <div className="text-base text-amber-100 font-semibold truncate">
+                  {s.playerName || <span className="text-stone-500 italic">—</span>}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+  } else if (info.type === 'role') {
+    const role = info.roleId ? CHAR_BY_ID[info.roleId] : null;
+    body = (
+      <div className="text-center space-y-3">
+        <div className="text-sm text-stone-300">The executed player was:</div>
+        {role ? (
+          <div className="flex flex-col items-center gap-2">
+            {iconUrl(role.id) && (
+              <img src={iconUrl(role.id)} alt="" className="w-28 h-28 rounded-full border-2 border-amber-700 object-cover" />
+            )}
+            <div className={`text-3xl font-bold team-${role.team}`}>{role.name}</div>
+          </div>
+        ) : <div className="text-stone-400 italic">(none)</div>}
+      </div>
+    );
+  } else if (info.type === 'number') {
+    body = (
+      <div className="text-center space-y-2">
+        <div className="text-sm text-stone-300">You learn the number:</div>
+        <div className="text-7xl font-extrabold text-amber-200 leading-none my-2">{info.number}</div>
+      </div>
+    );
+  } else if (info.type === 'yesno') {
+    body = (
+      <div className="text-center space-y-2">
+        <div className={`text-6xl font-extrabold leading-none my-2 ${info.yes ? 'text-emerald-300' : 'text-red-300'}`}>
+          {info.yes ? 'YES' : 'NO'}
+        </div>
+      </div>
+    );
+  } else {
+    body = <div className="text-stone-400 italic text-center">(no info)</div>;
+  }
+
+  return (
+    <ScreenShell>
+      <section className="parchment rounded-lg p-4 sm:p-5 space-y-3 border-2 border-amber-600/70">
+        <div className="flex items-center gap-3">
+          {iconUrl(prompt.roleId) && (
+            <img src={iconUrl(prompt.roleId)} alt=""
+              className="w-14 h-14 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
+          )}
+          <div className="min-w-0">
+            <div className={`text-xs uppercase tracking-wider team-${c?.team || 'townsfolk'}`}>
+              {c?.team || 'role'}
+            </div>
+            <div className="text-amber-200 text-lg font-bold">{c?.name || prompt.roleId}</div>
+          </div>
+        </div>
+        <div className="text-sm text-stone-300/90 leading-relaxed border-l-2 border-amber-700/50 pl-3">
+          {prompt.instruction || c?.ability}
+        </div>
+      </section>
+
+      <section className="parchment rounded-lg p-5">
+        {body}
+      </section>
+
+      <div className="grid grid-cols-2 gap-2 pt-1">
+        <button onClick={onAck}
+          className="py-3 rounded-lg text-base font-semibold bg-emerald-600 hover:bg-emerald-500 text-stone-950 shadow-lg shadow-emerald-900/40">
+          Got it
+        </button>
+        <button onClick={onQuestion}
+          className="py-3 rounded-lg text-base font-semibold bg-stone-800 hover:bg-stone-700 text-amber-200 border border-amber-700/40">
+          Question
+        </button>
+      </div>
+      <p className="text-[10px] text-stone-500 text-center">
+        Got it confirms you saw the info. Question flags the storyteller.
+      </p>
+    </ScreenShell>
+  );
+}
+
 // Full-screen prompt shown when the storyteller (with automation on) clicks
 // "Start" on this player's night step. Renders a seat picker — the player taps
 // 1 or 2 seats (based on prompt.action) and hits Submit or Question. Submit
 // writes the targets back; the ST's effect auto-places the reminder. Question
 // flags the ST to come over in person.
 function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion }) {
+  // Info-role prompt (Washerwoman, Investigator, Empath, etc.) — ST has already
+  // picked the info; we just display it and let the player tap Got it.
+  if (prompt.infoPayload) {
+    return <NightInfoScreen
+      mySeat={mySeat}
+      seats={seats}
+      prompt={prompt}
+      onAck={() => onSubmit([])}
+      onQuestion={onQuestion}
+    />;
+  }
   const isTwo = prompt.action === 'target2';
   const need = isTwo ? 2 : 1;
   // Filter eligible seats based on the action's eligibility rules.
