@@ -222,8 +222,9 @@ function App() {
     />;
   }
 
-  // No game yet — storyteller hasn't generated roles
-  if (!grim?.generated || !grim?.seats?.length) {
+  // No seats yet — either the room is brand new or a legacy room created before
+  // we pre-populated seats. Show the waiting screen until the ST sets things up.
+  if (!grim?.seats?.length) {
     return <WaitingForStoryteller />;
   }
 
