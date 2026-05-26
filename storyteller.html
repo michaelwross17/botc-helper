@@ -1361,16 +1361,26 @@ function App() {
             next.__seatsCopy = seatsCopy;
           };
           if (info.type === 'seats+role') {
-            const matchSeat = (info.seats || [])
-              .map(n => state.grimoire.seats.find(s => s.seatNum === n))
-              .filter(Boolean)
-              .find(s => s.actualRoleId === info.roleId);
-            if (matchSeat) {
-              const already = (matchSeat.reminders || []).some(r =>
-                r.charId === p.roleId && r.label === p.reminderLabel && r.fromPrompt);
-              if (!already) placeOn(matchSeat.seatNum, p.reminderLabel);
-            } else if (!info.none) {
-              manualNotePlease = `place "${p.reminderLabel}" manually — info given doesn\'t match any in-play seat (player likely drunk/poisoned).`;
+            // For each picked seat: if it actually IS the chosen role, place the
+            // correct team-label reminder (e.g. "Outsider"); else place a "Wrong"
+            // reminder so the ST can always see what was shown to whom — both for
+            // truthful info AND for false info to drunk/poisoned players.
+            if (!info.none) {
+              const pickedSeats = (info.seats || [])
+                .map(n => state.grimoire.seats.find(s => s.seatNum === n))
+                .filter(Boolean);
+              let anyMatch = false;
+              for (const ps of pickedSeats) {
+                const isMatch = ps.actualRoleId === info.roleId;
+                const label = isMatch ? p.reminderLabel : 'Wrong';
+                if (isMatch) anyMatch = true;
+                const already = (ps.reminders || []).some(r =>
+                  r.charId === p.roleId && r.label === label && r.fromPrompt);
+                if (!already) placeOn(ps.seatNum, label);
+              }
+              if (!anyMatch) {
+                manualNotePlease = `both picks marked "Wrong" — neither is the ${(CHAR_BY_ID[info.roleId] || {}).name || info.roleId} (player likely drunk/poisoned).`;
+              }
             }
           } else if (info.type === 'role') {
             const rName = (CHAR_BY_ID[info.roleId] || {}).name || info.roleId || '';
@@ -3265,16 +3275,6 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         <KazaliPicksBanner picks={grim.kazaliPicks} seats={grim.seats} />
       )}
 
-      {!grim.gameStarted && !readOnly && (
-        <SetupRemindersBanner
-          seats={grim.seats}
-          remindersDone={grim.setupRemindersDone || {}}
-          skipped={!!grim.setupRemindersSkipped}
-          onMark={onMarkSetupReminder}
-          onSkip={onSkipSetupReminders}
-        />
-      )}
-
       {nightToasts.length > 0 && (
         <NightToastStack toasts={nightToasts} onDismiss={onDismissNightToast} />
       )}
@@ -3302,6 +3302,11 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         onPickup={onPickupAssignment}
         onCancel={onCancelAssignment}
         onUndo={onUndoAssignmentByCharId}
+        setupRemindersDone={grim.setupRemindersDone || {}}
+        setupRemindersSkipped={!!grim.setupRemindersSkipped}
+        onMarkSetupReminder={onMarkSetupReminder}
+        onSkipSetupReminders={onSkipSetupReminders}
+        gameStarted={!!grim.gameStarted}
       />
 
       <PlayersPanel
@@ -3456,11 +3461,12 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         onBegin={onBeginGame}
         onAdvance={onAdvanceToNight}
         setupReady={(() => {
+          if ((grim.pendingAssignments || []).length > 0) return false;
           if (grim.setupRemindersSkipped) return true;
           const items = listSetupReminders(grim.seats || [], grim.setupRemindersDone || {});
           return items.every(it => it.done);
         })()}
-        setupBlockReason="Complete or skip the setup reminders above before starting."
+        setupBlockReason="Finish the setup needs above before starting."
       />
 
       {pickerSeat != null && (
@@ -3921,7 +3927,8 @@ function getSetupNote(charId) {
 
 // Top-of-grimoire checklist: every in-play character with setup: true, plus any
 // pending hidden roles (Drunk/Marionette) that need ST assignment.
-function SetupNeedsPanel({ seats, pendingAssignments, assigningRoleId, eligibleCount, onPickup, onCancel, onUndo }) {
+function SetupNeedsPanel({ seats, pendingAssignments, assigningRoleId, eligibleCount, onPickup, onCancel, onUndo,
+                            setupRemindersDone = {}, setupRemindersSkipped = false, onMarkSetupReminder, onSkipSetupReminders, gameStarted = false }) {
   // In-play characters (by actualRoleId) with setup: true
   const inPlay = new Set(seats.map(s => s.actualRoleId));
   const charIds = [...inPlay].filter(id => CHAR_BY_ID[id]?.setup);
@@ -3929,7 +3936,11 @@ function SetupNeedsPanel({ seats, pendingAssignments, assigningRoleId, eligibleC
   for (const id of pendingAssignments) {
     if (!inPlay.has(id) && CHAR_BY_ID[id]) charIds.push(id);
   }
-  if (charIds.length === 0) return null;
+  // Setup reminders (Red Herring etc.) — only render while the game hasn't started.
+  const setupReminders = !gameStarted ? listSetupReminders(seats, setupRemindersDone) : [];
+
+  // If absolutely nothing to surface, render nothing.
+  if (charIds.length === 0 && setupReminders.length === 0) return null;
 
   // Order: pending (need attention) first, then assigned-but-undoable hidden roles, then informational.
   const isHidden = (id) => NOT_IN_PHYSICAL_BAG.has(id);
@@ -3941,16 +3952,19 @@ function SetupNeedsPanel({ seats, pendingAssignments, assigningRoleId, eligibleC
   });
 
   const anyPending = pendingAssignments.length > 0;
+  const remindersAllDone = setupReminders.every(it => it.done);
+  const anyReminderOutstanding = setupReminders.length > 0 && !remindersAllDone && !setupRemindersSkipped;
+  const blocksBegin = anyPending || anyReminderOutstanding;
 
   return (
-    <section className={`parchment rounded-lg p-3 sm:p-4 ${anyPending ? 'border-amber-700/70' : ''}`}>
+    <section className={`parchment rounded-lg p-3 sm:p-4 ${blocksBegin ? 'border-amber-700/70' : ''}`}>
       <div className="flex items-baseline justify-between gap-2 mb-2">
         <div>
           <h3 className="text-amber-200 font-semibold">Setup needs</h3>
           <p className="text-xs text-stone-400">
-            {anyPending
-              ? 'Some characters still need to be assigned before the game can begin.'
-              : 'All setup characters handled. Reference notes for in-play setup effects.'}
+            {blocksBegin
+              ? 'Finish these before clicking Begin Game.'
+              : 'All setup handled. Reference notes for in-play setup effects.'}
           </p>
         </div>
         {assigningRoleId && (
@@ -3961,29 +3975,84 @@ function SetupNeedsPanel({ seats, pendingAssignments, assigningRoleId, eligibleC
         )}
       </div>
 
-      <ul className="space-y-1.5">
-        {charIds.map(id => {
-          const c = CHAR_BY_ID[id];
-          const isPendingThis = pendingAssignments.includes(id);
-          const isPickedUp = assigningRoleId === id;
-          // Find a seat where this hidden role was assigned (perceived != actual matches charId)
-          const assignedSeat = !isPendingThis && isHidden(id)
-            ? seats.find(s => s.actualRoleId === id && s.perceivedRoleId !== s.actualRoleId)
-            : null;
-          return (
-            <SetupEntry key={id}
-              char={c}
-              isPending={isPendingThis}
-              isPickedUp={isPickedUp}
-              eligibleCount={isPickedUp ? eligibleCount : null}
-              assignedSeat={assignedSeat}
-              onPickup={(isHidden(id) || isPendingThis) ? () => onPickup(id) : null}
-              onUndo={assignedSeat ? () => onUndo(id) : null}
-              seats={seats}
-            />
-          );
-        })}
-      </ul>
+      {charIds.length > 0 && (
+        <ul className="space-y-1.5">
+          {charIds.map(id => {
+            const c = CHAR_BY_ID[id];
+            const isPendingThis = pendingAssignments.includes(id);
+            const isPickedUp = assigningRoleId === id;
+            // Find a seat where this hidden role was assigned (perceived != actual matches charId)
+            const assignedSeat = !isPendingThis && isHidden(id)
+              ? seats.find(s => s.actualRoleId === id && s.perceivedRoleId !== s.actualRoleId)
+              : null;
+            return (
+              <SetupEntry key={id}
+                char={c}
+                isPending={isPendingThis}
+                isPickedUp={isPickedUp}
+                eligibleCount={isPickedUp ? eligibleCount : null}
+                assignedSeat={assignedSeat}
+                onPickup={(isHidden(id) || isPendingThis) ? () => onPickup(id) : null}
+                onUndo={assignedSeat ? () => onUndo(id) : null}
+                seats={seats}
+              />
+            );
+          })}
+        </ul>
+      )}
+
+      {/* Setup reminders sub-section (Red Herring, etc.) */}
+      {setupReminders.length > 0 && (
+        <div className={`${charIds.length > 0 ? 'mt-3 pt-3 border-t border-stone-800' : ''}`}>
+          <div className="flex items-baseline justify-between gap-2 mb-1.5">
+            <div className="text-xs uppercase tracking-wider text-amber-300">
+              Setup reminders
+            </div>
+            <span className="text-[11px] text-stone-400">
+              {setupReminders.filter(it => it.done).length} / {setupReminders.length} done
+              {setupRemindersSkipped && <span className="ml-1 text-amber-400">· skipped</span>}
+            </span>
+          </div>
+          <ul className="space-y-1.5">
+            {setupReminders.map(it => (
+              <li key={it.id} className={`card rounded p-2 flex items-start gap-2 ${it.done ? 'opacity-70' : ''}`}>
+                {iconUrl(it.icon) && (
+                  <img src={iconUrl(it.icon)} alt=""
+                    className="w-9 h-9 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                )}
+                <div className="flex-1 min-w-0">
+                  <div className={`text-sm font-medium ${it.done ? 'text-emerald-300 line-through' : 'text-amber-200'}`}>
+                    {it.title}
+                  </div>
+                  <div className="text-xs text-stone-400 mt-0.5">{it.description}</div>
+                </div>
+                <button onClick={() => onMarkSetupReminder && onMarkSetupReminder(it.id, !it.done)}
+                  disabled={it.autoDetected}
+                  title={it.autoDetected ? 'Auto-detected from grimoire reminders' : undefined}
+                  className={`text-[11px] px-2 py-1 rounded transition flex-shrink-0
+                    ${it.done
+                      ? 'pill text-emerald-300 cursor-default'
+                      : 'pill hover:border-amber-500 hover:text-amber-200'}
+                    ${it.autoDetected ? 'cursor-not-allowed' : ''}`}>
+                  {it.done ? '✓ Done' : 'Mark done'}
+                </button>
+              </li>
+            ))}
+          </ul>
+          {!remindersAllDone && onSkipSetupReminders && (
+            <div className="mt-2 flex items-center justify-between gap-2">
+              <span className="text-[10px] text-stone-500">
+                Reminders block Begin Game until done or skipped.
+              </span>
+              <button onClick={() => onSkipSetupReminders(!setupRemindersSkipped)}
+                className={`text-[11px] px-2 py-1 rounded pill
+                  ${setupRemindersSkipped ? 'border-amber-500 text-amber-200' : 'hover:border-amber-500 hover:text-amber-200 text-stone-300'}`}>
+                {setupRemindersSkipped ? '↺ Un-skip' : 'Skip remaining'}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
     </section>
   );
 }
@@ -7163,7 +7232,12 @@ function STResponseInline({ prompts, seats, onSend }) {
 function STResponseCard({ seatNum, prompt, seats, onSend }) {
   const c = CHAR_BY_ID[prompt.roleId];
   const mySeat = seats.find(s => s.seatNum === seatNum);
-  const targets = Array.isArray(prompt.targets) ? prompt.targets : [];
+  // Firebase may round-trip arrays as { 0: x, 1: y } objects; coerce back.
+  const targets = Array.isArray(prompt.targets)
+    ? prompt.targets
+    : (prompt.targets && typeof prompt.targets === 'object'
+        ? Object.keys(prompt.targets).sort((a, b) => Number(a) - Number(b)).map(k => prompt.targets[k])
+        : []);
   const targetSeats = targets.map(n => seats.find(s => s.seatNum === n)).filter(Boolean);
   const ftDrunkOrPoisoned = isDrunkOrPoisoned(mySeat);
   // Auto-suggest YES if any target is demon-team or has a Red Herring reminder.
@@ -7795,7 +7869,7 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }
   const c = CHAR_BY_ID[step.char.id];
   const mySeat = step.seat;
   const isInfo = !!infoPayload;
-  const isTwo = step.action === 'target2';
+  const isTwo = step.action === 'target2' || step.action === 'target2+yesno';
   const need = isTwo ? 2 : 1;
   const eligible = (NIGHT_ACTIONS[step.char.id] && NIGHT_ACTIONS[step.char.id].eligible) || 'all';
   const eligibleSeats = (seats || []).filter(s => {

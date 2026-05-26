@@ -1304,7 +1304,7 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion }) {
       </ScreenShell>
     );
   }
-  const isTwo = prompt.action === 'target2';
+  const isTwo = prompt.action === 'target2' || prompt.action === 'target2+yesno';
   const need = isTwo ? 2 : 1;
   // Filter eligible seats based on the action's eligibility rules.
   const eligibleSeats = (seats || []).filter(s => {
