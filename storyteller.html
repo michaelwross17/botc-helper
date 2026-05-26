@@ -2229,7 +2229,21 @@ function BagSetupPage({ state, bag, grouped, setupMods, onCount, onJumpToScript,
     return acc;
   }, {});
 
-  const isReady = bag && teams.every(t => physicalBagIdsByTeam[t].length === (eff?.bag[teamIdx[t]] || 0));
+  // Per-team count of NOT_IN_PHYSICAL_BAG characters that were selected — these
+  // characters count toward eff.bag's target (Drunk is still one of the
+  // outsiders, etc.) but don't take a physical bag token. Their slot is filled
+  // by another team's token via setup_delta (Drunk → +1 Townsfolk, Marionette
+  // → +1 Townsfolk, Lunatic → +1 Demon, Lil' Monsta → +1 Minion / −1 Demon).
+  // So the physical target to match for each team is (full target − non-physical
+  // selected in that team).
+  const nonPhysicalByTeam = teams.reduce((acc, t) => {
+    acc[t] = bagIdsByTeam[t].filter(id => NOT_IN_PHYSICAL_BAG.has(id)).length;
+    return acc;
+  }, {});
+
+  const isReady = bag && teams.every(t =>
+    physicalBagIdsByTeam[t].length === ((eff?.bag[teamIdx[t]] || 0) - nonPhysicalByTeam[t])
+  );
 
   return (
     <div className="space-y-6">
