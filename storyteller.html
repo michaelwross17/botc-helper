@@ -1170,7 +1170,12 @@ function App() {
         changedBy:      'scarletwoman',
         perceivedRoleId: demonRoleId,
         actualRoleId:    demonRoleId,
-        // Re-deal: player phone re-renders RoleReveal with the new role + bluffs.
+        // Per official rules, the promoted SW does NOT get demon bluffs —
+        // bluffs are a first-night thing for the original demon only. The
+        // player's RoleReveal honors this flag and omits the bluffs section.
+        skipDemonBluffs: true,
+        // Re-deal: player phone re-renders RoleReveal with the new role
+        // (no bluffs — see skipDemonBluffs above).
         roleDealt:    true,
         playerStatus: 'pending',
         reminders: [

@@ -657,7 +657,9 @@ function RoleReveal({ seat, grimoire, bagCharacterIds, onAccept, onAsk }) {
     : [];
   // Summoner uses the demon-bluff pool; if Snitch ALSO marks this minion, prefer
   // the minion-specific bluffs (which are per-seat and may be customized).
-  const showBluffs = perceivedIsDemon || showMinionBluffs || isSummoner;
+  // skipDemonBluffs is set by the storyteller when promoting (e.g. SW becomes
+  // the Demon) — those players don't get the 3-bluff first-night info.
+  const showBluffs = !seat.skipDemonBluffs && (perceivedIsDemon || showMinionBluffs || isSummoner);
   const bluffs = showMinionBluffs
     ? minionBluffsForMe
     : (isLunatic
@@ -679,7 +681,15 @@ function RoleReveal({ seat, grimoire, bagCharacterIds, onAccept, onAsk }) {
             the Kazali changed them. */}
         {seat.previousRoleId && seat.previousRoleId !== seat.perceivedRoleId && (() => {
           const prev = CHAR_BY_ID[seat.previousRoleId];
-          const by = seat.changedBy === 'kazali' ? 'the Kazali' : 'the Storyteller';
+          const fromSW = seat.changedBy === 'scarletwoman';
+          const by = seat.changedBy === 'kazali'
+            ? 'the Kazali'
+            : (fromSW ? 'The previous Demon has died and' : 'the Storyteller');
+          // SW-promotion blurb: she's becoming the Demon (not a Minion).
+          // Kazali / generic ST conversions still read as "become a Minion".
+          const message = fromSW
+            ? `${by} you have taken over as the Demon. Your new role is shown below.`
+            : `${by} has chosen you to become a Minion of the evil team. Your new role is shown below.`;
           return (
             <div className="rounded-lg p-3 border-2 border-red-700 bg-red-950/40 text-center">
               <div className="text-xs uppercase tracking-wider text-red-300 font-semibold mb-2">Your role has changed</div>
@@ -695,9 +705,7 @@ function RoleReveal({ seat, grimoire, bagCharacterIds, onAccept, onAsk }) {
                   {prev?.name || seat.previousRoleId}
                 </div>
               </div>
-              <p className="text-xs text-stone-300 mt-3">
-                {by} has chosen you to become a Minion of the evil team. Your new role is shown below.
-              </p>
+              <p className="text-xs text-stone-300 mt-3">{message}</p>
             </div>
           );
         })()}
