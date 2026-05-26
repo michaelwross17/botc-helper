@@ -677,6 +677,9 @@ const DEFAULT_STATE = {
   lotOutsiders: 0,         // 0-4 — outsider count when Lord of Typhon is in the bag
   kazaliOutsiders: 0,      // 0-4 — outsider count when Kazali is in the bag
   atheistOutsiders: 0,     // 0-4 — outsider count when Atheist is in the bag
+  features: {              // optional ST features toggled from the bag-setup panel
+    automation: false,     // walk the night order interactively; prompt player phones for choices
+  },
   grimoireView: 'circular',// 'circular' | 'list'
   grimoire: {
     generated: false,
@@ -863,6 +866,12 @@ function App() {
   }, [state.grimoire.generated, state.page]);
 
   const update = (patch) => setState(s => ({ ...s, ...patch }));
+
+  // Toggle an optional ST feature (e.g. automation). Stored under state.features
+  // so it round-trips through Firebase and survives reloads.
+  const setFeature = (key, value) => {
+    update({ features: { ...(state.features || {}), [key]: value } });
+  };
 
   const loadEdition = (id) => {
     const ed = DEFAULT_SCRIPTS[id];
@@ -1570,6 +1579,7 @@ function App() {
           onSetLotOutsiders={setLotOutsiders}
           onSetKazaliOutsiders={setKazaliOutsiders}
           onSetAtheistOutsiders={setAtheistOutsiders}
+          onSetFeature={setFeature}
           onGenerate={generateRoles}
         />
       )}
@@ -1918,10 +1928,69 @@ function ScriptBuilderPage(props) {
   );
 }
 
+// Optional features the storyteller can enable for this game. Lives at the top
+// of the bag-setup page so the ST sees it before generating roles. Each toggle
+// stores under state.features.<key> and round-trips through Firebase.
+// Currently:
+//   - automation: walks the night order interactively, prompts player phones
+//     for choices, auto-places reminder tokens on submit.
+function FeaturesPanel({ features, onSetFeature }) {
+  const [expanded, setExpanded] = useState(false);
+  const automationOn = !!features.automation;
+  const anyOn = automationOn;
+  return (
+    <section className="parchment rounded-lg p-3 sm:p-4 border-amber-700/50">
+      <button onClick={() => setExpanded(e => !e)}
+        className="w-full flex items-center justify-between gap-2 text-left">
+        <div>
+          <h3 className="text-amber-200 font-semibold text-sm">
+            Features <span className="text-stone-500 font-normal text-xs">· optional</span>
+          </h3>
+          <p className="text-xs text-stone-400 mt-0.5">
+            {anyOn
+              ? <>Enabled: {automationOn && <span className="text-amber-300">Automation</span>}</>
+              : <>No optional features enabled</>}
+            <span className="text-stone-500"> · click to {expanded ? 'collapse' : 'expand'}</span>
+          </p>
+        </div>
+        <span className="text-stone-400 text-lg leading-none w-5 text-center">{expanded ? '▾' : '▸'}</span>
+      </button>
+      {expanded && (
+        <div className="mt-3 pt-3 border-t border-stone-800 space-y-2">
+          <FeatureToggle
+            label="Automation"
+            description="During the night, click each step to prompt the right player's phone to make their choice (e.g. Poisoner picks a target). Submissions auto-place the reminder; questions raise a flag."
+            checked={automationOn}
+            onChange={(v) => onSetFeature('automation', v)}
+          />
+          {/* Add more features here as they are built. */}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function FeatureToggle({ label, description, checked, onChange }) {
+  return (
+    <label className="flex items-start gap-3 p-2 rounded cursor-pointer hover:bg-stone-900/50">
+      <input type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="mt-1 w-4 h-4 accent-amber-600 flex-shrink-0" />
+      <div className="flex-1 min-w-0">
+        <div className={`text-sm font-medium ${checked ? 'text-amber-200' : 'text-stone-200'}`}>
+          {label}
+        </div>
+        <div className="text-xs text-stone-400 mt-0.5 leading-snug">{description}</div>
+      </div>
+    </label>
+  );
+}
+
 function BagSetupPage({ state, bag, grouped, setupMods, onCount, onJumpToScript,
                         onIncrementInBag, onDecrementInBag, onRandomizeTeam, onClearTeam, onClearBag,
                         onSetGodfatherSign, onSetBalloonistOutsider, onSetHermitOutsider, onSetXaanOutsiders, onSetLotOutsiders, onSetKazaliOutsiders, onSetAtheistOutsiders,
-                        onGenerate }) {
+                        onSetFeature, onGenerate }) {
   const eff = getEffectiveBag(bag, state.bagCharacterIds, state.godfatherSign, state.balloonistOutsider, state.hermitOutsider, state.xaanOutsiders, state.lotOutsiders, state.kazaliOutsiders, state.atheistOutsiders);
   const teams = ['townsfolk','outsider','minion','demon'];
   const teamIdx = { townsfolk: 0, outsider: 1, minion: 2, demon: 3 };
@@ -1944,6 +2013,8 @@ function BagSetupPage({ state, bag, grouped, setupMods, onCount, onJumpToScript,
 
   return (
     <div className="space-y-6">
+      <FeaturesPanel features={state.features || {}} onSetFeature={onSetFeature} />
+
       <ScriptSummary state={state} grouped={grouped} onEdit={onJumpToScript} />
 
       <PlayerCountPicker state={state} onCount={onCount} onClearBag={onClearBag} />
@@ -3031,6 +3102,9 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         daysSnapshots={grim.days || []}
         gameStarted={grim.gameStarted}
         extraCharIds={(state.bagCharacterIds || []).filter(id => NO_SEAT_ASSIGNMENT.has(id))}
+        automation={!!(state.features?.automation)}
+        nightPrompts={grim.nightPrompts || {}}
+        readOnly={readOnly}
       />
 
       <DealRolesButton
@@ -6269,6 +6343,179 @@ function DealRolesButton({ seats, onDealAll, onUndealAll, blockedReason }) {
   );
 }
 
+// ---------------- Night Automation Registry ----------------
+//
+// Maps roleId → { action, reminder, instruction, eligible, phase } describing
+// what the engine should do when the ST clicks "Start" on this character's
+// night step (assuming features.automation is on).
+//
+// action types:
+//   'target1'        — player picks 1 living seat. Submit places `reminder` on that seat.
+//   'target1any'     — same as target1 but dead seats are allowed.
+//   'target1self'    — player picks 1 living seat (self allowed). Submit places `reminder`.
+//   'target2'        — player picks 2 living seats. Submit places `reminder` on each.
+//   'info-st'        — ST decides info on their device, app pushes a chosen role/count
+//                      to the player's phone. No player picker. (e.g. Washerwoman, Empath)
+//   'manual'         — no automation; ST handles in person and clicks "Mark done".
+//
+// `eligible` (optional): 'others' (exclude self) | 'self' (only self) | 'all' (default)
+// `phase` (optional): 'first' | 'other' | 'both' (default). Restricts when the action runs.
+//
+// Anything not listed here falls back to 'manual' so unknown / custom-script roles
+// simply show a "Mark done" button (with the role's normal night reminder text).
+// This makes the engine work for ALL scripts; we add entries incrementally for
+// roles whose mechanics fit one of the patterns.
+const NIGHT_ACTIONS = {
+  // ===== Trouble Brewing =====
+  poisoner:      { action: 'target1',     reminder: 'Poisoned',    instruction: 'Choose a player to poison tonight.', eligible: 'others' },
+  monk:          { action: 'target1',     reminder: 'Safe',        instruction: 'Choose a player to protect from the Demon tonight.', eligible: 'others', phase: 'other' },
+  butler:        { action: 'target1',     reminder: 'Master',      instruction: 'Choose your Master. Tomorrow you can only vote when they vote.', eligible: 'others' },
+  imp:           { action: 'target1self', reminder: 'Dead',        instruction: 'Choose a player to kill. (Choose yourself to pass the demon to a Minion.)', phase: 'other' },
+  fortuneteller: { action: 'target2',     reminder: 'Chose',       instruction: 'Choose 2 players. You will learn if either is the Demon.' },
+  ravenkeeper:   { action: 'target1',     reminder: 'Chose',       instruction: 'You died tonight. Choose a player — you will learn their character.', phase: 'other' },
+  washerwoman:   { action: 'info-st',     reminder: 'Townsfolk',   instruction: 'You learn that one of 2 players is a particular Townsfolk.', phase: 'first' },
+  librarian:     { action: 'info-st',     reminder: 'Outsider',    instruction: 'You learn that one of 2 players is a particular Outsider (or that no Outsiders are in play).', phase: 'first' },
+  investigator:  { action: 'info-st',     reminder: 'Minion',      instruction: 'You learn that one of 2 players is a particular Minion.', phase: 'first' },
+  chef:          { action: 'info-st',     reminder: 'Chef #',      instruction: 'You learn how many pairs of evil players are sitting next to each other.', phase: 'first' },
+  empath:        { action: 'info-st',     reminder: 'Empath #',    instruction: 'You learn how many of your 2 alive neighbours are evil.' },
+  undertaker:    { action: 'info-st',     reminder: 'Saw',         instruction: 'You learn which character was executed today.', phase: 'other' },
+
+  // ===== Bad Moon Rising =====
+  godfather:     { action: 'target1',     reminder: 'Dead',        instruction: 'An Outsider died today — choose a player to die tonight.', phase: 'other' },
+  pukka:         { action: 'target1self', reminder: 'Poisoned',    instruction: 'Choose a player. They are poisoned; the previously poisoned player dies.' },
+  shabaloth:     { action: 'target2',     reminder: 'Dead',        instruction: 'Choose 2 players — they die. A dead player you chose last night might be regurgitated.', phase: 'other' },
+  po:            { action: 'target1self', reminder: 'Dead',        instruction: 'Choose a player to kill, or 3 players if you chose no one last night.', phase: 'other' },
+  zombuul:       { action: 'target1',     reminder: 'Dead',        instruction: 'If no one died today, choose a player to die tonight.', phase: 'other' },
+  innkeeper:     { action: 'target2',     reminder: 'Safe',        instruction: 'Choose 2 players — they are safe from the Demon tonight, but one becomes drunk.', phase: 'other' },
+  gambler:       { action: 'target1self', reminder: 'Gambled',     instruction: 'Choose a player and guess their character. If wrong, you die.', phase: 'other' },
+  exorcist:      { action: 'target1',     reminder: 'Chose',       instruction: 'Choose a player (not the same as last night) — the Demon does not wake tonight.', eligible: 'others', phase: 'other' },
+  courtier:      { action: 'target1',     reminder: 'Drunk',       instruction: 'Choose a player. If they are the Demon, they are drunk for 3 nights and 3 days.' },
+  professor:     { action: 'target1',     reminder: 'Used',        instruction: 'Once per game at night, choose a dead player — if they are a Townsfolk, they are resurrected.', phase: 'other' },
+
+  // ===== Sects & Violets =====
+  flowergirl:    { action: 'info-st',     reminder: 'Saw',         instruction: 'You learn if a Demon voted today.', phase: 'other' },
+  towncrier:     { action: 'info-st',     reminder: 'Saw',         instruction: 'You learn if any Minion nominated today.', phase: 'other' },
+  oracle:        { action: 'info-st',     reminder: 'Oracle #',    instruction: 'You learn how many dead players are evil.', phase: 'other' },
+  seamstress:    { action: 'target2',     reminder: 'Chose',       instruction: 'Once per game at night, choose 2 players (not yourself) — you learn if they are the same alignment.', eligible: 'others' },
+  mathematician: { action: 'info-st',     reminder: 'Math #',      instruction: 'You learn how many players\' abilities malfunctioned last day or night.', phase: 'other' },
+  snakecharmer:  { action: 'target1',     reminder: 'Chose',       instruction: 'Choose a player. If they are the Demon, you swap roles and they become poisoned.' },
+  cerenovus:     { action: 'target1',     reminder: 'Mad',         instruction: 'Choose a player and a good character — they are mad about being that character.' },
+  fanggu:        { action: 'target1',     reminder: 'Dead',        instruction: 'Choose a player to kill. The first Outsider killed becomes an evil Fang Gu instead.' },
+  vigormortis:   { action: 'target1',     reminder: 'Dead',        instruction: 'Choose a player to die. Killed Minions keep their ability and poison a neighbour.' },
+  nodashii:      { action: 'target1',     reminder: 'Dead',        instruction: 'Choose a player to kill. Your 2 living Townsfolk neighbours are poisoned.' },
+  vortox:        { action: 'target1',     reminder: 'Dead',        instruction: 'Choose a player to kill. All Townsfolk get false info today.' },
+  witch:         { action: 'target1',     reminder: 'Cursed',      instruction: 'Choose a player. If they nominate tomorrow, they die.' },
+};
+
+// Look up the action descriptor for a role. Returns a normalized descriptor with
+// defaults applied — never returns null so the caller can always call `.action`.
+function nightActionFor(roleId) {
+  const def = NIGHT_ACTIONS[roleId] || {};
+  return {
+    action: def.action || 'manual',
+    reminder: def.reminder || '',
+    instruction: def.instruction || '',
+    eligible: def.eligible || 'all',
+    phase: def.phase || 'both',
+  };
+}
+
+// ---------------- Night Step Action Row (automation) ----------------
+//
+// Per-step controls that appear under each character row when automation is on.
+// Behavior depends on the action type:
+//   - 'target1/target1self/target2/target1any' → Start sends a prompt to the
+//     player's phone (or to the ST device if isLocal). Status badge shows
+//     "awaiting…" → "submitted" or "question".
+//   - 'info-st' → Start opens an ST-side picker modal so the ST chooses the
+//     info, which is then pushed to the player.
+//   - 'manual' → "Mark done" button only; the ST handles the ability in person.
+//
+// PHASE A NOTE: Wiring to Firebase (push prompt / receive response / place
+// reminder / fire toast) is not yet implemented. The Start button currently
+// shows a placeholder confirming what *would* happen. Phase B replaces this
+// placeholder with the real flow.
+function NightStepActionRow({ step, readOnly }) {
+  const { action, seat, instruction, reminderLabel, prompt } = step;
+  if (readOnly) return null;
+  if (!seat) return (
+    <div className="mt-1.5 text-[11px] text-stone-500 italic">No seat — handle manually.</div>
+  );
+  if (seat.isDead && action !== 'manual') return (
+    <div className="mt-1.5 text-[11px] text-stone-500 italic">Seat is dead — skip.</div>
+  );
+
+  const actionLabel = ({
+    target1:     'Asks for 1 player',
+    target1self: 'Asks for 1 player (self ok)',
+    target1any:  'Asks for 1 player (dead ok)',
+    target2:     'Asks for 2 players',
+    'info-st':   'You pick the info to reveal',
+    manual:      'No automation — handle in person',
+  })[action] || action;
+
+  const onStart = () => {
+    if (seat.isLocal) {
+      alert(
+        'Phase B (coming next):\n\n' +
+        'Show the "' + actionLabel + '" prompt on THIS device since seat #' + seat.seatNum + ' is local.\n\n' +
+        'Instruction: ' + instruction + '\n\n' +
+        (reminderLabel ? 'On submit → place "' + reminderLabel + '" reminder on chosen seat.' : '')
+      );
+    } else {
+      alert(
+        'Phase B (coming next):\n\n' +
+        'Push the "' + actionLabel + '" prompt to seat #' + seat.seatNum + (seat.playerName ? ' · ' + seat.playerName : '') + '\'s phone.\n\n' +
+        'Instruction: ' + instruction + '\n\n' +
+        (reminderLabel ? 'On submit → place "' + reminderLabel + '" reminder on chosen seat.' : '')
+      );
+    }
+  };
+  const onMarkDone = () => {
+    alert('Phase B (coming next): marking this step done will collapse the row and advance the highlight.');
+  };
+
+  let statusBadge = null;
+  if (prompt?.status === 'awaiting') {
+    statusBadge = <span className="text-[10px] uppercase text-amber-300 font-semibold">⌛ awaiting player</span>;
+  } else if (prompt?.status === 'submitted') {
+    statusBadge = <span className="text-[10px] uppercase text-emerald-300 font-semibold">✓ submitted</span>;
+  } else if (prompt?.status === 'question') {
+    statusBadge = <span className="text-[10px] uppercase text-red-300 font-semibold">⚠ question raised</span>;
+  } else if (prompt?.status === 'done') {
+    statusBadge = <span className="text-[10px] uppercase text-stone-400">done</span>;
+  }
+
+  return (
+    <div className="mt-2 pt-2 border-t border-stone-800/70">
+      <div className="text-[11px] text-stone-400 mb-1.5 italic">
+        Automation: <span className="text-amber-300/90 not-italic">{actionLabel}</span>
+        {reminderLabel && <> · auto-places <span className="text-amber-200 not-italic">"{reminderLabel}"</span></>}
+        {statusBadge && <span className="ml-2">{statusBadge}</span>}
+      </div>
+      <div className="flex items-center gap-2 flex-wrap">
+        {action === 'manual' ? (
+          <button onClick={onMarkDone}
+            className="text-xs px-3 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
+            Mark done
+          </button>
+        ) : (
+          <>
+            <button onClick={onStart}
+              className="text-xs px-3 py-1 rounded bg-amber-700 hover:bg-amber-600 text-stone-950 font-medium">
+              ▶ Start
+            </button>
+            <button onClick={onMarkDone}
+              className="text-xs px-2.5 py-1 rounded pill hover:border-stone-400 hover:text-stone-200 text-stone-400">
+              Skip
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ---------------- Night Phase Section ----------------
 
 // Labels for the abstract "ceremonies" that appear in the official night order
@@ -6280,8 +6527,11 @@ const NIGHT_CEREMONIES = {
   demoninfo:   'Demon wakes — learns Minions & sees 3 bluffs',
 };
 
-function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted, extraCharIds = [] }) {
-  const [collapsed, setCollapsed] = useState(true);
+function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted, extraCharIds = [],
+                              automation = false, nightPrompts = {}, readOnly = false }) {
+  // Auto-expand when automation is on so the ST sees the interactive panel immediately.
+  const [collapsed, setCollapsed] = useState(!automation);
+  useEffect(() => { if (automation) setCollapsed(false); }, [automation]);
   const nightOrder = window.BOTC_DATA?.nightOrder || { firstNight: [], otherNight: [] };
   // The "night" is determined by the day being viewed. Day 0 -> Night 0 (first), Day N -> Night N.
   const nightNum = viewingDayIndex || 0;
@@ -6309,7 +6559,14 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
       if (!seat && !isExtra) continue;
       stepNum += 1;
       const reminder = (isFirstNight ? c.firstNightReminder : c.otherNightReminder) || '';
-      steps.push({ type: 'char', stepNum, char: c, seat, reminder, isExtra });
+      // For automation: resolve the action descriptor; phase-restricted roles fall back to manual.
+      const def = nightActionFor(id);
+      const phaseOk = def.phase === 'both' || (def.phase === 'first' && isFirstNight) || (def.phase === 'other' && !isFirstNight);
+      const effectiveAction = phaseOk ? def.action : 'manual';
+      const prompt = seat ? nightPrompts[seat.seatNum] : null;
+      steps.push({ type: 'char', stepNum, char: c, seat, reminder, isExtra,
+                   action: effectiveAction, instruction: def.instruction, reminderLabel: def.reminder,
+                   prompt });
     }
   }
   // Active jinxes (same logic as JinxSection but scoped to in-play characters).
@@ -6317,12 +6574,13 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
   const jinxes = getActiveJinxes(inPlayIds);
 
   return (
-    <section className="parchment rounded-lg p-3 sm:p-4">
+    <section className={`parchment rounded-lg p-3 sm:p-4 ${automation ? 'border-amber-700/60' : ''}`}>
       <button onClick={() => setCollapsed(c => !c)}
         className="w-full flex items-center justify-between gap-2 text-left">
         <div>
           <h3 className="text-amber-200 font-semibold">
             Night phase {gameStarted && <span className="text-stone-400 font-normal">· {isFirstNight ? 'first night' : `night ${nightNum}`}</span>}
+            {automation && <span className="ml-2 text-[10px] uppercase tracking-wider text-amber-400 align-middle">⚡ automated</span>}
           </h3>
           <p className="text-xs text-stone-400">
             {steps.filter(s => s.type === 'char').length} characters wake
@@ -6344,7 +6602,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                   {s.label}
                 </li>
               ) : (
-                <li key={i} className={`card rounded p-2 flex items-start gap-2 ${s.seat?.isDead ? 'opacity-50' : ''}`}>
+                <li key={i} className={`card rounded p-2 flex items-start gap-2 ${s.seat?.isDead ? 'opacity-50' : ''} ${automation && s.prompt?.status === 'awaiting' ? 'border-amber-500 ring-1 ring-amber-700/40' : ''} ${automation && s.prompt?.status === 'question' ? 'border-red-500 ring-1 ring-red-700/40' : ''}`}>
                   <span className="text-stone-500 text-xs tabular-nums w-6 text-center pt-0.5">{s.stepNum}</span>
                   {iconUrl(s.char.id) && (
                     <img src={iconUrl(s.char.id)} alt=""
@@ -6357,6 +6615,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                         <>
                           <span className="text-[10px] uppercase text-amber-200/70">seat #{s.seat.seatNum}{s.seat.playerName ? ` · ${s.seat.playerName}` : ''}</span>
                           {s.seat.isDead && <span className="text-[10px] uppercase text-red-400">dead</span>}
+                          {s.seat.isLocal && <span className="text-[10px] uppercase text-purple-300">🏠 local</span>}
                         </>
                       ) : (
                         <span className="text-[10px] uppercase text-amber-300/80">no seat · find the "Is the Demon" reminder</span>
@@ -6364,6 +6623,9 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                     </div>
                     {s.reminder && (
                       <div className="text-xs text-stone-300/85 mt-0.5 leading-snug">{s.reminder}</div>
+                    )}
+                    {automation && (
+                      <NightStepActionRow step={s} readOnly={readOnly} />
                     )}
                   </div>
                 </li>
