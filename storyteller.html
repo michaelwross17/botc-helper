@@ -2070,7 +2070,11 @@ function App() {
         />
       )}
 
-      {deathConfirmSeat != null && (
+      {/* Death-confirm modal — deferred while a LocalNightPromptOverlay is
+          open so the local player (holding the ST phone) doesn't see who died
+          or any attached role/protection info. The modal appears as soon as
+          the ST taps "Return to storyteller" and the local overlay closes. */}
+      {deathConfirmSeat != null && localOverlayStep == null && (
         <DeathConfirmModal
           seat={(state.grimoire.seats || []).find(s => s.seatNum === deathConfirmSeat)}
           seats={state.grimoire.seats || []}
