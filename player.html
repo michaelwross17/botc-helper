@@ -486,21 +486,28 @@ function SeatPicker({ seats, clientId, onPicked }) {
         )}
         <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
           {seats.map(seat => {
-            const taken = (seat.claims || []).length > 0;
+            const claimed = (seat.claims || []).length > 0;
+            const isLocal = !!seat.isLocal;
+            // Local seats are managed on the ST's device — no remote phone can claim them.
+            const taken = claimed || isLocal;
             return (
               <button key={seat.seatNum}
-                onClick={() => pick(seat.seatNum)}
+                onClick={() => !isLocal && pick(seat.seatNum)}
                 disabled={taken}
                 className={`seat-btn rounded-lg border flex flex-col items-center justify-center gap-0.5 p-2 transition
                   ${taken
                     ? 'bg-stone-900/60 border-stone-800 text-stone-600 cursor-not-allowed'
                     : 'pill hover:border-amber-500 hover:text-amber-200 active:scale-95'}`}>
                 <span className="text-lg font-bold">#{seat.seatNum}</span>
-                {taken
-                  ? <span className="text-[10px] uppercase truncate w-full text-center">
-                      {seat.playerName ? seat.playerName : 'taken'}
+                {isLocal
+                  ? <span className="text-[10px] uppercase truncate w-full text-center text-purple-400">
+                      🏠 local{seat.playerName ? ` · ${seat.playerName}` : ''}
                     </span>
-                  : <span className="text-[10px] uppercase text-stone-500">open</span>}
+                  : taken
+                    ? <span className="text-[10px] uppercase truncate w-full text-center">
+                        {seat.playerName ? seat.playerName : 'taken'}
+                      </span>
+                    : <span className="text-[10px] uppercase text-stone-500">open</span>}
               </button>
             );
           })}
