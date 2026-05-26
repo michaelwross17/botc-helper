@@ -1371,6 +1371,27 @@ function App() {
   // Not persisted to Firebase — purely per-session UI.
   const [toasts, setToasts] = useState([]);
 
+  // Day-phase banners — small dismissable cards rendered on the grimoire page.
+  // Used for outcomes of day-phase ability claims (e.g. "Alice claimed Slayer
+  // on Bob — not the Slayer, nothing happens"). Transient per session.
+  const [dayBanners, setDayBanners] = useState([]);
+  const pushDayBanner = (banner) => {
+    setDayBanners(prev => [...prev, { id: 'b_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), ...banner }]);
+  };
+  const dismissDayBanner = (id) => setDayBanners(prev => prev.filter(b => b.id !== id));
+
+  // Corner-notification prompts — small slide-in cards in the bottom-right of
+  // the screen. Used for active ST prompts during day-phase ability resolution
+  // (e.g. "Real Slayer but drunk/poisoned — fire anyway?"). Each prompt has
+  // actions; clicking an action resolves and dismisses. Transient per session.
+  const [cornerPrompts, setCornerPrompts] = useState([]);
+  const addCornerPrompt = (prompt) => {
+    const id = 'cp_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+    setCornerPrompts(prev => [...prev, { id, ...prompt }]);
+    return id;
+  };
+  const dismissCornerPrompt = (id) => setCornerPrompts(prev => prev.filter(p => p.id !== id));
+
   // Per-session set of seatNums whose ST-response popup has been dismissed by
   // the storyteller. The banner remains visible at the top of the grimoire;
   // dismissing only hides the modal popup. The set is cleared when the prompt
@@ -1823,6 +1844,10 @@ function App() {
         votes: 0,
       }],
     });
+    // Auto-trigger Virgin if automation is on and the nominee is the Virgin.
+    if (state.features?.automation) {
+      tryFireVirgin(nominatorSeat, nomineeSeat);
+    }
   };
   const updateNomination = (dayIdx, id, patch) => {
     const day = dayEntry(dayIdx);
@@ -1961,6 +1986,178 @@ function App() {
       return { ...s, reminders };
     });
     update({ grimoire: { ...state.grimoire, seats } });
+  };
+
+  // ---------------- Day-phase ability resolution ----------------
+  //
+  // Each handler is called when the ST records a day-phase claim from the
+  // Nominations tab (Slayer claim, Psychopath claim, Mutant claim) or from
+  // a triggered nomination (Virgin). Steps:
+  //   1. Check whether the claimant actually has the role.
+  //   2. Check whether they're drunk or poisoned (ability malfunctions).
+  //   3. Check whether they've already used the ability (once-per-game roles).
+  //   4. Branch: fire / ask-ST-to-fire-anyway / no-op.
+  //
+  // Outcomes are surfaced via dayBanners (dismissable on grimoire) and/or
+  // cornerPrompts (active ST prompts). When an ability fires, the relevant
+  // reminders are auto-placed in the grimoire.
+  const _seatBy = (n) => (state.grimoire.seats || []).find(s => s.seatNum === n);
+  const _seatLabel = (s) => s ? `seat #${s.seatNum}${s.playerName ? ' · ' + s.playerName : ''}` : '?';
+
+  // Place an arbitrary reminder on a seat (used by ability resolvers).
+  const _placeReminderInline = (seatNum, charId, label, extra = {}) => {
+    const seats = state.grimoire.seats.map(s =>
+      s.seatNum === seatNum
+        ? { ...s, reminders: [...(s.reminders || []), { charId, label, ...extra }] }
+        : s
+    );
+    update({ grimoire: { ...state.grimoire, seats } });
+  };
+
+  // Slayer / Psychopath: claim + target. If real + sober → target dies +
+  // "No ability" placed on claimant. If real + drunk/poisoned → ask ST. If
+  // fake → dismissable banner only.
+  const resolveClaimAndKill = ({ roleId, label, claimantSeatNum, targetSeatNum }) => {
+    const claimant = _seatBy(claimantSeatNum);
+    const target = _seatBy(targetSeatNum);
+    if (!claimant || !target) return;
+    const isReal = claimant.actualRoleId === roleId;
+    const afflicted = isDrunkOrPoisoned(claimant);
+    const alreadyUsed = (claimant.reminders || []).some(r => r && /no ability/i.test(String(r.label || '')));
+    const claimantLabel = _seatLabel(claimant);
+    const targetLabel = _seatLabel(target);
+    const roleName = (CHAR_BY_ID[roleId] || {}).name || label;
+    if (alreadyUsed && isReal) {
+      pushDayBanner({
+        kind: 'info',
+        text: `${claimantLabel} claimed ${roleName} on ${targetLabel} — they're the ${roleName} but the ability has already been used (No ability marker present). Nothing happens.`,
+      });
+      return;
+    }
+    if (!isReal) {
+      // Fake claim — banner only.
+      pushDayBanner({
+        kind: 'fake',
+        text: `${claimantLabel} claimed ${roleName} on ${targetLabel} — not the ${roleName}. Nothing happens.`,
+      });
+      return;
+    }
+    // Real claimant. Fire either immediately (sober) or after ST confirmation (drunk/poisoned).
+    const fire = () => {
+      // Place Dead on target → queues death-confirm via existing addReminder hook.
+      addReminder(targetSeatNum, roleId, 'Dead');
+      // Place "No ability" on claimant so the ability dims/locks in future.
+      _placeReminderInline(claimantSeatNum, roleId, 'No ability');
+      addCornerPrompt({
+        kind: 'success',
+        title: `${roleName} fired`,
+        body: `${claimantLabel} is the ${roleName} — ${targetLabel} marked dead.`,
+        actions: [{ label: 'Got it', primary: true }],
+      });
+    };
+    if (afflicted) {
+      const cpId = addCornerPrompt({
+        kind: 'warn',
+        title: `${roleName} (drunk/poisoned)`,
+        body: `${claimantLabel} IS the ${roleName} but is drunk or poisoned. Fire the ability on ${targetLabel} anyway?`,
+        actions: [
+          { label: 'Fire anyway', primary: true, onClick: () => fire() },
+          { label: 'No effect', onClick: () => pushDayBanner({
+              kind: 'info',
+              text: `${claimantLabel}'s ${roleName} ability did not fire (drunk/poisoned).`,
+          }) },
+        ],
+      });
+    } else {
+      fire();
+    }
+  };
+
+  // Mutant: claim only (publicly claims to be an Outsider while being the
+  // Mutant). If real → prompt ST that they may be executed. If fake → banner.
+  const resolveMutantClaim = ({ claimantSeatNum }) => {
+    const claimant = _seatBy(claimantSeatNum);
+    if (!claimant) return;
+    const claimantLabel = _seatLabel(claimant);
+    const isReal = claimant.actualRoleId === 'mutant';
+    const afflicted = isDrunkOrPoisoned(claimant);
+    if (!isReal) {
+      pushDayBanner({
+        kind: 'fake',
+        text: `${claimantLabel} publicly claimed Outsider — not the Mutant. No execution required.`,
+      });
+      return;
+    }
+    addCornerPrompt({
+      kind: 'warn',
+      title: `Mutant publicly claimed Outsider`,
+      body: `${claimantLabel} IS the Mutant${afflicted ? ' (but is drunk/poisoned — ST may waive)' : ''}. You may execute them (BotC rule).`,
+      actions: [{ label: 'Got it', primary: true }],
+    });
+  };
+
+  // Virgin: auto-triggered when a Townsfolk nominates a Virgin who hasn't used
+  // the ability yet. Pops a corner prompt so the ST confirms execution (handles
+  // edge cases like Recluse registration).
+  const tryFireVirgin = (nominatorSeatNum, nomineeSeatNum) => {
+    const nominator = _seatBy(nominatorSeatNum);
+    const nominee = _seatBy(nomineeSeatNum);
+    if (!nominator || !nominee) return;
+    if (nominee.actualRoleId !== 'virgin') return;
+    const virginAlreadyUsed = (nominee.reminders || []).some(r => r && /no ability/i.test(String(r.label || '')));
+    if (virginAlreadyUsed) return;
+    const nominatorTeam = (CHAR_BY_ID[nominator.actualRoleId] || {}).team;
+    const nominatorAfflicted = isDrunkOrPoisoned(nominee);
+    const isRecluse = nominator.actualRoleId === 'recluse';
+    const isTownsfolk = nominatorTeam === 'townsfolk';
+    if (!isTownsfolk && !isRecluse) {
+      // Non-townsfolk nominator (and not Recluse) — ability doesn't fire.
+      return;
+    }
+    const fire = () => {
+      // Mark Virgin as used.
+      _placeReminderInline(nomineeSeatNum, 'virgin', 'No ability');
+      // Execute the nominator → place Dead → triggers death-confirm.
+      addReminder(nominatorSeatNum, 'virgin', 'Dead');
+      addCornerPrompt({
+        kind: 'success',
+        title: 'Virgin ability fired',
+        body: `${_seatLabel(nominator)} nominated the Virgin (${_seatLabel(nominee)}) and is executed immediately.`,
+        actions: [{ label: 'Got it', primary: true }],
+      });
+    };
+    if (nominatorAfflicted) {
+      // Virgin drunk/poisoned — ability malfunctions.
+      pushDayBanner({
+        kind: 'info',
+        text: `${_seatLabel(nominator)} nominated the Virgin (${_seatLabel(nominee)}) — Virgin is drunk/poisoned, ability does not fire.`,
+      });
+      _placeReminderInline(nomineeSeatNum, 'virgin', 'No ability');
+      return;
+    }
+    if (isRecluse) {
+      // ST may choose to fire (Recluse may register as Townsfolk).
+      addCornerPrompt({
+        kind: 'warn',
+        title: 'Virgin nominated by Recluse',
+        body: `Recluse may register as Townsfolk. Fire the Virgin ability and execute ${_seatLabel(nominator)}?`,
+        actions: [
+          { label: 'Yes, fire', primary: true, onClick: fire },
+          { label: 'No', onClick: () => {} },
+        ],
+      });
+      return;
+    }
+    // Townsfolk nominator + sober Virgin → confirm prompt.
+    addCornerPrompt({
+      kind: 'warn',
+      title: 'Virgin ability triggered',
+      body: `Townsfolk ${_seatLabel(nominator)} nominated the Virgin (${_seatLabel(nominee)}). Execute ${_seatLabel(nominator)} immediately?`,
+      actions: [
+        { label: 'Yes, execute', primary: true, onClick: fire },
+        { label: 'Cancel', onClick: () => {} },
+      ],
+    });
   };
 
   // Pickup a hidden role (Drunk / Marionette) for assignment. Toggle on re-pickup.
@@ -2148,6 +2345,8 @@ function App() {
           onSetDayVoting={setDayVoting}
           onSetViewingDay={setNominationsViewingDayIndex}
           onJumpToGrimoire={() => update({ page: 'grimoire' })}
+          onResolveClaimAndKill={resolveClaimAndKill}
+          onResolveMutantClaim={resolveMutantClaim}
         />
       )}
 
@@ -2167,6 +2366,8 @@ function App() {
           onDismissResponsePopup={dismissResponsePopup}
           onPromoteScarletWoman={promoteScarletWoman}
           onStartShowGrimoire={startShowGrimoire}
+          dayBanners={dayBanners}
+          onDismissDayBanner={dismissDayBanner}
           forceReadOnly={isSpectator}
           state={state}
           swapSourceSeat={swapSourceSeat}
@@ -2249,6 +2450,20 @@ function App() {
           open so the local player (holding the ST phone) doesn't see who died
           or any attached role/protection info. The modal appears as soon as
           the ST taps "Return to storyteller" and the local overlay closes. */}
+      {cornerPrompts.length > 0 && (
+        <STCornerPrompts
+          prompts={cornerPrompts}
+          onAction={(promptId, actionIdx) => {
+            const p = cornerPrompts.find(x => x.id === promptId);
+            if (!p) return;
+            const a = (p.actions || [])[actionIdx];
+            if (a && a.onClick) a.onClick();
+            dismissCornerPrompt(promptId);
+          }}
+          onDismiss={dismissCornerPrompt}
+        />
+      )}
+
       {deathConfirmSeat != null && localOverlayStep == null && localGrimoireSeat == null && (
         <DeathConfirmModal
           seat={(state.grimoire.seats || []).find(s => s.seatNum === deathConfirmSeat)}
@@ -3413,6 +3628,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
                         onStartNightPrompt, onCancelNightPrompt, onMarkStepDone, onClearAllNightPrompts, onOpenLocalPrompt,
                         onMarkSetupReminder, onSkipSetupReminders, onRespondToNightPrompt,
                         dismissedResponses, onDismissResponsePopup, onPromoteScarletWoman, onStartShowGrimoire,
+                        dayBanners = [], onDismissDayBanner,
                         onSeatTap, onCancelSwap, onPickupAssignment, onCancelAssignment,
                         onUndoAssignmentByCharId, onUnassignPending,
                         onToggleDead, onToggleAlignment, onSwap,
@@ -3575,6 +3791,10 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
 
       {nightToasts.length > 0 && (
         <NightToastStack toasts={nightToasts} onDismiss={onDismissNightToast} />
+      )}
+
+      {dayBanners.length > 0 && (
+        <DayBannerStack banners={dayBanners} onDismiss={onDismissDayBanner} />
       )}
 
       {/* ST-response banner at top of grimoire — persistent reminder. */}
@@ -5472,7 +5692,8 @@ function DayTabs({ days, viewingDayIndex, onSelect }) {
 
 // ---------------- Nominations page ----------------
 
-function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onSetViewingDay, onJumpToGrimoire }) {
+function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onSetViewingDay, onJumpToGrimoire,
+                            onResolveClaimAndKill, onResolveMutantClaim }) {
   const grim = state.grimoire;
 
   if (!grim.gameStarted) {
@@ -5511,6 +5732,15 @@ function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onS
         readOnly={isPast}
         onChange={(which, value) => onSetDayVoting(viewingIdx, which, value)}
       />
+
+      {!isPast && !!(state.features?.automation) && (
+        <DayAbilitiesSection
+          scriptCharIds={state.characterIds || []}
+          seats={liveSeats}
+          onResolveClaimAndKill={onResolveClaimAndKill}
+          onResolveMutantClaim={onResolveMutantClaim}
+        />
+      )}
 
       {!isPast && (
         <CircularNominator
@@ -7858,6 +8088,242 @@ function STResponseCard({ seatNum, prompt, seats, scriptCharIds = [], onSend }) 
         </div>
       )}
     </section>
+  );
+}
+
+// ---------------- Day-phase outcome banners (dismissable) ----------------
+//
+// Small cards stacked above the grimoire; ST dismisses each with ✕. Used for
+// "fake claim" outcomes and other auditable day-phase events.
+function DayBannerStack({ banners, onDismiss }) {
+  return (
+    <div className="space-y-1.5">
+      {banners.map(b => (
+        <div key={b.id}
+          className={`parchment rounded-lg p-2.5 flex items-start gap-2 border
+            ${b.kind === 'fake' ? 'border-stone-600 bg-stone-900/40' : 'border-amber-700/50 bg-amber-950/15'}`}>
+          <div className="text-base leading-none mt-0.5">{b.kind === 'fake' ? '·' : 'ℹ'}</div>
+          <div className="flex-1 min-w-0 text-xs text-stone-200 leading-snug">{b.text}</div>
+          <button onClick={() => onDismiss && onDismiss(b.id)}
+            title="Dismiss"
+            className="text-stone-500 hover:text-stone-300 px-1.5 -my-0.5 text-base leading-none">✕</button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ---------------- ST Corner Prompts (small notifications) ----------------
+//
+// Stacked in the bottom-right of the viewport. Compact (~280px wide on phones).
+// Each prompt has a title + body + actions. Action click invokes onAction(id, actionIdx).
+// Dismiss via ✕ (calls onDismiss(id) without invoking any action).
+function STCornerPrompts({ prompts, onAction, onDismiss }) {
+  return (
+    <div className="fixed bottom-3 right-3 z-50 flex flex-col gap-2 max-w-[300px] w-[calc(100vw-1.5rem)] sm:w-[280px]">
+      {prompts.map(p => (
+        <div key={p.id}
+          className={`rounded-lg shadow-xl border-2 p-3 text-xs leading-snug
+            ${p.kind === 'success'
+              ? 'border-emerald-700 bg-emerald-950/95 text-emerald-100'
+              : p.kind === 'warn'
+                ? 'border-amber-600 bg-amber-950/95 text-amber-100'
+                : 'border-stone-600 bg-stone-900/95 text-stone-100'}`}>
+          <div className="flex items-start gap-2 mb-1.5">
+            <div className="text-base leading-none">
+              {p.kind === 'success' ? '✓' : p.kind === 'warn' ? '⚠' : 'ℹ'}
+            </div>
+            <div className="flex-1 min-w-0 font-semibold text-[11px] uppercase tracking-wider">{p.title}</div>
+            <button onClick={() => onDismiss(p.id)} className="text-stone-400 hover:text-stone-100 leading-none">✕</button>
+          </div>
+          <div className="text-stone-100/95 mb-2">{p.body}</div>
+          {(p.actions || []).length > 0 && (
+            <div className="flex gap-1.5 flex-wrap">
+              {(p.actions || []).map((a, i) => (
+                <button key={i} onClick={() => onAction(p.id, i)}
+                  className={`px-2.5 py-1 rounded text-[11px] font-medium
+                    ${a.primary
+                      ? 'bg-amber-600 hover:bg-amber-500 text-stone-950'
+                      : 'bg-stone-800 hover:bg-stone-700 text-stone-200 border border-stone-700'}`}>
+                  {a.label}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ---------------- Day Abilities Section (Nominations tab) ----------------
+//
+// Renders above New Nomination on the Nominations tab when features.automation
+// is enabled. Lists role buttons for in-script day-phase abilities the ST
+// might need to resolve. Clicking opens DayClaimModal (compact picker).
+//
+// Currently covers: Slayer, Psychopath (claim+target), Mutant (claim only).
+// Virgin is auto-handled when a nomination is added.
+const DAY_ABILITY_ROLES = [
+  { id: 'slayer',     label: 'Slayer claim',     kind: 'claim-target', icon: 'slayer',     hint: '"I claim Slayer on X."' },
+  { id: 'psychopath', label: 'Psychopath claim', kind: 'claim-target', icon: 'psychopath', hint: '"I claim Psychopath, killing X."' },
+  { id: 'mutant',     label: 'Mutant claim',     kind: 'claim-only',   icon: 'mutant',     hint: 'Public Outsider claim — checks if they\'re the Mutant.' },
+];
+
+function DayAbilitiesSection({ scriptCharIds, seats, onResolveClaimAndKill, onResolveMutantClaim }) {
+  // Only show roles that are in the script.
+  const inScript = new Set(scriptCharIds || []);
+  const available = DAY_ABILITY_ROLES.filter(r => inScript.has(r.id));
+  const [openClaim, setOpenClaim] = useState(null); // descriptor of the modal to open
+  if (available.length === 0) return null;
+  return (
+    <section className="parchment rounded-lg p-3 sm:p-4 border-amber-700/40">
+      <div className="flex items-baseline justify-between gap-2 mb-2">
+        <h3 className="text-amber-200 font-semibold text-sm">Day-phase abilities</h3>
+        <span className="text-[10px] text-stone-500">Click when a player publicly claims one of these.</span>
+      </div>
+      <ul className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+        {available.map(r => (
+          <li key={r.id}>
+            <button onClick={() => setOpenClaim(r)}
+              className="w-full card rounded px-2.5 py-2 flex items-center gap-2 text-left hover:border-amber-500">
+              {iconUrl(r.icon) && (
+                <img src={iconUrl(r.icon)} alt=""
+                  className="w-9 h-9 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+              )}
+              <div className="flex-1 min-w-0 leading-tight">
+                <div className="text-sm text-amber-200 font-medium">{r.label}</div>
+                <div className="text-[10px] text-stone-400 truncate">{r.hint}</div>
+              </div>
+            </button>
+          </li>
+        ))}
+      </ul>
+      {openClaim && (
+        <DayClaimModal
+          role={openClaim}
+          seats={seats}
+          onSubmit={({ claimantSeatNum, targetSeatNum }) => {
+            if (openClaim.kind === 'claim-target') {
+              onResolveClaimAndKill && onResolveClaimAndKill({
+                roleId: openClaim.id,
+                label: openClaim.label,
+                claimantSeatNum,
+                targetSeatNum,
+              });
+            } else if (openClaim.kind === 'claim-only' && openClaim.id === 'mutant') {
+              onResolveMutantClaim && onResolveMutantClaim({ claimantSeatNum });
+            }
+            setOpenClaim(null);
+          }}
+          onClose={() => setOpenClaim(null)}
+        />
+      )}
+    </section>
+  );
+}
+
+function DayClaimModal({ role, seats, onSubmit, onClose }) {
+  const needsTarget = role.kind === 'claim-target';
+  const [claimantSeatNum, setClaimantSeatNum] = useState(null);
+  const [targetSeatNum, setTargetSeatNum]     = useState(null);
+  const canSubmit = claimantSeatNum != null && (!needsTarget || targetSeatNum != null);
+  const aliveSeats = (seats || []).filter(s => s && s.actualRoleId);
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-950/85 flex items-start sm:items-center justify-center p-2 sm:p-4 overflow-y-auto">
+      <div className="parchment rounded-lg p-4 sm:p-5 max-w-md w-full my-4 space-y-3 border-2 border-amber-700/60">
+        <div className="flex items-center gap-3">
+          {iconUrl(role.icon) && (
+            <img src={iconUrl(role.icon)} alt=""
+              className="w-12 h-12 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
+          )}
+          <div className="flex-1 min-w-0">
+            <div className="text-xs uppercase tracking-wider text-amber-300">{role.label}</div>
+            <div className="text-amber-200 text-sm font-bold leading-tight">
+              {needsTarget ? 'Pick claimant + target' : 'Pick claimant'}
+            </div>
+          </div>
+          <button onClick={onClose} className="text-stone-400 hover:text-stone-200 text-xl leading-none">✕</button>
+        </div>
+
+        <div>
+          <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">Claimant</div>
+          <ul className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-44 overflow-y-auto">
+            {aliveSeats.map(s => {
+              const picked = claimantSeatNum === s.seatNum;
+              const rc = CHAR_BY_ID[s.actualRoleId];
+              return (
+                <li key={s.seatNum}>
+                  <button onClick={() => setClaimantSeatNum(s.seatNum)}
+                    className={`w-full card rounded px-2 py-1.5 flex items-center gap-1.5 text-left text-sm
+                      ${picked ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}
+                      ${s.isDead ? 'opacity-60' : ''}`}>
+                    <span className="text-amber-200/80 text-xs w-6 text-center">#{s.seatNum}</span>
+                    {iconUrl(s.actualRoleId) && (
+                      <img src={iconUrl(s.actualRoleId)} alt=""
+                        className="w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                    )}
+                    <div className="flex-1 min-w-0 leading-tight">
+                      <div className="truncate">{s.playerName || <span className="text-stone-500 italic">—</span>}</div>
+                      <div className={`text-[9px] uppercase tracking-wider truncate ${rc ? `team-${rc.team}` : 'text-stone-500'}`}>
+                        {rc?.name || '(no role)'}
+                      </div>
+                    </div>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+
+        {needsTarget && (
+          <div>
+            <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">Target</div>
+            <ul className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-44 overflow-y-auto">
+              {aliveSeats.map(s => {
+                const picked = targetSeatNum === s.seatNum;
+                const rc = CHAR_BY_ID[s.actualRoleId];
+                return (
+                  <li key={s.seatNum}>
+                    <button onClick={() => setTargetSeatNum(s.seatNum)}
+                      className={`w-full card rounded px-2 py-1.5 flex items-center gap-1.5 text-left text-sm
+                        ${picked ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}
+                        ${s.isDead ? 'opacity-60' : ''}`}>
+                      <span className="text-amber-200/80 text-xs w-6 text-center">#{s.seatNum}</span>
+                      {iconUrl(s.actualRoleId) && (
+                        <img src={iconUrl(s.actualRoleId)} alt=""
+                          className="w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                      )}
+                      <div className="flex-1 min-w-0 leading-tight">
+                        <div className="truncate">{s.playerName || <span className="text-stone-500 italic">—</span>}</div>
+                        <div className={`text-[9px] uppercase tracking-wider truncate ${rc ? `team-${rc.team}` : 'text-stone-500'}`}>
+                          {rc?.name || '(no role)'}
+                        </div>
+                      </div>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-2 pt-2">
+          <button onClick={onClose}
+            className="py-2 rounded text-sm font-semibold bg-stone-800 hover:bg-stone-700 text-stone-300 border border-stone-700">
+            Cancel
+          </button>
+          <button onClick={() => onSubmit({ claimantSeatNum, targetSeatNum })}
+            disabled={!canSubmit}
+            className={`py-2 rounded text-sm font-bold transition
+              ${canSubmit
+                ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40'
+                : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+            Submit
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
