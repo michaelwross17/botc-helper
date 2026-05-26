@@ -1154,6 +1154,40 @@ function App() {
     update({ grimoire: { ...state.grimoire, seats } });
   };
 
+  // Promote the Scarlet Woman to the dead Demon's role. Triggered from the
+  // SW-promotion step in the night phase. Swaps the SW's role, resets dealing
+  // so the player phone re-shows role reveal (with demon bluffs etc.), and
+  // places a permanent "Was the Scarlet Woman" reminder.
+  const promoteScarletWoman = (swSeatNum, demonRoleId) => {
+    if (!swSeatNum || !demonRoleId) return;
+    const swSeat = state.grimoire.seats.find(s => s.seatNum === swSeatNum);
+    const demonName = CHAR_BY_ID[demonRoleId]?.name || demonRoleId;
+    const seats = state.grimoire.seats.map(s => {
+      if (s.seatNum !== swSeatNum) return s;
+      return {
+        ...s,
+        previousRoleId: 'scarletwoman',
+        changedBy:      'scarletwoman',
+        perceivedRoleId: demonRoleId,
+        actualRoleId:    demonRoleId,
+        // Re-deal: player phone re-renders RoleReveal with the new role + bluffs.
+        roleDealt:    true,
+        playerStatus: 'pending',
+        reminders: [
+          ...(s.reminders || []),
+          // scarletWomanOriginal flag → isReminderPermanent keeps this across nights.
+          { charId: 'scarletwoman', label: 'Was the Scarlet Woman', scarletWomanOriginal: true },
+        ],
+      };
+    });
+    update({ grimoire: { ...state.grimoire, seats } });
+    // For a local SW, auto-open the role overlay so the ST can hand the phone
+    // to the player without remembering to click Show role.
+    if (swSeat && swSeat.isLocal) {
+      setShowRoleForSeat(swSeatNum);
+    }
+  };
+
   // Toggle a seat between "remote" (player connects from a phone) and "local"
   // (no phone — ST shows the role on their own device). Marking a seat local
   // also clears any existing claims so a dead-phone client doesn't keep showing
@@ -1297,7 +1331,7 @@ function App() {
     // the prompt as 'awaiting-st-response' so the ST sees the response popup.
     // Subsequent submission (info ack with infoPayload set) transitions to
     // 'submitted' so the existing effect places the 'Chose' reminders.
-    const isPickerSubmitForTwoStep = step.action === 'target2+yesno' && !infoPayload;
+    const isPickerSubmitForTwoStep = (step.action === 'target2+yesno' || step.action === 'target1+role') && !infoPayload;
     const newStatus = isPickerSubmitForTwoStep ? 'awaiting-st-response' : 'submitted';
     // Preserve existing targets when caller didn't supply new ones (info ack).
     const newTargets = (Array.isArray(targets) && targets.length > 0)
@@ -2003,6 +2037,7 @@ function App() {
           onRespondToNightPrompt={respondToNightPrompt}
           dismissedResponses={dismissedResponses}
           onDismissResponsePopup={dismissResponsePopup}
+          onPromoteScarletWoman={promoteScarletWoman}
           forceReadOnly={isSpectator}
           state={state}
           swapSourceSeat={swapSourceSeat}
@@ -3237,7 +3272,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
                         nightToasts = [], onDismissNightToast,
                         onStartNightPrompt, onCancelNightPrompt, onMarkStepDone, onClearAllNightPrompts, onOpenLocalPrompt,
                         onMarkSetupReminder, onSkipSetupReminders, onRespondToNightPrompt,
-                        dismissedResponses, onDismissResponsePopup,
+                        dismissedResponses, onDismissResponsePopup, onPromoteScarletWoman,
                         onSeatTap, onCancelSwap, onPickupAssignment, onCancelAssignment,
                         onUndoAssignmentByCharId, onUnassignPending,
                         onToggleDead, onToggleAlignment, onSwap,
@@ -3406,6 +3441,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
       <STResponseInline
         prompts={grim.nightPrompts || {}}
         seats={grim.seats || []}
+        scriptCharIds={state.characterIds || []}
         onSend={onRespondToNightPrompt}
       />
 
@@ -3418,6 +3454,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         dismissed={dismissedResponses || new Set()}
         onDismiss={onDismissResponsePopup}
         onSend={onRespondToNightPrompt}
+        scriptCharIds={state.characterIds || []}
       />
 
       <GrimoireToolbar
@@ -3578,6 +3615,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         scriptCharIds={state.characterIds || []}
         onOpenLocalPrompt={onOpenLocalPrompt}
         nominationsByDay={grim.nominationsByDay || {}}
+        onPromoteScarletWoman={onPromoteScarletWoman}
       />
 
       <DealRolesButton
@@ -6919,7 +6957,9 @@ const NIGHT_ACTIONS = {
   imp:           { action: 'target1self', reminder: 'Dead',        instruction: 'Choose a player to kill. (Choose yourself to pass the demon to a Minion.)', phase: 'other' },
   fortuneteller: { action: 'target2+yesno', reminder: 'Chose',     instruction: 'Choose 2 players. You will learn if either is the Demon.',
                    responseConfig: { yesLabel: 'YES — one of them registers as the Demon', noLabel: 'NO — neither is the Demon' } },
-  ravenkeeper:   { action: 'target1',     reminder: 'Chose',       instruction: 'You died tonight. Choose a player — you will learn their character.', phase: 'other' },
+  ravenkeeper:   { action: 'target1+role', reminder: 'Chose',     instruction: 'You died tonight. Choose a player — you will learn their character.', phase: 'other',
+                   requiresDeath: true,
+                   responseConfig: { title: 'Show the Ravenkeeper a character' } },
   washerwoman:   { action: 'info-st',     reminder: 'Townsfolk',   instruction: 'You learn that one of 2 players is a particular Townsfolk.', phase: 'first',
                    infoType: 'seats+role', infoConfig: { numSeats: 2, roleTeam: 'townsfolk', allowNone: false, prefix: 'One of these players is the' } },
   librarian:     { action: 'info-st',     reminder: 'Outsider',    instruction: 'You learn that one of 2 players is a particular Outsider (or that no Outsiders are in play).', phase: 'first',
@@ -6976,6 +7016,7 @@ function nightActionFor(roleId) {
     instruction: def.instruction || '',
     eligible: def.eligible || 'all',
     phase: def.phase || 'both',
+    requiresDeath: !!def.requiresDeath,
   };
 }
 
@@ -7012,6 +7053,7 @@ function isReminderPermanent(reminder) {
   if (!reminder) return false;
   if (reminder.hiddenRoleMarker) return true;
   if (reminder.kazaliOriginal) return true;
+  if (reminder.scarletWomanOriginal) return true;
   if (PERMANENT_REMINDER_LABELS.has(reminder.label)) return true;
   if (PERMANENT_REMINDER_CHARS.has(reminder.charId)) return true;
   // Courtier countdown — 3-night "Drunk" persists.
@@ -7056,6 +7098,25 @@ function isDrunkOrPoisoned(seat) {
 // reminder is placed. Returns { reasons: [...], afflicted: bool } where
 // `reasons` is a human-readable list (empty = no protection found). Used by
 // the death-confirm modal so the ST can make an informed call.
+// Scarlet Woman: if she's alive, the Demon is dead, and there are 5+ alive
+// players (Travellers don't count), she becomes the Demon on the next night.
+// Returns null when conditions aren't met, otherwise { swSeat, deadDemonSeat,
+// demonRoleId, aliveCount }.
+function detectScarletWomanPromotion(seats) {
+  if (!seats || seats.length === 0) return null;
+  const swSeat = seats.find(s => s.actualRoleId === 'scarletwoman' && !s.isDead);
+  if (!swSeat) return null;
+  const deadDemonSeat = seats.find(s => {
+    if (!s.isDead) return false;
+    const team = CHAR_BY_ID[s.actualRoleId]?.team;
+    return team === 'demon';
+  });
+  if (!deadDemonSeat) return null;
+  const aliveCount = seats.filter(s => !s.isDead && s.actualRoleId).length;
+  if (aliveCount < 5) return null;
+  return { swSeat, deadDemonSeat, demonRoleId: deadDemonSeat.actualRoleId, aliveCount };
+}
+
 function checkDeathProtection(seat, allSeats) {
   if (!seat) return { reasons: [], afflicted: false };
   const reasons = [];
@@ -7228,12 +7289,24 @@ function infoSuggestion(roleId, mySeat, seats, ctx) {
 // shows a placeholder confirming what *would* happen. Phase B replaces this
 // placeholder with the real flow.
 function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onMarkDone: onMarkDoneProp, onOpenInfoPicker, onOpenLocalPrompt, gameStarted = false }) {
-  const { action, seat, instruction, reminderLabel, prompt } = step;
+  const { action, seat, instruction, reminderLabel, prompt, requiresDeath } = step;
   if (readOnly) return null;
   if (!seat) return (
     <div className="mt-1.5 text-[11px] text-stone-500 italic">No seat — handle manually.</div>
   );
-  if (seat.isDead && action !== 'manual') return (
+  // requiresDeath roles (Ravenkeeper) only fire when the seat is dead AND has
+  // a "Dead" reminder — i.e. they died this night (Dead reminders are cleared
+  // at Go to Night). This catch comes before the generic "seat is dead — skip"
+  // check below, since for these roles death is the trigger, not a skip reason.
+  const hasDeadReminder = (seat.reminders || []).some(r => r && r.label === 'Dead');
+  if (requiresDeath && !(seat.isDead && hasDeadReminder)) {
+    return (
+      <div className="mt-1.5 text-[11px] text-stone-500 italic">
+        Wakes only when this seat dies at night (needs both seat-dead and a "Dead" reminder).
+      </div>
+    );
+  }
+  if (seat.isDead && action !== 'manual' && !requiresDeath) return (
     <div className="mt-1.5 text-[11px] text-stone-500 italic">Seat is dead — skip.</div>
   );
   if (!gameStarted) {
@@ -7245,12 +7318,14 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
   // — see the dispatch in onStart below. We still annotate the row visually.)
 
   const actionLabel = ({
-    target1:     'Asks for 1 player',
-    target1self: 'Asks for 1 player (self ok)',
-    target1any:  'Asks for 1 player (dead ok)',
-    target2:     'Asks for 2 players',
-    'info-st':   'You pick the info to reveal',
-    manual:      'No automation — handle in person',
+    target1:        'Asks for 1 player',
+    target1self:    'Asks for 1 player (self ok)',
+    target1any:     'Asks for 1 player (dead ok)',
+    target2:        'Asks for 2 players',
+    'target2+yesno':'Asks for 2 players → you respond YES/NO',
+    'target1+role': 'Asks for 1 player → you respond with a role',
+    'info-st':      'You pick the info to reveal',
+    manual:         'No automation — handle in person',
   })[action] || action;
 
   const onStart = () => {
@@ -7433,7 +7508,7 @@ function SetupRemindersBanner({ seats, remindersDone, skipped, onMark, onSkip })
 // their targets and now the ST needs to respond with info. Currently only
 // Fortune Teller uses this (action='target2+yesno'), but the component is
 // designed generically.
-function STResponseInline({ prompts, seats, onSend }) {
+function STResponseInline({ prompts, seats, scriptCharIds = [], onSend }) {
   const pending = Object.entries(prompts || {})
     .filter(([_, p]) => p && p.status === 'awaiting-st-response')
     .map(([k, p]) => ({ seatNum: Number(k), prompt: p }));
@@ -7445,6 +7520,7 @@ function STResponseInline({ prompts, seats, onSend }) {
           seatNum={seatNum}
           prompt={prompt}
           seats={seats}
+          scriptCharIds={scriptCharIds}
           onSend={(payload) => onSend(seatNum, payload)}
         />
       ))}
@@ -7452,7 +7528,7 @@ function STResponseInline({ prompts, seats, onSend }) {
   );
 }
 
-function STResponseCard({ seatNum, prompt, seats, onSend }) {
+function STResponseCard({ seatNum, prompt, seats, scriptCharIds = [], onSend }) {
   const c = CHAR_BY_ID[prompt.roleId];
   const mySeat = seats.find(s => s.seatNum === seatNum);
   // Firebase may round-trip arrays as { 0: x, 1: y } objects; coerce back.
@@ -7462,7 +7538,11 @@ function STResponseCard({ seatNum, prompt, seats, onSend }) {
         ? Object.keys(prompt.targets).sort((a, b) => Number(a) - Number(b)).map(k => prompt.targets[k])
         : []);
   const targetSeats = targets.map(n => seats.find(s => s.seatNum === n)).filter(Boolean);
-  const ftDrunkOrPoisoned = isDrunkOrPoisoned(mySeat);
+  const askerAfflicted = isDrunkOrPoisoned(mySeat);
+  const isRolePick = prompt.action === 'target1+role';
+  // Auto-suggested role for target1+role = the chosen seat's actualRoleId.
+  const suggestedRoleId = isRolePick && targetSeats[0] ? targetSeats[0].actualRoleId : null;
+  const [pickedRole, setPickedRole] = useState('');
   // Auto-suggest YES if any target is demon-team or has a Red Herring reminder.
   const yesReason = [];
   for (const ts of targetSeats) {
@@ -7473,6 +7553,14 @@ function STResponseCard({ seatNum, prompt, seats, onSend }) {
   }
   const recluseAmong = targetSeats.some(ts => (CHAR_BY_ID[ts.actualRoleId] || {}).id === 'recluse');
   const suggestedYes = yesReason.length > 0;
+
+  // Candidate roles for the role-pick variant (any in-script role).
+  const candidateRoles = isRolePick
+    ? (scriptCharIds || [])
+        .map(id => CHAR_BY_ID[id])
+        .filter(Boolean)
+        .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+    : [];
 
   return (
     <section className="parchment rounded-lg p-3 sm:p-4 border-2 border-amber-600/70 bg-amber-950/15 space-y-3">
@@ -7492,7 +7580,7 @@ function STResponseCard({ seatNum, prompt, seats, onSend }) {
         </div>
       </div>
 
-      {ftDrunkOrPoisoned && (
+      {askerAfflicted && (
         <div className="rounded-md p-2.5 border-2 border-red-600/70 bg-red-950/40 text-red-100 text-xs">
           <span className="font-semibold">⚠ Drunk or poisoned</span> — you may give false info.
         </div>
@@ -7500,7 +7588,7 @@ function STResponseCard({ seatNum, prompt, seats, onSend }) {
 
       <div>
         <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">
-          Players chosen
+          {isRolePick ? 'Player chosen' : 'Players chosen'}
         </div>
         <ul className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
           {targetSeats.map(ts => {
@@ -7520,7 +7608,7 @@ function STResponseCard({ seatNum, prompt, seats, onSend }) {
                   <div className={`text-[10px] uppercase tracking-wider truncate ${rc ? `team-${rc.team}` : 'text-stone-500'}`}>
                     {rc?.name || '(no role)'}
                   </div>
-                  {(isDemon || hasRH || isRecluse) && (
+                  {!isRolePick && (isDemon || hasRH || isRecluse) && (
                     <div className="text-[10px] mt-0.5 space-x-1">
                       {isDemon && <span className="text-red-300">⚑ Demon</span>}
                       {hasRH && <span className="text-amber-300">⚑ Red Herring</span>}
@@ -7534,30 +7622,71 @@ function STResponseCard({ seatNum, prompt, seats, onSend }) {
         </ul>
       </div>
 
-      <div>
-        <div className="flex items-baseline justify-between gap-2 mb-1.5">
-          <span className="text-xs uppercase tracking-wider text-amber-300">Send the answer</span>
-          <span className="text-[10px] text-stone-400">
-            Suggested: <span className={suggestedYes ? 'text-emerald-300 font-bold' : 'text-red-300 font-bold'}>
-              {suggestedYes ? 'YES' : 'NO'}
+      {/* Branch on response shape: yes/no buttons for FT, role grid for Ravenkeeper-style */}
+      {isRolePick ? (
+        <div>
+          <div className="flex items-baseline justify-between gap-2 mb-1.5">
+            <span className="text-xs uppercase tracking-wider text-amber-300">Pick the role to reveal</span>
+            {suggestedRoleId && (
+              <button onClick={() => setPickedRole(suggestedRoleId)}
+                className={`text-[11px] px-2 py-1 rounded transition
+                  ${pickedRole === suggestedRoleId
+                    ? 'bg-emerald-700/60 text-emerald-100 border border-emerald-600'
+                    : 'pill hover:border-emerald-500 hover:text-emerald-200 text-emerald-300'}`}>
+                {pickedRole === suggestedRoleId ? '✓ Suggested: ' : 'Suggested: '}
+                <span className="font-bold">{(CHAR_BY_ID[suggestedRoleId] || {}).name || suggestedRoleId}</span>
+              </button>
+            )}
+          </div>
+          <ul className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-60 overflow-y-auto">
+            {candidateRoles.map(rc => (
+              <li key={rc.id}>
+                <button onClick={() => setPickedRole(rc.id)}
+                  className={`w-full card rounded px-2 py-1.5 flex items-center gap-2 text-left text-sm
+                    ${pickedRole === rc.id ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}`}>
+                  {iconUrl(rc.id) && <img src={iconUrl(rc.id)} alt="" className="w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0" />}
+                  <span className={`flex-1 min-w-0 truncate team-${rc.team}`}>{rc.name}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+          <div className="grid grid-cols-1 gap-2 pt-3">
+            <button onClick={() => onSend({ type: 'role', roleId: pickedRole })}
+              disabled={!pickedRole}
+              className={`py-3 rounded-lg text-base font-bold transition
+                ${pickedRole
+                  ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40'
+                  : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+              Send role →
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div>
+          <div className="flex items-baseline justify-between gap-2 mb-1.5">
+            <span className="text-xs uppercase tracking-wider text-amber-300">Send the answer</span>
+            <span className="text-[10px] text-stone-400">
+              Suggested: <span className={suggestedYes ? 'text-emerald-300 font-bold' : 'text-red-300 font-bold'}>
+                {suggestedYes ? 'YES' : 'NO'}
+              </span>
+              {recluseAmong && !suggestedYes && <span className="text-stone-500"> (or YES via Recluse)</span>}
             </span>
-            {recluseAmong && !suggestedYes && <span className="text-stone-500"> (or YES via Recluse)</span>}
-          </span>
+          </div>
+          {yesReason.length > 0 && (
+            <div className="text-[10px] text-stone-400 mb-1.5">Reason: {yesReason.join('; ')}.</div>
+          )}
+          <div className="grid grid-cols-2 gap-3">
+            <button onClick={() => onSend({ type: 'yesno', yes: true })}
+              className="py-3 rounded-lg text-base font-bold transition bg-emerald-700 hover:bg-emerald-600 text-stone-100">
+              Send YES →
+            </button>
+            <button onClick={() => onSend({ type: 'yesno', yes: false })}
+              className="py-3 rounded-lg text-base font-bold transition bg-red-700 hover:bg-red-600 text-stone-100">
+              Send NO →
+            </button>
+          </div>
         </div>
-        {yesReason.length > 0 && (
-          <div className="text-[10px] text-stone-400 mb-1.5">Reason: {yesReason.join('; ')}.</div>
-        )}
-        <div className="grid grid-cols-2 gap-3">
-          <button onClick={() => onSend({ type: 'yesno', yes: true })}
-            className="py-3 rounded-lg text-base font-bold transition bg-emerald-700 hover:bg-emerald-600 text-stone-100">
-            Send YES →
-          </button>
-          <button onClick={() => onSend({ type: 'yesno', yes: false })}
-            className="py-3 rounded-lg text-base font-bold transition bg-red-700 hover:bg-red-600 text-stone-100">
-            Send NO →
-          </button>
-        </div>
-      </div>
+      )}
     </section>
   );
 }
@@ -7569,7 +7698,7 @@ function STResponseCard({ seatNum, prompt, seats, onSend }) {
 // notice it immediately even if scrolled elsewhere. ST can close (X) to
 // dismiss the popup for that seat (banner remains as a reminder), or click
 // Send YES/NO to respond. Status change naturally closes the popup.
-function STResponsePopup({ prompts, seats, dismissed, onDismiss, onSend }) {
+function STResponsePopup({ prompts, seats, dismissed, onDismiss, onSend, scriptCharIds = [] }) {
   const pending = Object.entries(prompts || {})
     .filter(([_, p]) => p && p.status === 'awaiting-st-response')
     .map(([k, p]) => ({ seatNum: Number(k), prompt: p }))
@@ -7589,6 +7718,7 @@ function STResponsePopup({ prompts, seats, dismissed, onDismiss, onSend }) {
           seatNum={seatNum}
           prompt={prompt}
           seats={seats}
+          scriptCharIds={scriptCharIds}
           onSend={(payload) => onSend(seatNum, payload)}
         />
         {pending.length > 1 && (
@@ -7695,6 +7825,84 @@ function DeathConfirmModal({ seat, seats, onConfirm, onDismiss }) {
           <button onClick={onConfirm}
             className="py-2.5 rounded-lg text-sm font-bold bg-red-700 hover:bg-red-600 text-stone-100 shadow-lg shadow-red-900/40">
             Yes, mark dead
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------- Scarlet Woman Promotion Modal ----------------
+//
+// Confirms promotion of the SW to the dead Demon's role. Shows both seats
+// (SW + dead Demon) so the ST can verify before committing. On confirm the
+// caller swaps roles, re-deals, and places the permanent "Was the Scarlet
+// Woman" reminder.
+function SWPromoteModal({ step, onConfirm, onCancel }) {
+  if (!step) return null;
+  const demonChar = CHAR_BY_ID[step.demonRoleId];
+  const swSeat = step.swSeat;
+  const deadDemonSeat = step.deadDemonSeat;
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-950/85 flex items-start sm:items-center justify-center p-2 sm:p-4 overflow-y-auto">
+      <div className="parchment rounded-lg p-4 sm:p-5 max-w-md w-full my-4 space-y-4 border-2 border-red-700/70">
+        <div className="flex items-center gap-3">
+          <div className="text-3xl leading-none">🩸</div>
+          <div className="flex-1 min-w-0">
+            <div className="text-xs uppercase tracking-wider text-red-300">Scarlet Woman promotion</div>
+            <div className="text-amber-200 text-lg font-bold leading-tight">
+              The Scarlet Woman becomes the Demon
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 gap-2">
+          <div className="card rounded p-2 flex items-center gap-2 border-stone-700">
+            {iconUrl('scarletwoman') && (
+              <img src={iconUrl('scarletwoman')} alt=""
+                className="w-10 h-10 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+            )}
+            <div className="flex-1 min-w-0 leading-tight">
+              <div className="text-xs uppercase tracking-wider text-stone-400">SW seat</div>
+              <div className="text-sm">
+                #{swSeat.seatNum}{swSeat.playerName ? ` · ${swSeat.playerName}` : ''}
+                {swSeat.isLocal && <span className="ml-1 text-[10px] text-purple-300">🏠 local</span>}
+              </div>
+            </div>
+          </div>
+          <div className="text-center text-stone-500 text-lg leading-none">↓</div>
+          <div className="card rounded p-2 flex items-center gap-2 border-red-700/60 bg-red-950/20">
+            {iconUrl(step.demonRoleId) && (
+              <img src={iconUrl(step.demonRoleId)} alt=""
+                className="w-10 h-10 rounded-full border border-red-700 object-cover flex-shrink-0" />
+            )}
+            <div className="flex-1 min-w-0 leading-tight">
+              <div className="text-xs uppercase tracking-wider text-red-300">becomes</div>
+              <div className="text-sm">
+                <span className="team-demon font-bold">{demonChar?.name || step.demonRoleId}</span>
+                <span className="text-stone-500 text-[11px] ml-1">(was seat #{deadDemonSeat.seatNum})</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="rounded-md p-2.5 bg-stone-900/60 border border-stone-800 text-xs text-stone-300/90 leading-snug space-y-1">
+          <div>On confirm:</div>
+          <ul className="space-y-0.5 ml-2">
+            <li>• SW's role changes to <span className="team-demon">{demonChar?.name || step.demonRoleId}</span> (with demon bluffs)</li>
+            <li>• Role is auto re-dealt — {swSeat.isLocal ? "the local-role overlay opens on this device" : "their phone re-shows the role reveal"}</li>
+            <li>• A permanent "Was the Scarlet Woman" reminder is placed on their seat</li>
+          </ul>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2 pt-1">
+          <button onClick={onCancel}
+            className="py-2.5 rounded-lg text-sm font-semibold bg-stone-800 hover:bg-stone-700 text-stone-300 border border-stone-700">
+            Cancel
+          </button>
+          <button onClick={onConfirm}
+            className="py-2.5 rounded-lg text-sm font-bold bg-red-700 hover:bg-red-600 text-stone-100 shadow-lg shadow-red-900/40">
+            Promote
           </button>
         </div>
       </div>
@@ -8469,7 +8677,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                               automation = false, nightPrompts = {}, readOnly = false,
                               onStartPrompt, onCancelPrompt, onMarkDone, onClearAllPrompts,
                               scriptCharIds = [], onOpenLocalPrompt,
-                              nominationsByDay = {} }) {
+                              nominationsByDay = {}, onPromoteScarletWoman }) {
   // Auto-expand when automation is on so the ST sees the interactive panel immediately.
   const [collapsed, setCollapsed] = useState(!automation);
   useEffect(() => { if (automation) setCollapsed(false); }, [automation]);
@@ -8477,6 +8685,12 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
   const [infoPickerStep, setInfoPickerStep] = useState(null);
   const openInfoPicker = (step) => setInfoPickerStep(step);
   const closeInfoPicker = () => setInfoPickerStep(null);
+  // Scarlet Woman promotion confirm modal — opens when ST clicks Start on the
+  // synthetic SW step. Holds the step descriptor so the modal can read the
+  // dead demon's role + the SW's seat info.
+  const [swPromoteStep, setSWPromoteStep] = useState(null);
+  const openSWPromote  = (step) => setSWPromoteStep(step);
+  const closeSWPromote = () => setSWPromoteStep(null);
   const nightOrder = window.BOTC_DATA?.nightOrder || { firstNight: [], otherNight: [] };
   // The "night" is determined by the day being viewed. Day 0 -> Night 0 (first), Day N -> Night N.
   const nightNum = viewingDayIndex || 0;
@@ -8507,6 +8721,24 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
   // Emit ONE step per matching seat (so dual-FT etc. both show).
   const steps = [];
   let stepNum = 0;
+  // Scarlet Woman: if conditions are met at the start of any non-first night,
+  // synthesize a promotion step before the normal order. After the ST confirms
+  // promotion, SW's role changes and detectScarletWomanPromotion returns null
+  // on subsequent renders so the step disappears.
+  if (!isFirstNight) {
+    const sw = detectScarletWomanPromotion(seats);
+    if (sw) {
+      stepNum += 1;
+      steps.push({
+        type: 'sw-promote',
+        stepNum,
+        char: CHAR_BY_ID['scarletwoman'] || { id: 'scarletwoman', name: 'Scarlet Woman', team: 'minion' },
+        swSeat: sw.swSeat,
+        deadDemonSeat: sw.deadDemonSeat,
+        demonRoleId: sw.demonRoleId,
+      });
+    }
+  }
   for (const id of orderList) {
     if (NIGHT_CEREMONIES[id]) {
       steps.push({ type: 'ceremony', id, label: NIGHT_CEREMONIES[id] });
@@ -8526,14 +8758,14 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
       stepNum += 1;
       steps.push({ type: 'char', stepNum, char: c, seat: null, reminder, isExtra,
                    action: effectiveAction, instruction: def.instruction, reminderLabel: def.reminder,
-                   prompt: null });
+                   requiresDeath: def.requiresDeath, prompt: null });
     } else {
       for (const seat of matched) {
         stepNum += 1;
         const prompt = nightPrompts[seat.seatNum];
         steps.push({ type: 'char', stepNum, char: c, seat, reminder, isExtra,
                      action: effectiveAction, instruction: def.instruction, reminderLabel: def.reminder,
-                     prompt });
+                     requiresDeath: def.requiresDeath, prompt });
       }
     }
   }
@@ -8568,6 +8800,38 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
               {steps.map((s, i) => s.type === 'ceremony' ? (
                 <li key={i} className="card rounded px-3 py-1.5 border-stone-700 bg-stone-900/60 text-stone-300 text-xs uppercase tracking-wider text-center">
                   {s.label}
+                </li>
+              ) : s.type === 'sw-promote' ? (
+                <li key={i} className="card rounded p-2 flex items-start gap-2 border-red-600/70 bg-red-950/30">
+                  <span className="text-stone-500 text-xs tabular-nums w-6 text-center pt-0.5">{s.stepNum}</span>
+                  {iconUrl('scarletwoman') && (
+                    <img src={iconUrl('scarletwoman')} alt=""
+                      className="w-10 h-10 rounded-full border-2 border-red-600 object-cover flex-shrink-0" />
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="team-minion font-medium text-sm">Scarlet Woman</span>
+                      <span className="text-[10px] uppercase text-amber-200/70">seat #{s.swSeat.seatNum}{s.swSeat.playerName ? ` · ${s.swSeat.playerName}` : ''}</span>
+                      {s.swSeat.isLocal && <span className="text-[10px] uppercase text-purple-300">🏠 local</span>}
+                    </div>
+                    <div className="text-xs text-stone-300/85 mt-0.5 leading-snug">
+                      Demon (<span className="team-demon">{CHAR_BY_ID[s.demonRoleId]?.name || s.demonRoleId}</span>, seat #{s.deadDemonSeat.seatNum}) is dead. Promote the Scarlet Woman to take over.
+                    </div>
+                    {automation && (
+                      <div className="mt-2 pt-2 border-t border-stone-800/70">
+                        {gameStarted ? (
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <button onClick={() => openSWPromote(s)}
+                              className="text-xs px-3 py-1 rounded bg-red-700 hover:bg-red-600 text-stone-100 font-medium">
+                              ▶ Promote to {CHAR_BY_ID[s.demonRoleId]?.name || s.demonRoleId}
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="text-[11px] text-stone-500 italic">Click "Begin Game" first before promoting.</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </li>
               ) : (
                 <li key={i} className={`card rounded p-2 flex items-start gap-2 ${s.seat?.isDead ? 'opacity-50' : ''} ${automation && s.prompt?.status === 'awaiting' ? 'border-amber-500 ring-1 ring-amber-700/40' : ''} ${automation && s.prompt?.status === 'question' ? 'border-red-500 ring-1 ring-red-700/40' : ''}`}>
@@ -8665,6 +8929,17 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
             }
             closeInfoPicker();
           }}
+        />
+      )}
+
+      {swPromoteStep && (
+        <SWPromoteModal
+          step={swPromoteStep}
+          onConfirm={() => {
+            onPromoteScarletWoman && onPromoteScarletWoman(swPromoteStep.swSeat.seatNum, swPromoteStep.demonRoleId);
+            closeSWPromote();
+          }}
+          onCancel={closeSWPromote}
         />
       )}
     </section>

@@ -379,7 +379,7 @@ function App() {
             // 'awaiting-st-response' so the ST can pick the info to return.
             // For info acks (Got it on an info display) the prompt already has
             // an infoPayload — those go straight to 'submitted'.
-            const isTwoStep = curr.action === 'target2+yesno' && !curr.infoPayload;
+            const isTwoStep = (curr.action === 'target2+yesno' || curr.action === 'target1+role') && !curr.infoPayload;
             const newStatus = isTwoStep ? 'awaiting-st-response' : 'submitted';
             // Preserve existing targets when info-acking with an empty array,
             // so the ST effect can still place the per-target reminders.
