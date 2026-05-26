@@ -10,6 +10,28 @@
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
+<!-- Firebase: real-time cloud sync with the storyteller. Same project as the
+     storyteller page so both ends read/write the same room. -->
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
+<script>
+  var firebaseConfig = {
+    apiKey: "AIzaSyB4hEXL1Vtuh4clINjW-iHmVvEuK_9L5cI",
+    authDomain: "botc-helper-523b3.firebaseapp.com",
+    databaseURL: "https://botc-helper-523b3-default-rtdb.firebaseio.com",
+    projectId: "botc-helper-523b3",
+    storageBucket: "botc-helper-523b3.firebasestorage.app",
+    messagingSenderId: "572978707049",
+    appId: "1:572978707049:web:8a8661a1f1269b15ab00f8"
+  };
+  try {
+    firebase.initializeApp(firebaseConfig);
+    window.__BOTC_DB__ = firebase.database();
+  } catch (e) {
+    console.error('Firebase init failed:', e);
+  }
+</script>
+
 <!-- Shared character data (so the player can see role icons later when revealed) -->
 <script src="data/characters.js"></script>
 
@@ -38,20 +60,41 @@ function iconUrl(charId) {
   return `data/icons/${c.team}/${charId}.webp`;
 }
 
-// Same key as storyteller — both pages share the grimoire state via localStorage.
-// In a future networked version this becomes a server API.
-const LS_KEY = 'botc-storyteller-v1';
+// Cloud sync via Firebase Realtime Database. The room code in the URL
+// (`?room=ABCD`) decides which game we attach to. The storyteller and every
+// player phone listen to the same node — writes from any client fan out
+// to the others in milliseconds.
 const CLIENT_ID_KEY = 'botc-player-client-id';
 
-function loadGame() {
-  try {
-    const raw = localStorage.getItem(LS_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch { return null; }
+// Module-level pointer to the current game cache so updateSeat / updateTraveller
+// can grab the latest snapshot without an additional Firebase read.
+let __gameCache = null;
+let __gameRef = null;
+let __saveTimer = null;
+let __lastSavedJson = '';
+
+function setGameRef(ref) { __gameRef = ref; }
+function setGameCache(g) {
+  __gameCache = g;
+  __lastSavedJson = JSON.stringify(g || {});
 }
 
+function loadGame() { return __gameCache; }
+
 function saveGame(g) {
-  try { localStorage.setItem(LS_KEY, JSON.stringify(g)); } catch {}
+  __gameCache = g;
+  if (!__gameRef) return;
+  const json = JSON.stringify(g);
+  if (json === __lastSavedJson) return;
+  clearTimeout(__saveTimer);
+  __saveTimer = setTimeout(() => {
+    __lastSavedJson = json;
+    __gameRef.set(g).catch(e => console.error('player write failed:', e));
+  }, 150);
+}
+
+function getRoomFromUrl() {
+  try { return new URLSearchParams(window.location.search).get('room'); } catch { return null; }
 }
 
 function getOrCreateClientId() {
@@ -99,21 +142,72 @@ function getTravellerNumFromUrl() {
 
 // ---------------- App ----------------
 function App() {
-  const [game, setGame] = useState(loadGame());
   const clientId = useMemo(getOrCreateClientId, []);
   // ?t=N tells us this client is a traveller, joining via the link the ST shared.
   // We don't go through SeatPicker at all in that case — the traveller's slot is
   // pre-allocated by the ST.
   const travellerNum = useMemo(getTravellerNumFromUrl, []);
+  const [roomCode, setRoomCode] = useState(() => {
+    const c = getRoomFromUrl();
+    return c ? c.toUpperCase() : null;
+  });
+  const [game, setGameState] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+  const [isOnline, setIsOnline] = useState(true);
 
-  // Cross-tab sync: when storyteller updates state, refresh our view.
+  // Wrap setGame so callers stay simple — both update React state AND push to
+  // Firebase via saveGame (which debounces).
+  const setGame = (g) => {
+    setGameState(g);
+    if (g) saveGame(g);
+  };
+
+  // Subscribe to the room's state in Firebase. Re-subscribes if roomCode changes.
   useEffect(() => {
-    const handler = (e) => {
-      if (e.key === LS_KEY) setGame(loadGame());
+    if (!roomCode || !window.__BOTC_DB__) {
+      setLoaded(true);
+      return;
+    }
+    const ref = window.__BOTC_DB__.ref('rooms/' + roomCode + '/state');
+    setGameRef(ref);
+    const onValue = (snap) => {
+      const v = snap.val();
+      setGameCache(v || null);
+      setGameState(v || null);
+      setLoaded(true);
     };
-    window.addEventListener('storage', handler);
-    return () => window.removeEventListener('storage', handler);
-  }, []);
+    ref.on('value', onValue);
+    const connRef = window.__BOTC_DB__.ref('.info/connected');
+    const onConn = (snap) => setIsOnline(!!snap.val());
+    connRef.on('value', onConn);
+    return () => {
+      ref.off('value', onValue);
+      connRef.off('value', onConn);
+      setGameRef(null);
+    };
+  }, [roomCode]);
+
+  // Without a room code, show a join screen.
+  if (!roomCode) {
+    return <RoomEntry onJoin={(code) => {
+      const c = code.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
+      if (!c) return;
+      // Update URL so the player can refresh/bookmark.
+      const url = new URL(window.location.href);
+      url.searchParams.set('room', c);
+      window.history.replaceState(null, '', url.toString());
+      setRoomCode(c);
+    }} />;
+  }
+
+  if (!loaded) {
+    return (
+      <div className="text-center py-24">
+        <div className="text-amber-200 text-lg">Joining room <span className="font-bold tracking-widest">{roomCode}</span>…</div>
+        <p className="text-xs text-stone-500 mt-2">Connecting…</p>
+      </div>
+    );
+  }
 
   const grim = game?.grimoire;
 
@@ -275,6 +369,34 @@ function ScreenShell({ children }) {
       </header>
       {children}
     </div>
+  );
+}
+
+// Shown when the player opens player.html without a room code. They either
+// scan the ST's QR (which sets ?room=…) or type the 4-letter code by hand.
+function RoomEntry({ onJoin }) {
+  const [code, setCode] = useState('');
+  const trimmed = code.trim();
+  return (
+    <ScreenShell>
+      <section className="parchment rounded-lg p-5 space-y-4 text-center">
+        <div className="text-xs uppercase tracking-wider text-amber-300">Join a game</div>
+        <p className="text-sm text-stone-300">
+          Ask the storyteller for the 4-letter room code, or scan the QR code they're holding up.
+        </p>
+        <input value={code}
+          onChange={e => setCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8))}
+          onKeyDown={e => { if (e.key === 'Enter' && trimmed) onJoin(trimmed); }}
+          autoFocus placeholder="ABCD"
+          className="w-full bg-stone-900 border border-stone-700 rounded px-3 py-3 text-2xl tracking-[0.4em] font-mono text-center" />
+        <button onClick={() => trimmed && onJoin(trimmed)}
+          disabled={!trimmed}
+          className={`w-full py-3 rounded-lg text-base font-semibold
+            ${trimmed ? 'bg-emerald-600 hover:bg-emerald-500 text-stone-950' : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+          Join
+        </button>
+      </section>
+    </ScreenShell>
   );
 }
 

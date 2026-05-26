@@ -31,6 +31,32 @@
 <!-- QR code generator (for traveller join links). Fails silently if it can't load. -->
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
 
+<!-- Firebase: real-time cloud sync between storyteller + all player phones.
+     Compat-mode SDK exposes a global `firebase` namespace so we can use it
+     from our inline <script type="text/babel"> without ES module imports. -->
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
+<script>
+  // The Firebase project config. Safe to commit to a public repo — the API key
+  // here is a public identifier, not a secret; access control happens via the
+  // Realtime Database security rules in the Firebase console.
+  var firebaseConfig = {
+    apiKey: "AIzaSyB4hEXL1Vtuh4clINjW-iHmVvEuK_9L5cI",
+    authDomain: "botc-helper-523b3.firebaseapp.com",
+    databaseURL: "https://botc-helper-523b3-default-rtdb.firebaseio.com",
+    projectId: "botc-helper-523b3",
+    storageBucket: "botc-helper-523b3.firebasestorage.app",
+    messagingSenderId: "572978707049",
+    appId: "1:572978707049:web:8a8661a1f1269b15ab00f8"
+  };
+  try {
+    firebase.initializeApp(firebaseConfig);
+    window.__BOTC_DB__ = firebase.database();
+  } catch (e) {
+    console.error('Firebase init failed:', e);
+  }
+</script>
+
 <!-- Game data (loaded as JS so it works from file:// without a server) -->
 <script src="data/characters.js"></script>
 <script src="data/editions.js"></script>
@@ -115,18 +141,47 @@ function charactersForEdition(editionId) {
     .map(c => c.id);
 }
 
-// ---------------- Persistence ----------------
-const LS_KEY = 'botc-storyteller-v1';
+// ---------------- Cloud persistence (Firebase Realtime Database) ----------------
+// We store all game state in Firebase keyed by an ST-chosen room code. Players
+// join with the same code. localStorage is now only used to remember which room
+// the storyteller most recently created/joined, so reopening their browser drops
+// them straight back in.
+const LAST_ROOM_KEY = 'botc-last-room';
 
-function loadState() {
-  try {
-    const raw = localStorage.getItem(LS_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw);
-  } catch { return null; }
+// Room codes are 4 chars from an unambiguous alphabet (no 0/O, no 1/I).
+// 32^4 = ~1M codes — plenty for non-overlapping concurrent home games.
+function generateRoomCode() {
+  const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 4; i++) code += A[Math.floor(Math.random() * A.length)];
+  return code;
 }
-function saveState(s) {
-  try { localStorage.setItem(LS_KEY, JSON.stringify(s)); } catch {}
+
+function getRoomFromUrl() {
+  try { return new URLSearchParams(window.location.search).get('room'); } catch { return null; }
+}
+
+function getLastRoom() {
+  try { return localStorage.getItem(LAST_ROOM_KEY); } catch { return null; }
+}
+function setLastRoom(code) {
+  try { localStorage.setItem(LAST_ROOM_KEY, code); } catch {}
+}
+
+// Replace ?room=X in the current URL without a page reload. So creating a new
+// game updates the address bar so the ST can copy/share it.
+function setRoomInUrl(code) {
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.set('room', code);
+    window.history.replaceState(null, '', url.toString());
+  } catch {}
+}
+
+// Reference to the JSON tree for one room. Returns null if Firebase didn't load.
+function roomRef(code) {
+  if (!window.__BOTC_DB__ || !code) return null;
+  return window.__BOTC_DB__.ref('rooms/' + code + '/state');
 }
 
 // ---------------- Helpers ----------------
@@ -579,33 +634,101 @@ const DEFAULT_STATE = {
 };
 
 function App() {
-  // Deep-merge the loaded state with DEFAULT_STATE so older saved states (missing
-  // newly-added fields like lunaticBluffs, nominationsByDay, etc.) still get the
-  // right defaults. A shallow merge would replace `grimoire` entirely from storage,
-  // leaving its new sub-fields undefined and causing runtime crashes downstream.
-  const loaded = loadState() || {};
-  const initial = {
-    ...DEFAULT_STATE,
-    ...loaded,
-    grimoire: { ...DEFAULT_STATE.grimoire, ...(loaded.grimoire || {}) },
-  };
-  const [state, setState] = useState(initial);
-  useEffect(() => { saveState(state); }, [state]);
-
-  // Cross-tab sync: when another tab (player.html) modifies the shared state,
-  // pick up the change without a manual refresh. The browser's 'storage' event
-  // only fires in OTHER tabs, so this never loops on the storyteller's own writes.
+  // The room code drives which Firebase node we read/write. Picked from the URL
+  // first (so shared/bookmarked links land in the right room), else the most
+  // recent room this browser opened, else a fresh new code.
+  const [roomCode, setRoomCodeState] = useState(() => {
+    const fromUrl = getRoomFromUrl();
+    if (fromUrl) return fromUrl.toUpperCase();
+    const fromStorage = getLastRoom();
+    if (fromStorage) return fromStorage;
+    const fresh = generateRoomCode();
+    return fresh;
+  });
+  // Keep URL + localStorage in sync whenever roomCode changes.
   useEffect(() => {
-    const handler = (e) => {
-      if (e.key !== LS_KEY || e.newValue == null) return;
-      try {
-        const fresh = JSON.parse(e.newValue);
-        if (fresh) setState(fresh);
-      } catch {}
+    if (!roomCode) return;
+    setRoomInUrl(roomCode);
+    setLastRoom(roomCode);
+  }, [roomCode]);
+
+  // State starts as DEFAULT_STATE; the first Firebase snapshot will replace it
+  // with the cloud copy. `loaded` flips true once we've heard back from the
+  // server (so we don't show a blank grimoire while waiting).
+  const [state, setState] = useState(DEFAULT_STATE);
+  const [loaded, setLoaded] = useState(false);
+  const [isOnline, setIsOnline] = useState(true);
+  // String version of the last state we wrote — used to short-circuit echo
+  // writes when Firebase fires .on('value') with our own update.
+  const lastSavedRef = useRef('');
+  const saveTimerRef = useRef(null);
+
+  // Subscribe to the room's state node. Disposed + re-subscribed when roomCode changes.
+  useEffect(() => {
+    const ref = roomRef(roomCode);
+    if (!ref) {
+      // Firebase didn't load — fall back to local-only behavior so the page still works.
+      setLoaded(true);
+      return;
+    }
+    const handleValue = (snap) => {
+      const value = snap.val();
+      if (value) {
+        // Deep-merge with DEFAULT_STATE so any new fields we've added since the
+        // room was created still get reasonable defaults.
+        const merged = {
+          ...DEFAULT_STATE,
+          ...value,
+          grimoire: { ...DEFAULT_STATE.grimoire, ...(value.grimoire || {}) },
+        };
+        lastSavedRef.current = JSON.stringify(merged);
+        setState(merged);
+      } else {
+        // Fresh room with no data yet — seed Firebase with DEFAULT_STATE.
+        const seed = DEFAULT_STATE;
+        lastSavedRef.current = JSON.stringify(seed);
+        setState(seed);
+        ref.set(seed).catch(e => console.error('seed write failed:', e));
+      }
+      setLoaded(true);
     };
-    window.addEventListener('storage', handler);
-    return () => window.removeEventListener('storage', handler);
-  }, []);
+    ref.on('value', handleValue);
+    // Connection indicator
+    const connRef = window.__BOTC_DB__.ref('.info/connected');
+    const connHandler = (snap) => setIsOnline(!!snap.val());
+    connRef.on('value', connHandler);
+    return () => {
+      ref.off('value', handleValue);
+      connRef.off('value', connHandler);
+    };
+  }, [roomCode]);
+
+  // Debounced write to Firebase. Skips if state hasn't actually changed since
+  // our last write (prevents echoing the value we just received from the server
+  // back as a write).
+  useEffect(() => {
+    if (!loaded) return;                       // skip during the initial load
+    const ref = roomRef(roomCode);
+    if (!ref) return;
+    const json = JSON.stringify(state);
+    if (json === lastSavedRef.current) return; // no real change
+    clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      lastSavedRef.current = json;
+      ref.set(state).catch(e => console.error('write failed:', e));
+    }, 200);
+    return () => clearTimeout(saveTimerRef.current);
+  }, [state, roomCode, loaded]);
+
+  // Allow other parts of the UI to switch rooms (the new-game button etc).
+  const setRoomCode = (next) => {
+    if (!next) return;
+    const code = String(next).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
+    if (!code) return;
+    setLoaded(false);
+    lastSavedRef.current = '';
+    setRoomCodeState(code);
+  };
 
   // Transient UI state — not persisted.
   const [swapSourceSeat, setSwapSourceSeat] = useState(null);
@@ -1196,6 +1319,17 @@ function App() {
   const setupMods = useMemo(() => getSetupModifiers(state.characterIds), [state.characterIds]);
   const jinxes = useMemo(() => getActiveJinxes(state.characterIds), [state.characterIds]);
 
+  // While we're waiting for the very first Firebase snapshot, show a small
+  // loader rather than a blank page or a flash of DEFAULT_STATE.
+  if (!loaded) {
+    return (
+      <div className="text-center py-24">
+        <div className="text-amber-200 text-lg">Loading room <span className="font-bold tracking-widest">{roomCode}</span>…</div>
+        <p className="text-xs text-stone-500 mt-2">Connecting to the cloud. First-time loads can take a couple seconds.</p>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
       <header className="flex flex-wrap items-baseline justify-between gap-4">
@@ -1209,6 +1343,8 @@ function App() {
         </div>
         <a href="index.html" className="text-xs text-stone-400 hover:text-amber-300 underline underline-offset-2">← back to start</a>
       </header>
+
+      <RoomBar roomCode={roomCode} isOnline={isOnline} onSetRoom={setRoomCode} />
 
       <PageNav active={state.page} onChange={(p) => update({ page: p })}
         grimoireReady={state.grimoire.generated}
@@ -1339,6 +1475,82 @@ function App() {
 }
 
 // ---------------- Page Nav ----------------
+// Persistent room bar — shows the code, online status, copy/QR for the player
+// join link, and lets the ST start a brand-new room or jump into another.
+function RoomBar({ roomCode, isOnline, onSetRoom }) {
+  const [showQr, setShowQr] = useState(false);
+  const [joinInput, setJoinInput] = useState('');
+  const [joining, setJoining] = useState(false);
+  const playerUrl = playerJoinUrl(roomCode);
+  return (
+    <section className="parchment rounded-lg p-3 sm:p-4 space-y-2">
+      <div className="flex items-center gap-3 flex-wrap">
+        <div className="flex items-baseline gap-2">
+          <span className="text-xs uppercase tracking-wider text-stone-400">Room</span>
+          <span className="text-2xl font-bold tracking-[0.3em] text-amber-200">{roomCode}</span>
+        </div>
+        <span className={`text-[10px] uppercase font-bold px-2 py-0.5 rounded border
+          ${isOnline ? 'border-emerald-600 text-emerald-300' : 'border-red-600 text-red-300'}`}
+          title={isOnline ? 'Live — changes sync to all players' : 'Disconnected — reconnecting'}>
+          ● {isOnline ? 'online' : 'reconnecting'}
+        </span>
+        <div className="flex items-center gap-1 ml-auto flex-wrap">
+          <button onClick={() => { navigator.clipboard?.writeText(playerUrl); }}
+            title="Copy the player join link"
+            className="text-xs px-2.5 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
+            copy link
+          </button>
+          <button onClick={() => setShowQr(true)}
+            className="text-xs px-2.5 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
+            Show join QR
+          </button>
+          <button onClick={() => setJoining(j => !j)}
+            className="text-xs px-2.5 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
+            {joining ? 'cancel' : 'New / join…'}
+          </button>
+        </div>
+      </div>
+      <div className="text-[11px] text-stone-500 break-all">{playerUrl}</div>
+      {joining && (
+        <div className="flex flex-wrap items-center gap-2 mt-2 pt-2 border-t border-stone-800">
+          <button
+            onClick={() => {
+              if (!confirm('Start a brand-new game in a fresh room? You can always come back to ' + roomCode + ' by typing it in the join box.')) return;
+              onSetRoom(generateRoomCode());
+              setJoining(false);
+            }}
+            className="text-xs px-3 py-1.5 rounded pill border-emerald-700 text-emerald-300 hover:bg-emerald-950/30">
+            + New game (new room)
+          </button>
+          <span className="text-stone-500 text-xs">or join existing:</span>
+          <input value={joinInput} onChange={e => setJoinInput(e.target.value.toUpperCase())}
+            onKeyDown={e => { if (e.key === 'Enter' && joinInput.trim()) { onSetRoom(joinInput.trim()); setJoining(false); setJoinInput(''); } }}
+            maxLength={8} placeholder="ABCD"
+            className="bg-stone-900 border border-stone-700 rounded px-2 py-1 text-sm w-28 tracking-widest font-mono" />
+          <button
+            onClick={() => { if (joinInput.trim()) { onSetRoom(joinInput.trim()); setJoining(false); setJoinInput(''); } }}
+            disabled={!joinInput.trim()}
+            className={`text-xs px-3 py-1.5 rounded pill ${joinInput.trim() ? 'border-amber-600 text-amber-200 hover:bg-amber-950/40' : 'opacity-40 cursor-not-allowed'}`}>
+            Go
+          </button>
+        </div>
+      )}
+      {showQr && (
+        <QrFullscreenOverlay url={playerUrl} label={`Players — scan to join room ${roomCode}`}
+          onClose={() => setShowQr(false)} />
+      )}
+    </section>
+  );
+}
+
+// Build the URL a player opens to join this room. Used by the join QR/link
+// and by traveller link generation.
+function playerJoinUrl(roomCode) {
+  const here = window.location.href.split('?')[0].split('#')[0];
+  const base = here.replace(/\/storyteller\.html$/, '/').replace(/storyteller\.html$/, '');
+  return `${base}player.html?room=${roomCode}`;
+}
+
 function PageNav({ active, onChange, grimoireReady, gameStarted }) {
   const tabs = [
     { id: 'script',      label: 'Script Builder', sub: 'Pick characters' },
@@ -3235,12 +3447,14 @@ function allTravellerChars() {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-// Build the URL a traveller's player opens. Strips storyteller.html and replaces
-// it with player.html?t=<num>. Works whether opened via file:// or a real domain.
+// Build the URL a traveller's player opens. Includes the room code so the
+// traveller joins the right game, plus their traveller number.
 function travellerLinkFor(num) {
   const here = window.location.href.split('?')[0].split('#')[0];
   const base = here.replace(/\/storyteller\.html$/, '/').replace(/storyteller\.html$/, '');
-  return `${base}player.html?t=${num}`;
+  const room = getRoomFromUrl() || getLastRoom() || '';
+  const roomParam = room ? `room=${room}&` : '';
+  return `${base}player.html?${roomParam}t=${num}`;
 }
 
 // Render a small inline SVG QR for the given URL. Returns null if the qrcode lib
