@@ -620,6 +620,38 @@ function makeEmptySeats(n) {
 // Grow or shrink a seats array to a target length, preserving existing per-seat
 // data (playerName + claims especially) for the kept seats. Dropped seats lose
 // their claim — those players will see SeatPicker again next time they connect.
+// Firebase Realtime Database silently drops nulls from arrays — so saving
+// [null, null, null] disappears entirely, and ['mayor', null, null] round-trips
+// as just ['mayor']. That breaks our fixed-3-slot bluff UIs. Normalize on read.
+// Accepts arrays, sparse arrays, the {0:.., 1:.., 2:..} object form that Firebase
+// sometimes returns, or null/undefined. Always returns a [a, b, c] of length 3.
+function padBluffs(b) {
+  if (b == null) return [null, null, null];
+  if (Array.isArray(b)) return [b[0] || null, b[1] || null, b[2] || null];
+  if (typeof b === 'object') return [b[0] || b['0'] || null, b[1] || b['1'] || null, b[2] || b['2'] || null];
+  return [null, null, null];
+}
+
+// Apply padBluffs across every place bluffs are stored in a grimoire snapshot.
+// Called once at read time so downstream components can assume length-3 arrays.
+function normalizeGrimoireBluffs(grim) {
+  if (!grim) return grim;
+  const fixed = {
+    ...grim,
+    demonBluffs: padBluffs(grim.demonBluffs),
+    lunaticBluffs: padBluffs(grim.lunaticBluffs),
+  };
+  if (grim.minionBluffs && typeof grim.minionBluffs === 'object') {
+    const m = {};
+    for (const k in grim.minionBluffs) m[k] = padBluffs(grim.minionBluffs[k]);
+    fixed.minionBluffs = m;
+  }
+  if (Array.isArray(grim.days)) {
+    fixed.days = grim.days.map(d => d ? ({ ...d, demonBluffs: padBluffs(d.demonBluffs) }) : d);
+  }
+  return fixed;
+}
+
 function resizeSeats(prev, target) {
   const list = prev || [];
   const t = Math.max(0, target | 0);
@@ -724,11 +756,13 @@ function App() {
       const value = snap.val();
       if (value) {
         // Deep-merge with DEFAULT_STATE so any new fields we've added since the
-        // room was created still get reasonable defaults.
+        // room was created still get reasonable defaults. Then normalize the
+        // bluff arrays — Firebase drops trailing nulls, which would otherwise
+        // make our fixed-length bluff UIs lose slots.
         const merged = {
           ...DEFAULT_STATE,
           ...value,
-          grimoire: { ...DEFAULT_STATE.grimoire, ...(value.grimoire || {}) },
+          grimoire: normalizeGrimoireBluffs({ ...DEFAULT_STATE.grimoire, ...(value.grimoire || {}) }),
         };
         lastSavedRef.current = JSON.stringify(merged);
         setState(merged);

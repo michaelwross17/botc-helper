@@ -131,6 +131,34 @@ function updateTraveller(travellerNum, mutator) {
   return game;
 }
 
+// Mirror of storyteller.html: Firebase RTDB drops nulls from arrays, so bluff
+// arrays come back sparse or as objects. Always pad to length 3.
+function padBluffs(b) {
+  if (b == null) return [null, null, null];
+  if (Array.isArray(b)) return [b[0] || null, b[1] || null, b[2] || null];
+  if (typeof b === 'object') return [b[0] || b['0'] || null, b[1] || b['1'] || null, b[2] || b['2'] || null];
+  return [null, null, null];
+}
+function normalizeGrimoireBluffs(grim) {
+  if (!grim) return grim;
+  const fixed = {
+    ...grim,
+    demonBluffs: padBluffs(grim.demonBluffs),
+    lunaticBluffs: padBluffs(grim.lunaticBluffs),
+  };
+  if (grim.minionBluffs && typeof grim.minionBluffs === 'object') {
+    const m = {};
+    for (const k in grim.minionBluffs) m[k] = padBluffs(grim.minionBluffs[k]);
+    fixed.minionBluffs = m;
+  }
+  return fixed;
+}
+function normalizeGameBluffs(game) {
+  if (!game) return game;
+  if (!game.grimoire) return game;
+  return { ...game, grimoire: normalizeGrimoireBluffs(game.grimoire) };
+}
+
 // Read ?t=N from the current URL — non-null = this client is a traveller, not a regular player.
 function getTravellerNumFromUrl() {
   try {
@@ -171,7 +199,7 @@ function App() {
     const ref = window.__BOTC_DB__.ref('rooms/' + roomCode + '/state');
     setGameRef(ref);
     const onValue = (snap) => {
-      const v = snap.val();
+      const v = normalizeGameBluffs(snap.val());
       setGameCache(v || null);
       setGameState(v || null);
       setLoaded(true);
