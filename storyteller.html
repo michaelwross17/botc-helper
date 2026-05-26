@@ -1242,6 +1242,22 @@ function App() {
     if (!p) return;
     np[seatNum] = { ...p, status: 'awaiting', infoPayload, respondedAt: Date.now() };
     update({ grimoire: { ...state.grimoire, nightPrompts: np } });
+    // If this seat is local (no remote phone), open the local overlay with the
+    // info display so the local player can see YES/NO and tap Got it on this
+    // device. Otherwise the player's phone (remote) picks up the change.
+    const seat = (state.grimoire.seats || []).find(s => s.seatNum === seatNum);
+    if (seat && seat.isLocal) {
+      const c = CHAR_BY_ID[p.roleId];
+      const def = nightActionFor(p.roleId);
+      const step = {
+        char: c || { id: p.roleId, name: p.roleId },
+        seat,
+        action: p.action,
+        instruction: p.instruction || def.instruction,
+        reminderLabel: p.reminderLabel || def.reminder,
+      };
+      setLocalOverlayStep({ step, infoPayload });
+    }
   };
 
   // Local-player overlay: when a step's seat is isLocal, the prompt is handled
@@ -1270,16 +1286,28 @@ function App() {
     const { step, infoPayload } = localOverlayStep;
     const seatNum = step.seat.seatNum;
     const np = { ...(state.grimoire.nightPrompts || {}) };
+    const existing = np[seatNum] || {};
+    // For target2+yesno: first submission (picker, no infoPayload yet) parks
+    // the prompt as 'awaiting-st-response' so the ST sees the response popup.
+    // Subsequent submission (info ack with infoPayload set) transitions to
+    // 'submitted' so the existing effect places the 'Chose' reminders.
+    const isPickerSubmitForTwoStep = step.action === 'target2+yesno' && !infoPayload;
+    const newStatus = isPickerSubmitForTwoStep ? 'awaiting-st-response' : 'submitted';
+    // Preserve existing targets when caller didn't supply new ones (info ack).
+    const newTargets = (Array.isArray(targets) && targets.length > 0)
+      ? targets
+      : (existing.targets || targets || null);
     np[seatNum] = {
+      ...existing,
       roleId:        step.char.id,
       action:        step.action,
-      instruction:   step.instruction || '',
-      reminderLabel: step.reminderLabel || '',
+      instruction:   step.instruction || existing.instruction || '',
+      reminderLabel: step.reminderLabel || existing.reminderLabel || '',
       eligible:      (NIGHT_ACTIONS[step.char.id] && NIGHT_ACTIONS[step.char.id].eligible) || 'all',
-      status:        'submitted',
-      targets:       targets || null,
-      infoPayload:   infoPayload || null,
-      startedAt:     Date.now(),
+      status:        newStatus,
+      targets:       newTargets,
+      infoPayload:   infoPayload || existing.infoPayload || null,
+      startedAt:     existing.startedAt || Date.now(),
       decidedAt:     Date.now(),
       isLocal:       true,
       nightIdx:      (state.grimoire.viewingDayIndex || 0),
@@ -1297,6 +1325,37 @@ function App() {
   // Transient toasts shown across the top of the grimoire when prompts resolve.
   // Not persisted to Firebase — purely per-session UI.
   const [toasts, setToasts] = useState([]);
+
+  // Per-session set of seatNums whose ST-response popup has been dismissed by
+  // the storyteller. The banner remains visible at the top of the grimoire;
+  // dismissing only hides the modal popup. The set is cleared when the prompt
+  // resolves (i.e. status leaves 'awaiting-st-response').
+  const [dismissedResponses, setDismissedResponses] = useState(new Set());
+  const dismissResponsePopup = (seatNum) => {
+    setDismissedResponses(prev => {
+      const next = new Set(prev);
+      next.add(seatNum);
+      return next;
+    });
+  };
+  // When a prompt leaves 'awaiting-st-response', drop it from the dismissed set
+  // so a future re-prompt for the same seat re-opens the popup.
+  useEffect(() => {
+    const stillAwaiting = new Set(
+      Object.entries(state.grimoire.nightPrompts || {})
+        .filter(([_, p]) => p && p.status === 'awaiting-st-response')
+        .map(([k]) => Number(k))
+    );
+    setDismissedResponses(prev => {
+      let changed = false;
+      const next = new Set();
+      for (const n of prev) {
+        if (stillAwaiting.has(n)) next.add(n);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [JSON.stringify(state.grimoire.nightPrompts || {})]);
 
   // Effect: when a prompt transitions to 'submitted', auto-place the reminder
   // on each target seat, push a toast, and mark the prompt 'done'. When it
@@ -1894,6 +1953,8 @@ function App() {
           onMarkSetupReminder={markSetupReminder}
           onSkipSetupReminders={setSetupRemindersSkipped}
           onRespondToNightPrompt={respondToNightPrompt}
+          dismissedResponses={dismissedResponses}
+          onDismissResponsePopup={dismissResponsePopup}
           forceReadOnly={isSpectator}
           state={state}
           swapSourceSeat={swapSourceSeat}
@@ -3115,6 +3176,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
                         nightToasts = [], onDismissNightToast,
                         onStartNightPrompt, onCancelNightPrompt, onMarkStepDone, onClearAllNightPrompts, onOpenLocalPrompt,
                         onMarkSetupReminder, onSkipSetupReminders, onRespondToNightPrompt,
+                        dismissedResponses, onDismissResponsePopup,
                         onSeatTap, onCancelSwap, onPickupAssignment, onCancelAssignment,
                         onUndoAssignmentByCharId, onUnassignPending,
                         onToggleDead, onToggleAlignment, onSwap,
@@ -3279,11 +3341,21 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         <NightToastStack toasts={nightToasts} onDismiss={onDismissNightToast} />
       )}
 
-      {/* ST-response modal: rendered at the top of the grimoire whenever any
-          prompt is awaiting an ST response (Fortune Teller etc.). */}
+      {/* ST-response banner at top of grimoire — persistent reminder. */}
       <STResponseInline
         prompts={grim.nightPrompts || {}}
         seats={grim.seats || []}
+        onSend={onRespondToNightPrompt}
+      />
+
+      {/* ST-response popup: full-screen modal that auto-opens on a new
+          awaiting-st-response prompt. Dismissable so ST can fall back to the
+          banner. Sending YES/NO naturally closes via status change. */}
+      <STResponsePopup
+        prompts={grim.nightPrompts || {}}
+        seats={grim.seats || []}
+        dismissed={dismissedResponses || new Set()}
+        onDismiss={onDismissResponsePopup}
         onSend={onRespondToNightPrompt}
       />
 
@@ -7336,6 +7408,45 @@ function STResponseCard({ seatNum, prompt, seats, onSend }) {
         </div>
       </div>
     </section>
+  );
+}
+
+// ---------------- ST Response Popup (modal variant) ----------------
+//
+// Full-screen modal counterpart to the STResponseInline banner — pops up on
+// the ST device whenever a new prompt is awaiting their response so they
+// notice it immediately even if scrolled elsewhere. ST can close (X) to
+// dismiss the popup for that seat (banner remains as a reminder), or click
+// Send YES/NO to respond. Status change naturally closes the popup.
+function STResponsePopup({ prompts, seats, dismissed, onDismiss, onSend }) {
+  const pending = Object.entries(prompts || {})
+    .filter(([_, p]) => p && p.status === 'awaiting-st-response')
+    .map(([k, p]) => ({ seatNum: Number(k), prompt: p }))
+    .filter(({ seatNum }) => !(dismissed && dismissed.has(seatNum)));
+  if (pending.length === 0) return null;
+  // Show one popup at a time (the earliest awaiting). Others queue behind it.
+  const { seatNum, prompt } = pending[0];
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-950/90 flex items-start sm:items-center justify-center p-2 sm:p-4 overflow-y-auto">
+      <div className="max-w-lg w-full my-4 relative">
+        <button onClick={() => onDismiss(seatNum)}
+          title="Dismiss popup (banner still visible at top of grimoire)"
+          className="absolute top-2 right-2 z-10 w-9 h-9 rounded-full bg-stone-800 hover:bg-stone-700 border border-stone-700 text-stone-300 text-xl leading-none flex items-center justify-center">
+          ✕
+        </button>
+        <STResponseCard
+          seatNum={seatNum}
+          prompt={prompt}
+          seats={seats}
+          onSend={(payload) => onSend(seatNum, payload)}
+        />
+        {pending.length > 1 && (
+          <div className="mt-2 text-center text-[11px] text-stone-400">
+            {pending.length - 1} more response{pending.length - 1 === 1 ? '' : 's'} queued.
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 

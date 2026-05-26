@@ -381,7 +381,12 @@ function App() {
             // an infoPayload — those go straight to 'submitted'.
             const isTwoStep = curr.action === 'target2+yesno' && !curr.infoPayload;
             const newStatus = isTwoStep ? 'awaiting-st-response' : 'submitted';
-            np[mySeat.seatNum] = { ...curr, status: newStatus, targets, decidedAt: Date.now() };
+            // Preserve existing targets when info-acking with an empty array,
+            // so the ST effect can still place the per-target reminders.
+            const newTargets = (Array.isArray(targets) && targets.length > 0)
+              ? targets
+              : (curr.targets || targets);
+            np[mySeat.seatNum] = { ...curr, status: newStatus, targets: newTargets, decidedAt: Date.now() };
             next.grimoire.nightPrompts = np;
             saveGame(next);
             setGame(next);
