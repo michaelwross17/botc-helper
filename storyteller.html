@@ -1180,6 +1180,133 @@ function App() {
     update({ grimoire: { ...state.grimoire, seats } });
   };
 
+  // ---------------- Night-automation handlers ----------------
+  //
+  // Prompts live at state.grimoire.nightPrompts[seatNum]. ST writes the prompt
+  // metadata; the player's phone writes status='submitted'/'question' + targets
+  // back. An effect on the ST side watches for 'submitted' and auto-places the
+  // reminder, transitions the prompt to 'done', and pushes a toast.
+  const startNightPrompt = (seatNum, step) => {
+    if (!seatNum) return;
+    const np = { ...(state.grimoire.nightPrompts || {}) };
+    np[seatNum] = {
+      roleId:        step.char.id,
+      action:        step.action,
+      instruction:   step.instruction || '',
+      reminderLabel: step.reminderLabel || '',
+      eligible:      (NIGHT_ACTIONS[step.char.id] && NIGHT_ACTIONS[step.char.id].eligible) || 'all',
+      status:        'awaiting',
+      targets:       null,
+      startedAt:     Date.now(),
+      nightIdx:      (state.grimoire.viewingDayIndex || 0),
+    };
+    update({ grimoire: { ...state.grimoire, nightPrompts: np } });
+  };
+  const cancelNightPrompt = (seatNum) => {
+    if (!seatNum) return;
+    const np = { ...(state.grimoire.nightPrompts || {}) };
+    delete np[seatNum];
+    update({ grimoire: { ...state.grimoire, nightPrompts: np } });
+  };
+  const markStepDone = (seatNum) => {
+    if (!seatNum) return;
+    const np = { ...(state.grimoire.nightPrompts || {}) };
+    np[seatNum] = { ...(np[seatNum] || {}), status: 'done', doneAt: Date.now() };
+    update({ grimoire: { ...state.grimoire, nightPrompts: np } });
+  };
+  const clearAllNightPrompts = () => {
+    update({ grimoire: { ...state.grimoire, nightPrompts: {} } });
+  };
+  // Acknowledge a question (player tapped Question instead of Submit): the
+  // prompt stays visible on the player's phone with a "waiting for ST" message
+  // until the ST cancels it. ST clicks the toast to dismiss.
+  const dismissPromptToast = (seatNum) => {
+    setToasts(t => t.filter(x => x.seatNum !== seatNum));
+  };
+
+  // Transient toasts shown across the top of the grimoire when prompts resolve.
+  // Not persisted to Firebase — purely per-session UI.
+  const [toasts, setToasts] = useState([]);
+
+  // Effect: when a prompt transitions to 'submitted', auto-place the reminder
+  // on each target seat, push a toast, and mark the prompt 'done'. When it
+  // transitions to 'question', push a question-toast and leave the prompt
+  // alone (the player's phone keeps showing "waiting for ST").
+  //
+  // We key the effect by a JSON snapshot of nightPrompts so we re-run on every
+  // change but only act on prompts we haven't processed yet (tracked by status).
+  // Local players don't push to a phone — they're handled inline by the ST
+  // overlay below, so they bypass this effect entirely.
+  useEffect(() => {
+    if (!loaded || isSpectator) return;
+    const prompts = state.grimoire.nightPrompts || {};
+    let dirty = false;
+    let next = { ...prompts };
+    const newToasts = [];
+    for (const [seatStr, p] of Object.entries(prompts)) {
+      if (!p) continue;
+      const seatNum = Number(seatStr);
+      if (p.status === 'submitted') {
+        const seat = state.grimoire.seats.find(s => s.seatNum === seatNum);
+        const targets = Array.isArray(p.targets) ? p.targets : (p.targets ? [p.targets] : []);
+        // Auto-place reminder on each target (if a reminder is configured).
+        if (p.reminderLabel) {
+          for (const tnum of targets) {
+            const tseat = state.grimoire.seats.find(s => s.seatNum === tnum);
+            if (!tseat) continue;
+            const already = (tseat.reminders || []).some(r =>
+              r.charId === p.roleId && r.label === p.reminderLabel && r.fromPrompt);
+            if (already) continue;
+            // Splice the reminder in via direct seat mutation so we batch all
+            // target placements + the status flip into one update() call.
+            const seatsCopy = (next.__seatsCopy || state.grimoire.seats).map(s =>
+              s.seatNum === tnum
+                ? { ...s, reminders: [...(s.reminders || []), { charId: p.roleId, label: p.reminderLabel, fromPrompt: true }] }
+                : s
+            );
+            next.__seatsCopy = seatsCopy;
+          }
+        }
+        next[seatStr] = { ...p, status: 'done', doneAt: Date.now() };
+        dirty = true;
+        const charName = (CHAR_BY_ID[p.roleId] || {}).name || p.roleId;
+        const targetLabels = targets.map(t => {
+          const ts = state.grimoire.seats.find(s => s.seatNum === t);
+          return `#${t}${ts?.playerName ? ' ' + ts.playerName : ''}`;
+        }).join(' & ');
+        newToasts.push({
+          id: `${seatNum}-${p.startedAt || Date.now()}`,
+          seatNum,
+          kind: 'submitted',
+          text: `${charName} (seat #${seatNum}${seat?.playerName ? ' · ' + seat.playerName : ''}) chose ${targetLabels || '—'}${p.reminderLabel ? ` · "${p.reminderLabel}" placed` : ''}`,
+        });
+      } else if (p.status === 'question' && !p.toastShown) {
+        next[seatStr] = { ...p, toastShown: true };
+        dirty = true;
+        const charName = (CHAR_BY_ID[p.roleId] || {}).name || p.roleId;
+        const seat = state.grimoire.seats.find(s => s.seatNum === seatNum);
+        newToasts.push({
+          id: `${seatNum}-q-${p.startedAt || Date.now()}`,
+          seatNum,
+          kind: 'question',
+          text: `⚠ ${charName} (seat #${seatNum}${seat?.playerName ? ' · ' + seat.playerName : ''}) has a question — pull them aside.`,
+        });
+      }
+    }
+    if (dirty) {
+      const seats = next.__seatsCopy || state.grimoire.seats;
+      delete next.__seatsCopy;
+      update({ grimoire: { ...state.grimoire, seats, nightPrompts: next } });
+    }
+    if (newToasts.length) {
+      setToasts(t => {
+        // Dedupe by id so we don't double-push when the effect re-runs before write.
+        const existing = new Set(t.map(x => x.id));
+        return [...t, ...newToasts.filter(n => !existing.has(n.id))];
+      });
+    }
+  }, [JSON.stringify(state.grimoire.nightPrompts || {})]);
+
   // Per-seat role dealing. Each seat has roleDealt + playerStatus.
   const dealRoleToSeat = (seatNum) => {
     const seats = state.grimoire.seats.map(s =>
@@ -1605,6 +1732,12 @@ function App() {
 
       {(isSpectator || state.page === 'grimoire') && (
         <GrimoirePage
+          nightToasts={toasts}
+          onDismissNightToast={dismissPromptToast}
+          onStartNightPrompt={startNightPrompt}
+          onCancelNightPrompt={cancelNightPrompt}
+          onMarkStepDone={markStepDone}
+          onClearAllNightPrompts={clearAllNightPrompts}
           forceReadOnly={isSpectator}
           state={state}
           swapSourceSeat={swapSourceSeat}
@@ -2799,6 +2932,8 @@ function eligibleSeatsForPending(roleId, seats) {
 }
 
 function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
+                        nightToasts = [], onDismissNightToast,
+                        onStartNightPrompt, onCancelNightPrompt, onMarkStepDone, onClearAllNightPrompts,
                         onSeatTap, onCancelSwap, onPickupAssignment, onCancelAssignment,
                         onUndoAssignmentByCharId, onUnassignPending,
                         onToggleDead, onToggleAlignment, onSwap,
@@ -2959,6 +3094,10 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         <KazaliPicksBanner picks={grim.kazaliPicks} seats={grim.seats} />
       )}
 
+      {nightToasts.length > 0 && (
+        <NightToastStack toasts={nightToasts} onDismiss={onDismissNightToast} />
+      )}
+
       <GrimoireToolbar
         view={state.grimoireView}
         onSetView={onSetView}
@@ -3105,6 +3244,10 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         automation={!!(state.features?.automation)}
         nightPrompts={grim.nightPrompts || {}}
         readOnly={readOnly}
+        onStartPrompt={onStartNightPrompt}
+        onCancelPrompt={onCancelNightPrompt}
+        onMarkDone={onMarkStepDone}
+        onClearAllPrompts={onClearAllNightPrompts}
       />
 
       <DealRolesButton
@@ -6435,7 +6578,7 @@ function nightActionFor(roleId) {
 // reminder / fire toast) is not yet implemented. The Start button currently
 // shows a placeholder confirming what *would* happen. Phase B replaces this
 // placeholder with the real flow.
-function NightStepActionRow({ step, readOnly }) {
+function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onMarkDone: onMarkDoneProp }) {
   const { action, seat, instruction, reminderLabel, prompt } = step;
   if (readOnly) return null;
   if (!seat) return (
@@ -6444,6 +6587,19 @@ function NightStepActionRow({ step, readOnly }) {
   if (seat.isDead && action !== 'manual') return (
     <div className="mt-1.5 text-[11px] text-stone-500 italic">Seat is dead — skip.</div>
   );
+  if (seat.isLocal) {
+    // Local players are handled by the ST overlay (Phase D). For now show a hint.
+    // We still let the ST Mark done to advance the highlight.
+    return (
+      <div className="mt-2 pt-2 border-t border-stone-800/70 text-[11px] text-purple-300 italic flex items-center justify-between gap-2">
+        <span>🏠 Local player — handle on this device (overlay coming in Phase D).</span>
+        <button onClick={() => onMarkDoneProp && onMarkDoneProp(seat.seatNum)}
+          className="text-[11px] px-2.5 py-1 rounded pill hover:border-amber-500 hover:text-amber-200 not-italic">
+          Mark done
+        </button>
+      </div>
+    );
+  }
 
   const actionLabel = ({
     target1:     'Asks for 1 player',
@@ -6455,24 +6611,17 @@ function NightStepActionRow({ step, readOnly }) {
   })[action] || action;
 
   const onStart = () => {
-    if (seat.isLocal) {
-      alert(
-        'Phase B (coming next):\n\n' +
-        'Show the "' + actionLabel + '" prompt on THIS device since seat #' + seat.seatNum + ' is local.\n\n' +
-        'Instruction: ' + instruction + '\n\n' +
-        (reminderLabel ? 'On submit → place "' + reminderLabel + '" reminder on chosen seat.' : '')
-      );
-    } else {
-      alert(
-        'Phase B (coming next):\n\n' +
-        'Push the "' + actionLabel + '" prompt to seat #' + seat.seatNum + (seat.playerName ? ' · ' + seat.playerName : '') + '\'s phone.\n\n' +
-        'Instruction: ' + instruction + '\n\n' +
-        (reminderLabel ? 'On submit → place "' + reminderLabel + '" reminder on chosen seat.' : '')
-      );
+    if (action === 'info-st') {
+      alert('Info-role automation (Washerwoman / Investigator / Empath / etc.) ships in Phase C. For now, click "Mark done" once you have whispered the info in person.');
+      return;
     }
+    onStartPrompt && onStartPrompt(seat.seatNum, step);
+  };
+  const onCancel = () => {
+    onCancelPrompt && onCancelPrompt(seat.seatNum);
   };
   const onMarkDone = () => {
-    alert('Phase B (coming next): marking this step done will collapse the row and advance the highlight.');
+    onMarkDoneProp && onMarkDoneProp(seat.seatNum);
   };
 
   let statusBadge = null;
@@ -6496,9 +6645,37 @@ function NightStepActionRow({ step, readOnly }) {
       <div className="flex items-center gap-2 flex-wrap">
         {action === 'manual' ? (
           <button onClick={onMarkDone}
-            className="text-xs px-3 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
-            Mark done
+            className={`text-xs px-3 py-1 rounded pill hover:border-amber-500 hover:text-amber-200 ${prompt?.status === 'done' ? 'opacity-50' : ''}`}>
+            {prompt?.status === 'done' ? '✓ Done' : 'Mark done'}
           </button>
+        ) : prompt?.status === 'awaiting' ? (
+          <>
+            <span className="text-xs text-amber-300 font-medium">Sent to player\'s phone…</span>
+            <button onClick={onCancel}
+              className="text-xs px-2.5 py-1 rounded pill hover:border-red-500 hover:text-red-300 text-stone-400">
+              Cancel
+            </button>
+          </>
+        ) : prompt?.status === 'question' ? (
+          <>
+            <span className="text-xs text-red-300 font-medium">Player raised a question</span>
+            <button onClick={onCancel}
+              className="text-xs px-2.5 py-1 rounded bg-stone-800 hover:bg-stone-700 text-stone-200">
+              Dismiss prompt
+            </button>
+            <button onClick={onStart}
+              className="text-xs px-2.5 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
+              Re-send
+            </button>
+          </>
+        ) : prompt?.status === 'done' ? (
+          <>
+            <span className="text-xs text-emerald-300 font-medium">✓ Done</span>
+            <button onClick={onStart}
+              className="text-xs px-2.5 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
+              Re-prompt
+            </button>
+          </>
         ) : (
           <>
             <button onClick={onStart}
@@ -6516,6 +6693,33 @@ function NightStepActionRow({ step, readOnly }) {
   );
 }
 
+// ---------------- Night Toasts (automation feedback) ----------------
+//
+// Compact stack of dismissable banners shown at the top of the grimoire when
+// players submit or raise questions on automation prompts. Each toast persists
+// until the ST clicks ✕ on it (we don't auto-dismiss so the ST can confirm).
+function NightToastStack({ toasts, onDismiss }) {
+  return (
+    <div className="space-y-1.5">
+      {toasts.map(t => (
+        <div key={t.id}
+          className={`parchment rounded-lg p-2.5 flex items-start gap-2 border-2
+            ${t.kind === 'question' ? 'border-red-600 bg-red-950/30' : 'border-emerald-700 bg-emerald-950/20'}`}>
+          <div className="text-lg leading-none mt-0.5">{t.kind === 'question' ? '⚠' : '✓'}</div>
+          <div className={`flex-1 min-w-0 text-sm ${t.kind === 'question' ? 'text-red-100' : 'text-emerald-100'}`}>
+            {t.text}
+          </div>
+          <button onClick={() => onDismiss && onDismiss(t.seatNum)}
+            title="Dismiss"
+            className="text-stone-400 hover:text-stone-200 px-1.5 -my-0.5 text-lg leading-none">
+            ✕
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ---------------- Night Phase Section ----------------
 
 // Labels for the abstract "ceremonies" that appear in the official night order
@@ -6528,7 +6732,8 @@ const NIGHT_CEREMONIES = {
 };
 
 function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted, extraCharIds = [],
-                              automation = false, nightPrompts = {}, readOnly = false }) {
+                              automation = false, nightPrompts = {}, readOnly = false,
+                              onStartPrompt, onCancelPrompt, onMarkDone, onClearAllPrompts }) {
   // Auto-expand when automation is on so the ST sees the interactive panel immediately.
   const [collapsed, setCollapsed] = useState(!automation);
   useEffect(() => { if (automation) setCollapsed(false); }, [automation]);
@@ -6625,12 +6830,30 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                       <div className="text-xs text-stone-300/85 mt-0.5 leading-snug">{s.reminder}</div>
                     )}
                     {automation && (
-                      <NightStepActionRow step={s} readOnly={readOnly} />
+                      <NightStepActionRow step={s} readOnly={readOnly}
+                        onStartPrompt={onStartPrompt}
+                        onCancelPrompt={onCancelPrompt}
+                        onMarkDone={onMarkDone}
+                      />
                     )}
                   </div>
                 </li>
               ))}
             </ol>
+          )}
+
+          {automation && Object.keys(nightPrompts || {}).length > 0 && (
+            <div className="pt-2 border-t border-stone-800 flex items-center justify-between gap-2">
+              <span className="text-[11px] text-stone-500">
+                {Object.values(nightPrompts).filter(p => p && p.status === 'awaiting').length} awaiting ·
+                {' '}{Object.values(nightPrompts).filter(p => p && p.status === 'done').length} done ·
+                {' '}{Object.values(nightPrompts).filter(p => p && p.status === 'question').length} questions
+              </span>
+              <button onClick={() => { if (confirm('Clear all night-automation prompts? This dismisses any in-progress player phones.')) onClearAllPrompts && onClearAllPrompts(); }}
+                className="text-[11px] px-2.5 py-1 rounded pill hover:border-red-500 hover:text-red-300 text-stone-400">
+                Clear all prompts
+              </button>
+            </div>
           )}
 
           {/* Active jinxes */}

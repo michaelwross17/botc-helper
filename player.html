@@ -362,6 +362,34 @@ function App() {
           }}
         />;
       }
+      // Night automation: if the ST has issued a prompt to our seat, the player
+      // sees a full-screen NightPromptScreen instead of the resting AcceptedScreen.
+      const myPrompt = (grim.nightPrompts || {})[mySeat.seatNum];
+      if (myPrompt && (myPrompt.status === 'awaiting' || myPrompt.status === 'question')) {
+        return <NightPromptScreen
+          mySeat={mySeat}
+          seats={grim.seats}
+          prompt={myPrompt}
+          onSubmit={(targets) => {
+            const next = loadGame() || game;
+            if (!next?.grimoire) return;
+            const np = { ...(next.grimoire.nightPrompts || {}) };
+            np[mySeat.seatNum] = { ...np[mySeat.seatNum], status: 'submitted', targets, decidedAt: Date.now() };
+            next.grimoire.nightPrompts = np;
+            saveGame(next);
+            setGame(next);
+          }}
+          onQuestion={() => {
+            const next = loadGame() || game;
+            if (!next?.grimoire) return;
+            const np = { ...(next.grimoire.nightPrompts || {}) };
+            np[mySeat.seatNum] = { ...np[mySeat.seatNum], status: 'question', decidedAt: Date.now() };
+            next.grimoire.nightPrompts = np;
+            saveGame(next);
+            setGame(next);
+          }}
+        />;
+      }
       return <AcceptedScreen seat={mySeat} />;
     }
     return <RoleReveal
@@ -1078,6 +1106,129 @@ function KazaliPicksScreen({ mySeat, game, onSubmit }) {
           These will be sent to the storyteller and the chosen players' roles will update automatically.
         </p>
       </section>
+    </ScreenShell>
+  );
+}
+
+// Full-screen prompt shown when the storyteller (with automation on) clicks
+// "Start" on this player's night step. Renders a seat picker — the player taps
+// 1 or 2 seats (based on prompt.action) and hits Submit or Question. Submit
+// writes the targets back; the ST's effect auto-places the reminder. Question
+// flags the ST to come over in person.
+function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion }) {
+  const isTwo = prompt.action === 'target2';
+  const need = isTwo ? 2 : 1;
+  // Filter eligible seats based on the action's eligibility rules.
+  const eligibleSeats = (seats || []).filter(s => {
+    if (!s) return false;
+    const isSelf = s.seatNum === mySeat.seatNum;
+    if (prompt.eligible === 'others' && isSelf) return false;
+    if (prompt.eligible === 'self' && !isSelf) return false;
+    // target1any allows dead seats; everything else requires alive.
+    if (prompt.action !== 'target1any' && s.isDead) return false;
+    return true;
+  });
+  const [picked, setPicked] = useState([]);
+  // If status flipped to 'question' on this device (rare race), bail out.
+  const togglePick = (seatNum) => {
+    setPicked(prev => {
+      if (prev.includes(seatNum)) return prev.filter(n => n !== seatNum);
+      if (prev.length >= need) return [...prev.slice(1), seatNum]; // bump oldest
+      return [...prev, seatNum];
+    });
+  };
+  const canSubmit = picked.length === need;
+  const c = CHAR_BY_ID[prompt.roleId];
+  const isQuestion = prompt.status === 'question';
+
+  if (isQuestion) {
+    // Player has raised a question and is waiting for the ST to come pull them aside.
+    return (
+      <ScreenShell>
+        <section className="parchment rounded-lg p-6 text-center space-y-4 border-2 border-red-700/60">
+          <div className="text-5xl">⚠</div>
+          <div className="text-red-200 text-2xl font-bold">Waiting for the storyteller</div>
+          <p className="text-sm text-stone-300">
+            You asked a question about <span className="text-amber-200 font-semibold">{c?.name || prompt.roleId}</span>.
+            The storyteller will come to you in person.
+          </p>
+          <div className="text-xs text-stone-500 pt-3 border-t border-stone-800">
+            Seat #{mySeat.seatNum}{mySeat.playerName ? ' · ' + mySeat.playerName : ''}
+          </div>
+        </section>
+      </ScreenShell>
+    );
+  }
+
+  return (
+    <ScreenShell>
+      <section className="parchment rounded-lg p-4 sm:p-5 space-y-3 border-2 border-amber-600/70">
+        <div className="flex items-center gap-3">
+          {iconUrl(prompt.roleId) && (
+            <img src={iconUrl(prompt.roleId)} alt=""
+              className="w-14 h-14 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
+          )}
+          <div className="min-w-0">
+            <div className={`text-xs uppercase tracking-wider team-${c?.team || 'townsfolk'}`}>
+              {c?.team || 'role'}
+            </div>
+            <div className="text-amber-200 text-lg font-bold">{c?.name || prompt.roleId}</div>
+          </div>
+        </div>
+        <div className="text-sm text-stone-200 leading-relaxed border-l-2 border-amber-700/50 pl-3">
+          {prompt.instruction || c?.ability}
+        </div>
+      </section>
+
+      <section className="parchment rounded-lg p-3 sm:p-4 space-y-2">
+        <div className="flex items-baseline justify-between gap-2">
+          <h3 className="text-amber-200 font-semibold text-sm">
+            Choose {isTwo ? '2 players' : '1 player'}
+          </h3>
+          <span className="text-xs text-stone-400">
+            {picked.length} of {need} chosen
+          </span>
+        </div>
+        <ul className="grid grid-cols-2 gap-1.5">
+          {eligibleSeats.map(s => {
+            const isMe = s.seatNum === mySeat.seatNum;
+            const isPicked = picked.includes(s.seatNum);
+            return (
+              <li key={s.seatNum}>
+                <button onClick={() => togglePick(s.seatNum)}
+                  className={`w-full card rounded px-2.5 py-2 flex items-center gap-2 text-left transition
+                    ${isPicked ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}
+                    ${s.isDead ? 'opacity-60' : ''}`}>
+                  <span className="text-amber-200/80 text-xs w-7 text-center font-semibold">#{s.seatNum}</span>
+                  <span className="flex-1 min-w-0 truncate text-sm">
+                    {s.playerName || <span className="text-stone-500 italic">(no name)</span>}
+                    {isMe && <span className="ml-1 text-[10px] text-amber-300/80">· you</span>}
+                  </span>
+                  {isPicked && <span className="text-amber-300 text-sm leading-none">✓</span>}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      </section>
+
+      <div className="grid grid-cols-2 gap-2 pt-1">
+        <button onClick={() => onSubmit(picked)}
+          disabled={!canSubmit}
+          className={`py-3 rounded-lg text-base font-semibold transition
+            ${canSubmit
+              ? 'bg-emerald-600 hover:bg-emerald-500 text-stone-950 shadow-lg shadow-emerald-900/40'
+              : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+          Submit
+        </button>
+        <button onClick={onQuestion}
+          className="py-3 rounded-lg text-base font-semibold bg-stone-800 hover:bg-stone-700 text-amber-200 border border-amber-700/40">
+          Question
+        </button>
+      </div>
+      <p className="text-[10px] text-stone-500 text-center">
+        Submit places your choice automatically. Question flags the storyteller to come over.
+      </p>
     </ScreenShell>
   );
 }
