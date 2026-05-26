@@ -364,8 +364,13 @@ function App() {
       }
       // Night automation: if the ST has issued a prompt to our seat, the player
       // sees a full-screen NightPromptScreen instead of the resting AcceptedScreen.
+      // Excludes 'show-grimoire' prompts — those are rendered exclusively via
+      // the grimoireShownToSeat → GrimoireSnapshotOverlay path; rendering the
+      // generic target picker for them flashes briefly between the player
+      // tapping Got it and the ST effect transitioning the prompt to submitted.
       const myPrompt = (grim.nightPrompts || {})[mySeat.seatNum];
-      if (myPrompt && (myPrompt.status === 'awaiting' || myPrompt.status === 'question' || myPrompt.status === 'awaiting-st-response')) {
+      if (myPrompt && myPrompt.action !== 'show-grimoire' &&
+          (myPrompt.status === 'awaiting' || myPrompt.status === 'question' || myPrompt.status === 'awaiting-st-response')) {
         return <NightPromptScreen
           mySeat={mySeat}
           seats={grim.seats}

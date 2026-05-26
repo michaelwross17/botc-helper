@@ -1847,10 +1847,25 @@ function App() {
   };
 
   // --- Spy / special grimoire-share action ---
+  // For LOCAL seats, route through the on-ST LocalGrimoireOverlay (two-phase
+  // privacy) instead of writing grimoireShownToSeat — there's no remote phone
+  // to render the snapshot, so the legacy path was a no-op for local players.
   const showGrimoireToSeat = (seatNum) => {
-    update({ grimoire: { ...state.grimoire, grimoireShownToSeat: seatNum } });
+    const seat = (state.grimoire.seats || []).find(s => s.seatNum === seatNum);
+    if (seat?.isLocal) {
+      setLocalGrimoireSeat(seatNum);
+      setLocalGrimoirePhase('input');
+    } else {
+      update({ grimoire: { ...state.grimoire, grimoireShownToSeat: seatNum } });
+    }
   };
   const cancelGrimoireShow = () => {
+    // Also dismiss any open local grimoire overlay (in case the ST clicked
+    // "Recall" from the Tokens tab while the overlay was up).
+    if (localGrimoireSeat != null) {
+      setLocalGrimoireSeat(null);
+      setLocalGrimoirePhase('input');
+    }
     update({ grimoire: { ...state.grimoire, grimoireShownToSeat: null } });
   };
 
