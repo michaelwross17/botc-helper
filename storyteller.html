@@ -645,12 +645,21 @@ function App() {
     const fresh = generateRoomCode();
     return fresh;
   });
-  // Keep URL + localStorage in sync whenever roomCode changes.
+  // Spectator mode: ?view=spectator on the URL. Read-only grimoire, no Firebase
+  // writes, no PIN required (the ST shares this URL with bystanders).
+  const isSpectator = useMemo(() => {
+    try { return new URLSearchParams(window.location.search).get('view') === 'spectator'; } catch { return false; }
+  }, []);
+  // Keep URL + localStorage in sync whenever roomCode changes. Spectator URLs
+  // also keep their ?view=spectator param around.
   useEffect(() => {
     if (!roomCode) return;
     setRoomInUrl(roomCode);
-    setLastRoom(roomCode);
-  }, [roomCode]);
+    // Don't pollute "last room" with a room the user is just spectating —
+    // otherwise next time they open storyteller.html, they'd land in spectator
+    // mode on a room they don't own.
+    if (!isSpectator) setLastRoom(roomCode);
+  }, [roomCode, isSpectator]);
 
   // State starts as DEFAULT_STATE; the first Firebase snapshot will replace it
   // with the cloud copy. `loaded` flips true once we've heard back from the
@@ -658,6 +667,10 @@ function App() {
   const [state, setState] = useState(DEFAULT_STATE);
   const [loaded, setLoaded] = useState(false);
   const [isOnline, setIsOnline] = useState(true);
+  // PIN auth — null = haven't heard from Firebase yet; '' = no pin set; <string> = pin set.
+  const [knownPin, setKnownPin] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authed, setAuthed] = useState(false);
   // String version of the last state we wrote — used to short-circuit echo
   // writes when Firebase fires .on('value') with our own update.
   const lastSavedRef = useRef('');
@@ -703,11 +716,47 @@ function App() {
     };
   }, [roomCode]);
 
+  // Subscribe to the room's auth node so we know whether a PIN has been set
+  // and what it is (so we can validate the one stored in localStorage).
+  useEffect(() => {
+    if (!roomCode || !window.__BOTC_DB__) {
+      setAuthChecked(true);
+      return;
+    }
+    const authRef = window.__BOTC_DB__.ref('rooms/' + roomCode + '/auth');
+    const handler = (snap) => {
+      const v = snap.val();
+      setKnownPin(v && typeof v.pin === 'string' ? v.pin : '');
+      setAuthChecked(true);
+    };
+    authRef.on('value', handler);
+    return () => authRef.off('value', handler);
+  }, [roomCode]);
+
+  // When the auth state lands, decide whether this client is authorized.
+  // Spectators bypass auth (they get a read-only view). Otherwise we look for
+  // a PIN previously stored on this device for this room.
+  useEffect(() => {
+    if (!authChecked) return;
+    if (isSpectator) { setAuthed(true); return; }
+    if (knownPin === '' || knownPin === null) {
+      // No PIN set yet on this room — first-time creator, will see PinSetup.
+      setAuthed(false);
+      return;
+    }
+    let stored = null;
+    try { stored = localStorage.getItem('botc-pin-' + roomCode); } catch {}
+    setAuthed(stored === knownPin);
+  }, [authChecked, knownPin, isSpectator, roomCode]);
+
   // Debounced write to Firebase. Skips if state hasn't actually changed since
   // our last write (prevents echoing the value we just received from the server
-  // back as a write).
+  // back as a write). ALSO skipped for spectators (they can't change anything)
+  // and while we don't have auth yet (so a PIN prompt doesn't clobber state).
   useEffect(() => {
-    if (!loaded) return;                       // skip during the initial load
+    if (!loaded) return;
+    if (isSpectator) return;
+    if (!authed) return;
     const ref = roomRef(roomCode);
     if (!ref) return;
     const json = JSON.stringify(state);
@@ -718,7 +767,7 @@ function App() {
       ref.set(state).catch(e => console.error('write failed:', e));
     }, 200);
     return () => clearTimeout(saveTimerRef.current);
-  }, [state, roomCode, loaded]);
+  }, [state, roomCode, loaded, isSpectator, authed]);
 
   // Allow other parts of the UI to switch rooms (the new-game button etc).
   const setRoomCode = (next) => {
@@ -1319,9 +1368,9 @@ function App() {
   const setupMods = useMemo(() => getSetupModifiers(state.characterIds), [state.characterIds]);
   const jinxes = useMemo(() => getActiveJinxes(state.characterIds), [state.characterIds]);
 
-  // While we're waiting for the very first Firebase snapshot, show a small
-  // loader rather than a blank page or a flash of DEFAULT_STATE.
-  if (!loaded) {
+  // While we're waiting for the very first Firebase snapshot OR the auth check,
+  // show a small loader rather than a blank page or a flash of DEFAULT_STATE.
+  if (!loaded || !authChecked) {
     return (
       <div className="text-center py-24">
         <div className="text-amber-200 text-lg">Loading room <span className="font-bold tracking-widest">{roomCode}</span>…</div>
@@ -1330,27 +1379,61 @@ function App() {
     );
   }
 
+  // Auth gate (skipped for spectators). Two sub-screens:
+  //   • No PIN set yet → PinSetup (the user is the room creator)
+  //   • PIN set but this device hasn't passed → PinEntry
+  if (!isSpectator && !authed) {
+    if (knownPin === '' || knownPin === null) {
+      return <PinSetup
+        roomCode={roomCode}
+        onSet={(pin) => {
+          const ref = window.__BOTC_DB__.ref('rooms/' + roomCode + '/auth');
+          ref.set({ pin }).catch(e => console.error('pin set failed:', e));
+          try { localStorage.setItem('botc-pin-' + roomCode, pin); } catch {}
+          setAuthed(true);
+        }}
+      />;
+    }
+    return <PinEntry
+      roomCode={roomCode}
+      expectedPin={knownPin}
+      onSuccess={(pin) => {
+        try { localStorage.setItem('botc-pin-' + roomCode, pin); } catch {}
+        setAuthed(true);
+      }}
+      onSwitchToSpectator={() => {
+        const url = new URL(window.location.href);
+        url.searchParams.set('view', 'spectator');
+        window.location.href = url.toString();
+      }}
+    />;
+  }
+
   return (
     <div className="space-y-6">
       <header className="flex flex-wrap items-baseline justify-between gap-4">
         <div>
           <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-amber-200">
-            Storyteller — Blood on the Clocktower
+            {isSpectator ? 'Spectator — Blood on the Clocktower' : 'Storyteller — Blood on the Clocktower'}
           </h1>
           <p className="text-sm text-stone-400 mt-1">
-            Build your script and set up the game. Players never see this screen.
+            {isSpectator
+              ? 'Read-only grimoire view. You can see the game but not change anything.'
+              : 'Build your script and set up the game. Players never see this screen.'}
           </p>
         </div>
         <a href="index.html" className="text-xs text-stone-400 hover:text-amber-300 underline underline-offset-2">← back to start</a>
       </header>
 
-      <RoomBar roomCode={roomCode} isOnline={isOnline} onSetRoom={setRoomCode} />
+      <RoomBar roomCode={roomCode} isOnline={isOnline} onSetRoom={setRoomCode} isSpectator={isSpectator} />
 
-      <PageNav active={state.page} onChange={(p) => update({ page: p })}
-        grimoireReady={state.grimoire.generated}
-        gameStarted={state.grimoire.gameStarted} />
+      {!isSpectator && (
+        <PageNav active={state.page} onChange={(p) => update({ page: p })}
+          grimoireReady={state.grimoire.generated}
+          gameStarted={state.grimoire.gameStarted} />
+      )}
 
-      {state.page === 'script' && (
+      {state.page === 'script' && !isSpectator && (
         <ScriptBuilderPage
           state={state}
           grouped={grouped}
@@ -1372,7 +1455,7 @@ function App() {
         />
       )}
 
-      {state.page === 'bag' && (
+      {state.page === 'bag' && !isSpectator && (
         <BagSetupPage
           state={state}
           bag={bag}
@@ -1396,14 +1479,14 @@ function App() {
         />
       )}
 
-      {state.page === 'tokens' && (
+      {state.page === 'tokens' && !isSpectator && (
         <TokensPage state={state}
           onShowGrimoireToSeat={showGrimoireToSeat}
           onCancelGrimoireShow={cancelGrimoireShow}
         />
       )}
 
-      {state.page === 'nominations' && (
+      {state.page === 'nominations' && !isSpectator && (
         <NominationsPage
           state={state}
           onAdd={addNomination}
@@ -1415,8 +1498,9 @@ function App() {
         />
       )}
 
-      {state.page === 'grimoire' && (
+      {(isSpectator || state.page === 'grimoire') && (
         <GrimoirePage
+          forceReadOnly={isSpectator}
           state={state}
           swapSourceSeat={swapSourceSeat}
           assigningRoleId={assigningRoleId}
@@ -1477,11 +1561,15 @@ function App() {
 // ---------------- Page Nav ----------------
 // Persistent room bar — shows the code, online status, copy/QR for the player
 // join link, and lets the ST start a brand-new room or jump into another.
-function RoomBar({ roomCode, isOnline, onSetRoom }) {
-  const [showQr, setShowQr] = useState(false);
+// In spectator mode the controls are replaced with a "spectator" badge so the
+// bystander can't accidentally start a new game.
+function RoomBar({ roomCode, isOnline, onSetRoom, isSpectator }) {
+  const [showPlayerQr, setShowPlayerQr] = useState(false);
+  const [showSpectatorQr, setShowSpectatorQr] = useState(false);
   const [joinInput, setJoinInput] = useState('');
   const [joining, setJoining] = useState(false);
   const playerUrl = playerJoinUrl(roomCode);
+  const spectatorUrl = spectatorJoinUrl(roomCode);
   return (
     <section className="parchment rounded-lg p-3 sm:p-4 space-y-2">
       <div className="flex items-center gap-3 flex-wrap">
@@ -1494,24 +1582,43 @@ function RoomBar({ roomCode, isOnline, onSetRoom }) {
           title={isOnline ? 'Live — changes sync to all players' : 'Disconnected — reconnecting'}>
           ● {isOnline ? 'online' : 'reconnecting'}
         </span>
-        <div className="flex items-center gap-1 ml-auto flex-wrap">
-          <button onClick={() => { navigator.clipboard?.writeText(playerUrl); }}
-            title="Copy the player join link"
-            className="text-xs px-2.5 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
-            copy link
-          </button>
-          <button onClick={() => setShowQr(true)}
-            className="text-xs px-2.5 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
-            Show join QR
-          </button>
-          <button onClick={() => setJoining(j => !j)}
-            className="text-xs px-2.5 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
-            {joining ? 'cancel' : 'New / join…'}
-          </button>
-        </div>
+        {isSpectator && (
+          <span className="text-[10px] uppercase font-bold px-2 py-0.5 rounded border border-purple-600 text-purple-300"
+            title="Read-only spectator view">
+            👁 spectator
+          </span>
+        )}
+        {!isSpectator && (
+          <div className="flex items-center gap-1 ml-auto flex-wrap">
+            <button onClick={() => { navigator.clipboard?.writeText(playerUrl); }}
+              title="Copy the player join link"
+              className="text-xs px-2.5 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
+              copy player link
+            </button>
+            <button onClick={() => setShowPlayerQr(true)}
+              className="text-xs px-2.5 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
+              Player QR
+            </button>
+            <button onClick={() => setShowSpectatorQr(true)}
+              title="Read-only grimoire view — share with bystanders"
+              className="text-xs px-2.5 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
+              👁 Spectator QR
+            </button>
+            <button onClick={() => setJoining(j => !j)}
+              className="text-xs px-2.5 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
+              {joining ? 'cancel' : 'New / join…'}
+            </button>
+          </div>
+        )}
       </div>
-      <div className="text-[11px] text-stone-500 break-all">{playerUrl}</div>
-      {joining && (
+      {!isSpectator && (
+        <div className="text-[11px] text-stone-500 break-all">
+          Player: {playerUrl}
+          <br />
+          Spectator: {spectatorUrl}
+        </div>
+      )}
+      {joining && !isSpectator && (
         <div className="flex flex-wrap items-center gap-2 mt-2 pt-2 border-t border-stone-800">
           <button
             onClick={() => {
@@ -1535,20 +1642,117 @@ function RoomBar({ roomCode, isOnline, onSetRoom }) {
           </button>
         </div>
       )}
-      {showQr && (
+      {showPlayerQr && (
         <QrFullscreenOverlay url={playerUrl} label={`Players — scan to join room ${roomCode}`}
-          onClose={() => setShowQr(false)} />
+          onClose={() => setShowPlayerQr(false)} />
+      )}
+      {showSpectatorQr && (
+        <QrFullscreenOverlay url={spectatorUrl} label={`Spectators — scan for read-only grimoire (room ${roomCode})`}
+          onClose={() => setShowSpectatorQr(false)} />
       )}
     </section>
   );
 }
 
+// PIN setup screen — shown on a fresh room (no PIN yet). The ST picks a 4-digit
+// code; we pre-fill it with a random suggestion so a hurried ST can just hit
+// Save. The PIN is stored at /rooms/<code>/auth/pin in Firebase, and also kept
+// in localStorage for this device so they don't have to re-enter.
+function PinSetup({ roomCode, onSet }) {
+  const [pin, setPin] = useState(() => Math.floor(1000 + Math.random() * 9000).toString());
+  const trimmed = pin.trim();
+  const valid = /^\d{4,8}$/.test(trimmed);
+  return (
+    <div className="max-w-md mx-auto py-16">
+      <section className="parchment rounded-lg p-6 space-y-4 text-center">
+        <div>
+          <div className="text-xs uppercase tracking-wider text-amber-300">New room {roomCode}</div>
+          <h2 className="text-amber-200 text-xl font-semibold mt-1">Set a storyteller PIN</h2>
+          <p className="text-xs text-stone-400 mt-2">
+            This PIN protects the grimoire from players who know the room code.
+            Players don't need it; spectators get a separate read-only link.
+          </p>
+        </div>
+        <input value={pin}
+          onChange={e => setPin(e.target.value.replace(/\D/g, '').slice(0, 8))}
+          onKeyDown={e => { if (e.key === 'Enter' && valid) onSet(trimmed); }}
+          autoFocus inputMode="numeric"
+          className="w-full bg-stone-900 border border-stone-700 rounded px-3 py-3 text-3xl tracking-[0.4em] font-mono text-center" />
+        <button onClick={() => valid && onSet(trimmed)}
+          disabled={!valid}
+          className={`w-full py-3 rounded-lg text-base font-semibold
+            ${valid ? 'bg-emerald-600 hover:bg-emerald-500 text-stone-950' : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+          Save PIN &amp; start storyteller view
+        </button>
+        <p className="text-[10px] text-stone-500">4–8 digits. Write it down somewhere if you might ST from another device.</p>
+      </section>
+    </div>
+  );
+}
+
+// PIN entry screen — for ST returning from a different device, or anyone who
+// happens to know the room code but not the PIN. Includes a "switch to
+// spectator" escape hatch in case a bystander landed here by accident.
+function PinEntry({ roomCode, expectedPin, onSuccess, onSwitchToSpectator }) {
+  const [pin, setPin] = useState('');
+  const [err, setErr] = useState(false);
+  const tryPin = () => {
+    if (pin === expectedPin) { setErr(false); onSuccess(pin); }
+    else setErr(true);
+  };
+  return (
+    <div className="max-w-md mx-auto py-16">
+      <section className="parchment rounded-lg p-6 space-y-4 text-center">
+        <div>
+          <div className="text-xs uppercase tracking-wider text-amber-300">Room {roomCode}</div>
+          <h2 className="text-amber-200 text-xl font-semibold mt-1">Storyteller PIN required</h2>
+          <p className="text-xs text-stone-400 mt-2">Enter the PIN set when the room was created.</p>
+        </div>
+        <input value={pin}
+          onChange={e => { setPin(e.target.value.replace(/\D/g, '').slice(0, 8)); setErr(false); }}
+          onKeyDown={e => { if (e.key === 'Enter' && pin) tryPin(); }}
+          autoFocus inputMode="numeric" placeholder="••••"
+          className={`w-full bg-stone-900 border rounded px-3 py-3 text-3xl tracking-[0.4em] font-mono text-center
+            ${err ? 'border-red-600' : 'border-stone-700'}`} />
+        {err && <p className="text-xs text-red-400">Wrong PIN. Try again.</p>}
+        <button onClick={tryPin}
+          disabled={!pin}
+          className={`w-full py-3 rounded-lg text-base font-semibold
+            ${pin ? 'bg-emerald-600 hover:bg-emerald-500 text-stone-950' : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+          Unlock storyteller view
+        </button>
+        <div className="text-xs text-stone-500 pt-2 border-t border-stone-800">
+          Not the storyteller?{' '}
+          <button onClick={onSwitchToSpectator}
+            className="text-amber-300 hover:text-amber-200 underline underline-offset-2">
+            Open as spectator instead →
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+// Strip the current filename from the URL pathname so we can build sibling
+// URLs (player.html, storyteller.html) regardless of which page we're on.
+// e.g. on https://x.com/foo/storyteller.html?bar → returns "https://x.com/foo/"
+function siteBaseUrl() {
+  const origin = window.location.origin;                 // e.g. https://botc-3bt.pages.dev
+  const path = window.location.pathname.replace(/[^/]*$/, ''); // strip filename, keep dir
+  return origin + (path.endsWith('/') ? path : path + '/');
+}
+
 // Build the URL a player opens to join this room. Used by the join QR/link
 // and by traveller link generation.
 function playerJoinUrl(roomCode) {
-  const here = window.location.href.split('?')[0].split('#')[0];
-  const base = here.replace(/\/storyteller\.html$/, '/').replace(/storyteller\.html$/, '');
-  return `${base}player.html?room=${roomCode}`;
+  return `${siteBaseUrl()}player.html?room=${roomCode}`;
+}
+
+// Read-only spectator URL — bypasses the PIN, renders the grimoire with all
+// controls disabled. Lives on storyteller.html with ?view=spectator so the
+// page is identical (one less file to load on a phone) but locked down.
+function spectatorJoinUrl(roomCode) {
+  return `${siteBaseUrl()}storyteller.html?room=${roomCode}&view=spectator`;
 }
 
 function PageNav({ active, onChange, grimoireReady, gameStarted }) {
@@ -2401,7 +2605,7 @@ function eligibleSeatsForPending(roleId, seats) {
   return result;
 }
 
-function GrimoirePage({ state, swapSourceSeat, assigningRoleId,
+function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
                         onSeatTap, onCancelSwap, onPickupAssignment, onCancelAssignment,
                         onUndoAssignmentByCharId, onUnassignPending,
                         onToggleDead, onToggleAlignment, onSwap,
@@ -2467,7 +2671,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId,
   const displayedNotes = isViewingPastDay
     ? (grim.days[grim.viewingDayIndex]?.townSquareNotes || grim.townSquareNotes)
     : grim.townSquareNotes;
-  const readOnly = isViewingPastDay;
+  const readOnly = isViewingPastDay || !!forceReadOnly;
 
   // --- Night-info heads-up banners (Flower Girl, Town Crier) ---
   // On Day 2+, these characters wake each night* and learn something about the
@@ -3450,11 +3654,9 @@ function allTravellerChars() {
 // Build the URL a traveller's player opens. Includes the room code so the
 // traveller joins the right game, plus their traveller number.
 function travellerLinkFor(num) {
-  const here = window.location.href.split('?')[0].split('#')[0];
-  const base = here.replace(/\/storyteller\.html$/, '/').replace(/storyteller\.html$/, '');
   const room = getRoomFromUrl() || getLastRoom() || '';
   const roomParam = room ? `room=${room}&` : '';
-  return `${base}player.html?${roomParam}t=${num}`;
+  return `${siteBaseUrl()}player.html?${roomParam}t=${num}`;
 }
 
 // Render a small inline SVG QR for the given URL. Returns null if the qrcode lib
@@ -3509,7 +3711,10 @@ function QrFullscreenOverlay({ url, label, onClose }) {
           <p className="text-sm break-all bg-stone-100 p-3 rounded border border-stone-300 max-w-md">{url}</p>
         </div>
       )}
-      <div className="mt-4 text-stone-500 text-xs">Tap anywhere to close</div>
+      {/* Always print the encoded URL below the QR so the ST can sanity-check
+          (and so anyone whose phone can't scan QRs can just type it). */}
+      <div className="mt-3 text-stone-700 text-xs sm:text-sm break-all max-w-[min(90vmin,720px)] text-center font-mono px-2">{url}</div>
+      <div className="mt-2 text-stone-500 text-xs">Tap anywhere to close</div>
       <button onClick={(e) => { e.stopPropagation(); onClose(); }}
         className="absolute top-3 right-3 bg-stone-900 text-white rounded-full w-9 h-9 text-lg leading-none flex items-center justify-center shadow">
         ✕
