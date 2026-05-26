@@ -7145,18 +7145,30 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
                   <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">
                     Pick {cfg.numSeats || 2} seats <span className="text-stone-500 normal-case">({pickedSeats.length}/{cfg.numSeats || 2})</span>
                   </div>
-                  <ul className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+                  <ul className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
                     {(seats || []).map(s => {
                       const picked = pickedSeats.includes(s.seatNum);
+                      const rc = CHAR_BY_ID[s.actualRoleId];
                       return (
                         <li key={s.seatNum}>
                           <button onClick={() => toggleSeat(s.seatNum)}
-                            className={`w-full card rounded px-2 py-1.5 flex items-center gap-1.5 text-left text-sm
+                            className={`w-full card rounded px-2 py-1.5 flex items-center gap-2 text-left text-sm
                               ${picked ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}
                               ${s.isDead ? 'opacity-60' : ''}`}>
-                            <span className="text-amber-200/80 text-xs w-6 text-center">#{s.seatNum}</span>
-                            <span className="flex-1 min-w-0 truncate">{s.playerName || <span className="text-stone-500 italic">—</span>}</span>
-                            {picked && <span className="text-amber-300">✓</span>}
+                            <span className="text-amber-200/80 text-xs w-6 text-center flex-shrink-0">#{s.seatNum}</span>
+                            {iconUrl(s.actualRoleId) ? (
+                              <img src={iconUrl(s.actualRoleId)} alt=""
+                                className="w-8 h-8 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                            ) : (
+                              <span className="w-8 h-8 flex-shrink-0"></span>
+                            )}
+                            <div className="flex-1 min-w-0 leading-tight">
+                              <div className="truncate">{s.playerName || <span className="text-stone-500 italic">—</span>}</div>
+                              <div className={`text-[10px] uppercase tracking-wider truncate ${rc ? `team-${rc.team}` : 'text-stone-500'}`}>
+                                {rc?.name || '(no role)'}
+                              </div>
+                            </div>
+                            {picked && <span className="text-amber-300 text-base">✓</span>}
                           </button>
                         </li>
                       );
@@ -7340,9 +7352,10 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
               <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">
                 Pick the seat being asked about
               </div>
-              <ul className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+              <ul className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
                 {(seats || []).filter(s => s.actualRoleId && s.seatNum !== targetSeat?.seatNum).map(s => {
                   const picked = pickedSeats.includes(s.seatNum);
+                  const rc = CHAR_BY_ID[s.actualRoleId];
                   return (
                     <li key={s.seatNum}>
                       <button onClick={() => {
@@ -7351,12 +7364,23 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
                         setPickedRole('');
                         setPickedFalseRole('');
                       }}
-                        className={`w-full card rounded px-2 py-1.5 flex items-center gap-1.5 text-left text-sm
+                        className={`w-full card rounded px-2 py-1.5 flex items-center gap-2 text-left text-sm
                           ${picked ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}
                           ${s.isDead ? 'opacity-60' : ''}`}>
-                        <span className="text-amber-200/80 text-xs w-6 text-center">#{s.seatNum}</span>
-                        <span className="flex-1 min-w-0 truncate">{s.playerName || <span className="text-stone-500 italic">—</span>}</span>
-                        {picked && <span className="text-amber-300">✓</span>}
+                        <span className="text-amber-200/80 text-xs w-6 text-center flex-shrink-0">#{s.seatNum}</span>
+                        {iconUrl(s.actualRoleId) ? (
+                          <img src={iconUrl(s.actualRoleId)} alt=""
+                            className="w-8 h-8 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                        ) : (
+                          <span className="w-8 h-8 flex-shrink-0"></span>
+                        )}
+                        <div className="flex-1 min-w-0 leading-tight">
+                          <div className="truncate">{s.playerName || <span className="text-stone-500 italic">—</span>}</div>
+                          <div className={`text-[10px] uppercase tracking-wider truncate ${rc ? `team-${rc.team}` : 'text-stone-500'}`}>
+                            {rc?.name || '(no role)'}
+                          </div>
+                        </div>
+                        {picked && <span className="text-amber-300 text-base">✓</span>}
                       </button>
                     </li>
                   );
