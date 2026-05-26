@@ -1,0 +1,1 @@
+window.BOTC_DATA=window.BOTC_DATA||{};window.BOTC_DATA.teams=[{"id": "townsfolk", "name": "Townsfolk"}, {"id": "outsider", "name": "Outsiders"}, {"id": "minion", "name": "Minions"}, {"id": "demon", "name": "Demons"}, {"id": "traveller", "name": "Travellers"}, {"id": "fabled", "name": "Fabled"}, {"id": "loric", "name": "Loric"}];
