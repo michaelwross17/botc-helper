@@ -1237,6 +1237,9 @@ function App() {
   // Submit a local prompt — writes status='submitted' directly (skip 'awaiting'
   // since there's no remote phone to listen). `targets` for picker actions,
   // `infoPayload` echoed back for info actions.
+  // NOTE: we do NOT close the overlay here. The overlay component shows a
+  // "return phone to storyteller" confirmation screen after submit so the local
+  // player never sees the grimoire flash up. The ST taps Return to actually close.
   const submitLocalPrompt = (targets) => {
     if (!localOverlayStep) return;
     const { step, infoPayload } = localOverlayStep;
@@ -1257,7 +1260,7 @@ function App() {
       nightIdx:      (state.grimoire.viewingDayIndex || 0),
     };
     update({ grimoire: { ...state.grimoire, nightPrompts: np } });
-    setLocalOverlayStep(null);
+    // Overlay closes via closeLocalPrompt when the ST taps Return to storyteller.
   };
   // Acknowledge a question (player tapped Question instead of Submit): the
   // prompt stays visible on the player's phone with a "waiting for ST" message
@@ -7065,6 +7068,14 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }
     return true;
   });
   const [picked, setPicked] = useState([]);
+  // Internal phase: 'input' shows the picker/info; 'confirmed' shows a
+  // hand-the-phone-back screen that only the ST should tap to close.
+  // This prevents the local player from seeing the grimoire flash when the
+  // overlay closes on Submit.
+  const [phase, setPhase] = useState('input');
+  // Remember what was submitted so the confirmation screen can echo it.
+  const [submittedValue, setSubmittedValue] = useState(null);
+
   const togglePick = (seatNum) => {
     setPicked(prev => {
       if (prev.includes(seatNum)) return prev.filter(n => n !== seatNum);
@@ -7073,6 +7084,13 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }
     });
   };
   const canSubmit = isInfo ? true : picked.length === need;
+
+  const doSubmit = () => {
+    const v = isInfo ? [] : picked;
+    onSubmit(v);                 // writes the prompt; overlay does NOT close here
+    setSubmittedValue(isInfo ? 'info' : [...picked]);
+    setPhase('confirmed');
+  };
 
   // Build the info display body — same visual logic as player's NightInfoScreen.
   let infoBody = null;
@@ -7146,8 +7164,42 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }
     }
   }
 
+  // Confirmation phase — shown after Submit. Fully opaque background hides the
+  // grimoire while the local player is still holding the phone. Only the ST
+  // taps "Return to storyteller" to actually close the overlay.
+  if (phase === 'confirmed') {
+    return (
+      <div className="fixed inset-0 z-50 bg-stone-950 overflow-y-auto p-3 sm:p-4">
+        <div className="max-w-md mx-auto space-y-4 py-4">
+          <section className="parchment rounded-lg p-6 sm:p-8 text-center space-y-4 border-2 border-emerald-700/70">
+            <div className="text-6xl">✓</div>
+            <div className="text-emerald-300 text-2xl font-bold">
+              {isInfo ? 'Acknowledged' : 'Choice recorded'}
+            </div>
+            <p className="text-sm text-stone-300">
+              Thanks, <span className="text-amber-200 font-semibold">{mySeat.playerName || `seat #${mySeat.seatNum}`}</span>.
+              Please return the phone to the storyteller.
+            </p>
+            <div className="text-xs text-stone-500 pt-3 border-t border-stone-800">
+              Seat #{mySeat.seatNum}
+            </div>
+          </section>
+
+          <button onClick={onClose}
+            className="w-full py-3 rounded-lg text-base font-semibold bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40">
+            Return to storyteller →
+          </button>
+          <p className="text-[10px] text-stone-500 text-center">
+            Storyteller-only — do not tap if you are the local player.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // Input phase — picker or info display.
   return (
-    <div className="fixed inset-0 z-50 bg-stone-950/95 overflow-y-auto p-3 sm:p-4">
+    <div className="fixed inset-0 z-50 bg-stone-950 overflow-y-auto p-3 sm:p-4">
       <div className="max-w-md mx-auto space-y-4 py-4">
         <div className="text-center text-xs uppercase tracking-wider text-purple-300">
           🏠 Local player — show this to {mySeat.playerName || `seat #${mySeat.seatNum}`}
@@ -7210,7 +7262,7 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }
             className="py-3 rounded-lg text-base font-semibold bg-stone-800 hover:bg-stone-700 text-stone-300 border border-stone-700">
             Cancel
           </button>
-          <button onClick={() => onSubmit(isInfo ? [] : picked)}
+          <button onClick={doSubmit}
             disabled={!canSubmit}
             className={`py-3 rounded-lg text-base font-semibold transition
               ${canSubmit
