@@ -1398,6 +1398,28 @@ function App() {
       return next;
     });
   };
+  // show-grimoire completion detector: when the player (Spy) clears
+  // grimoireShownToSeat by tapping Got it on their phone, transition any
+  // matching show-grimoire prompt from 'awaiting' to 'submitted' so the
+  // night-phase row marks done and the toast fires via the normal effect.
+  useEffect(() => {
+    if (!loaded || isSpectator) return;
+    const np = state.grimoire.nightPrompts || {};
+    const shown = state.grimoire.grimoireShownToSeat;
+    let updated = null;
+    for (const [k, p] of Object.entries(np)) {
+      if (!p || p.action !== 'show-grimoire' || p.status !== 'awaiting') continue;
+      const seatNum = Number(k);
+      if (shown !== seatNum) {
+        updated = updated || { ...np };
+        updated[k] = { ...p, status: 'submitted', decidedAt: Date.now() };
+      }
+    }
+    if (updated) {
+      update({ grimoire: { ...state.grimoire, nightPrompts: updated } });
+    }
+  }, [state.grimoire.grimoireShownToSeat, JSON.stringify(state.grimoire.nightPrompts || {})]);
+
   // When a prompt leaves 'awaiting-st-response', drop it from the dismissed set
   // so a future re-prompt for the same seat re-opens the popup.
   useEffect(() => {
@@ -1540,7 +1562,9 @@ function App() {
         // For info prompts, summarize what was shown rather than what was picked.
         let toastText;
         const manualSuffix = manualNotePlease ? ` · ${manualNotePlease}` : '';
-        if (isInfoToast) {
+        if (p.action === 'show-grimoire') {
+          toastText = `${charName} (seat #${seatNum}${seat?.playerName ? ' · ' + seat.playerName : ''}) viewed the grimoire and dismissed it.`;
+        } else if (isInfoToast) {
           const info = p.infoPayload || {};
           const seatList = (info.seats || []).map(n => {
             const ts = state.grimoire.seats.find(s => s.seatNum === n);
@@ -1790,6 +1814,29 @@ function App() {
   };
   const cancelGrimoireShow = () => {
     update({ grimoire: { ...state.grimoire, grimoireShownToSeat: null } });
+  };
+
+  // Night-phase Spy automation: send the grimoire AND track via nightPrompts
+  // so the night-phase row shows status (awaiting / done). A separate effect
+  // (below) detects when the player taps Got it (grimoireShownToSeat clears)
+  // and transitions the prompt to 'submitted' for toast + done.
+  const startShowGrimoire = (seatNum, step) => {
+    if (!seatNum) return;
+    const g = state.grimoire;
+    const np = { ...(g.nightPrompts || {}) };
+    np[seatNum] = {
+      roleId:        step?.char?.id || 'spy',
+      action:        'show-grimoire',
+      instruction:   step?.instruction || '',
+      reminderLabel: '',  // no auto-reminder for show-grimoire
+      eligible:      'all',
+      status:        'awaiting',
+      targets:       null,
+      infoPayload:   null,
+      startedAt:     Date.now(),
+      nightIdx:      (g.viewingDayIndex || 0),
+    };
+    update({ grimoire: { ...g, nightPrompts: np, grimoireShownToSeat: seatNum } });
   };
 
   // Update one of the two Town Square freeform notes ('above' | 'below').
@@ -2056,6 +2103,7 @@ function App() {
           dismissedResponses={dismissedResponses}
           onDismissResponsePopup={dismissResponsePopup}
           onPromoteScarletWoman={promoteScarletWoman}
+          onStartShowGrimoire={startShowGrimoire}
           forceReadOnly={isSpectator}
           state={state}
           swapSourceSeat={swapSourceSeat}
@@ -3290,7 +3338,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
                         nightToasts = [], onDismissNightToast,
                         onStartNightPrompt, onCancelNightPrompt, onMarkStepDone, onClearAllNightPrompts, onOpenLocalPrompt,
                         onMarkSetupReminder, onSkipSetupReminders, onRespondToNightPrompt,
-                        dismissedResponses, onDismissResponsePopup, onPromoteScarletWoman,
+                        dismissedResponses, onDismissResponsePopup, onPromoteScarletWoman, onStartShowGrimoire,
                         onSeatTap, onCancelSwap, onPickupAssignment, onCancelAssignment,
                         onUndoAssignmentByCharId, onUnassignPending,
                         onToggleDead, onToggleAlignment, onSwap,
@@ -3634,6 +3682,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         onOpenLocalPrompt={onOpenLocalPrompt}
         nominationsByDay={grim.nominationsByDay || {}}
         onPromoteScarletWoman={onPromoteScarletWoman}
+        onStartShowGrimoire={onStartShowGrimoire}
       />
 
       <DealRolesButton
@@ -6975,6 +7024,8 @@ function DealRolesButton({ seats, onDealAll, onUndealAll, blockedReason }) {
 const NIGHT_ACTIONS = {
   // ===== Trouble Brewing =====
   poisoner:      { action: 'target1',     reminder: 'Poisoned',    instruction: 'Choose a player to poison tonight.', eligible: 'others' },
+  scarletwoman:  { action: 'passive',                                  instruction: "Will trigger automatically when the Demon dies and 5+ players remain alive (Travellers don't count)." },
+  spy:           { action: 'show-grimoire',                            instruction: 'Show the Spy the full grimoire (all seats, roles, reminders).' },
   monk:          { action: 'target1',     reminder: 'Safe',        instruction: 'Choose a player to protect from the Demon tonight.', eligible: 'others', phase: 'other' },
   butler:        { action: 'target1',     reminder: 'Master',      instruction: 'Choose your Master. Tomorrow you can only vote when they vote.', eligible: 'others' },
   imp:           { action: 'target1self', reminder: 'Dead',        instruction: 'Choose a player to kill. (Choose yourself to pass the demon to a Minion.)', phase: 'other' },
@@ -7312,7 +7363,7 @@ function infoSuggestion(roleId, mySeat, seats, ctx) {
 // reminder / fire toast) is not yet implemented. The Start button currently
 // shows a placeholder confirming what *would* happen. Phase B replaces this
 // placeholder with the real flow.
-function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onMarkDone: onMarkDoneProp, onOpenInfoPicker, onOpenLocalPrompt, gameStarted = false }) {
+function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onMarkDone: onMarkDoneProp, onOpenInfoPicker, onOpenLocalPrompt, onStartShowGrimoire, gameStarted = false }) {
   const { action, seat, instruction, reminderLabel, prompt, requiresDeath, oncePerGame } = step;
   if (readOnly) return null;
   if (!seat) return (
@@ -7327,6 +7378,13 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
   if (oncePerGame && hasNoAbility) {
     return (
       <div className="mt-1.5 text-[11px] text-stone-500 italic">Already used this game.</div>
+    );
+  }
+  if (action === 'passive') {
+    return (
+      <div className="mt-1.5 text-[11px] text-stone-400 italic">
+        {instruction || 'Passive — triggers automatically when conditions are met.'}
+      </div>
     );
   }
   if (requiresDeath && !(seat.isDead && hasDeadReminder)) {
@@ -7348,14 +7406,16 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
   // — see the dispatch in onStart below. We still annotate the row visually.)
 
   const actionLabel = ({
-    target1:        'Asks for 1 player',
-    target1self:    'Asks for 1 player (self ok)',
-    target1any:     'Asks for 1 player (dead ok)',
-    target2:        'Asks for 2 players',
-    'target2+yesno':'Asks for 2 players → you respond YES/NO',
-    'target1+role': 'Asks for 1 player → you respond with a role',
-    'info-st':      'You pick the info to reveal',
-    manual:         'No automation — handle in person',
+    target1:         'Asks for 1 player',
+    target1self:     'Asks for 1 player (self ok)',
+    target1any:      'Asks for 1 player (dead ok)',
+    target2:         'Asks for 2 players',
+    'target2+yesno': 'Asks for 2 players → you respond YES/NO',
+    'target1+role':  'Asks for 1 player → you respond with a role',
+    'info-st':       'You pick the info to reveal',
+    'show-grimoire': 'Show the player the grimoire',
+    passive:         'Passive — triggers automatically when conditions are met',
+    manual:          'No automation — handle in person',
   })[action] || action;
 
   const onStart = () => {
@@ -7363,6 +7423,12 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
       // Info flow always goes through the InfoPickerModal first; that modal
       // routes to a local overlay (if applicable) on Send.
       onOpenInfoPicker && onOpenInfoPicker(step);
+      return;
+    }
+    if (action === 'show-grimoire') {
+      // Spy-style: send the grimoire snapshot to the player phone (re-uses the
+      // existing 'Show grimoire to a player' mechanism).
+      onStartShowGrimoire && onStartShowGrimoire(seat.seatNum, step);
       return;
     }
     if (seat.isLocal) {
@@ -8707,7 +8773,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                               automation = false, nightPrompts = {}, readOnly = false,
                               onStartPrompt, onCancelPrompt, onMarkDone, onClearAllPrompts,
                               scriptCharIds = [], onOpenLocalPrompt,
-                              nominationsByDay = {}, onPromoteScarletWoman }) {
+                              nominationsByDay = {}, onPromoteScarletWoman, onStartShowGrimoire }) {
   // Auto-expand when automation is on so the ST sees the interactive panel immediately.
   const [collapsed, setCollapsed] = useState(!automation);
   useEffect(() => { if (automation) setCollapsed(false); }, [automation]);
@@ -8871,9 +8937,11 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                 // a 'No ability' reminder is already present (ability used).
                 // Otherwise dim when dead (the usual case).
                 const noAbility = (s.seat?.reminders || []).some(r => r && /no ability/i.test(String(r.label || '')));
-                const dim = s.requiresDeath
-                  ? (!s.seat?.isDead || noAbility)
-                  : !!s.seat?.isDead;
+                const dim = s.action === 'passive'
+                  ? true
+                  : s.requiresDeath
+                    ? (!s.seat?.isDead || noAbility)
+                    : !!s.seat?.isDead;
                 return (
                 <li key={i} className={`card rounded p-2 flex items-start gap-2 ${dim ? 'opacity-50' : ''} ${automation && s.prompt?.status === 'awaiting' ? 'border-amber-500 ring-1 ring-amber-700/40' : ''} ${automation && s.prompt?.status === 'question' ? 'border-red-500 ring-1 ring-red-700/40' : ''}`}>
                   <span className="text-stone-500 text-xs tabular-nums w-6 text-center pt-0.5">{s.stepNum}</span>
@@ -8904,6 +8972,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                         onMarkDone={onMarkDone}
                         onOpenInfoPicker={openInfoPicker}
                         onOpenLocalPrompt={onOpenLocalPrompt}
+                        onStartShowGrimoire={onStartShowGrimoire}
                         gameStarted={gameStarted}
                       />
                     )}
