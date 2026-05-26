@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Blood on the Clocktower — Helper</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { background:#0f0f14; color:#f1e9d2; font-family: ui-sans-serif, system-ui, sans-serif; }
+  .parchment { background: linear-gradient(180deg,#1c1a14 0%,#13110c 100%); border: 1px solid #4a3c22; }
+  .pill { background:#2a2415; border:1px solid #4a3c22; }
+</style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-6">
+  <div class="max-w-md w-full text-center space-y-6">
+    <div>
+      <h1 class="text-3xl font-semibold text-amber-200 tracking-tight">Blood on the Clocktower</h1>
+      <p class="text-sm text-stone-400 mt-1">Home-game helper</p>
+    </div>
+
+    <div class="parchment rounded-lg p-5 space-y-3">
+      <a href="storyteller.html"
+         class="block w-full px-4 py-3 rounded pill text-amber-200 hover:border-amber-500 font-medium">
+        I'm the Storyteller →
+      </a>
+      <a href="player.html"
+         class="block w-full px-4 py-3 rounded pill text-amber-200 hover:border-amber-500 font-medium">
+        I'm a Player →
+      </a>
+    </div>
+
+    <p class="text-xs text-stone-500">
+      Player joining is currently a local mock — the player and storyteller pages
+      share state via localStorage on the same device.<br/>
+      Real cross-device networking comes next.
+    </p>
+  </div>
+</body>
+</html>

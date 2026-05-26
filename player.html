@@ -1,0 +1,1068 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<meta name="robots" content="noindex" />
+<title>Player — Blood on the Clocktower Helper</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<!-- Shared character data (so the player can see role icons later when revealed) -->
+<script src="data/characters.js"></script>
+
+<style>
+  body { background: #0f0f14; color: #f1e9d2; font-family: ui-sans-serif, system-ui, sans-serif; min-height: 100dvh; }
+  .parchment { background: linear-gradient(180deg,#1c1a14 0%,#13110c 100%); border: 1px solid #4a3c22; }
+  .pill { background:#2a2415; border:1px solid #4a3c22; }
+  input, button { color-scheme: dark; }
+  /* Big tap targets on mobile */
+  .seat-btn { min-height: 64px; }
+</style>
+</head>
+<body>
+<div id="root" class="max-w-md mx-auto p-4 sm:p-6"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo } = React;
+
+// ---------------- Data + storage ----------------
+const ALL_CHARACTERS = window.BOTC_DATA?.characters || [];
+const CHAR_BY_ID = Object.fromEntries(ALL_CHARACTERS.map(c => [c.id, c]));
+
+function iconUrl(charId) {
+  const c = CHAR_BY_ID[charId];
+  if (!c) return null;
+  return `data/icons/${c.team}/${charId}.webp`;
+}
+
+// Same key as storyteller — both pages share the grimoire state via localStorage.
+// In a future networked version this becomes a server API.
+const LS_KEY = 'botc-storyteller-v1';
+const CLIENT_ID_KEY = 'botc-player-client-id';
+
+function loadGame() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+function saveGame(g) {
+  try { localStorage.setItem(LS_KEY, JSON.stringify(g)); } catch {}
+}
+
+function getOrCreateClientId() {
+  // Per-tab/session client ID. Two tabs on the same device = two different clients,
+  // which is exactly what we want for duplicate-claim detection.
+  let id = sessionStorage.getItem(CLIENT_ID_KEY);
+  if (!id) {
+    id = 'c_' + Math.random().toString(36).slice(2, 10);
+    sessionStorage.setItem(CLIENT_ID_KEY, id);
+  }
+  return id;
+}
+
+// Mutate a single seat in localStorage. Returns the new game state.
+function updateSeat(seatNum, mutator) {
+  const game = loadGame();
+  if (!game?.grimoire?.seats) return null;
+  game.grimoire.seats = game.grimoire.seats.map(s =>
+    s.seatNum === seatNum ? mutator({ ...s }) : s
+  );
+  saveGame(game);
+  return game;
+}
+
+// Mutate a single traveller in localStorage. Returns the new game state.
+function updateTraveller(travellerNum, mutator) {
+  const game = loadGame();
+  const list = game?.grimoire?.travellers;
+  if (!list) return null;
+  game.grimoire.travellers = list.map(t =>
+    t.travellerNum === travellerNum ? mutator({ ...t }) : t
+  );
+  saveGame(game);
+  return game;
+}
+
+// Read ?t=N from the current URL — non-null = this client is a traveller, not a regular player.
+function getTravellerNumFromUrl() {
+  try {
+    const v = new URLSearchParams(window.location.search).get('t');
+    const n = v ? parseInt(v, 10) : NaN;
+    return Number.isInteger(n) && n > 0 ? n : null;
+  } catch { return null; }
+}
+
+// ---------------- App ----------------
+function App() {
+  const [game, setGame] = useState(loadGame());
+  const clientId = useMemo(getOrCreateClientId, []);
+  // ?t=N tells us this client is a traveller, joining via the link the ST shared.
+  // We don't go through SeatPicker at all in that case — the traveller's slot is
+  // pre-allocated by the ST.
+  const travellerNum = useMemo(getTravellerNumFromUrl, []);
+
+  // Cross-tab sync: when storyteller updates state, refresh our view.
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.key === LS_KEY) setGame(loadGame());
+    };
+    window.addEventListener('storage', handler);
+    return () => window.removeEventListener('storage', handler);
+  }, []);
+
+  const grim = game?.grimoire;
+
+  // Traveller flow — diverges before the regular seat-picker because travellers
+  // can join AFTER the bag has been dealt (so the game may already be running).
+  if (travellerNum != null) {
+    return <TravellerApp
+      game={game}
+      setGame={setGame}
+      clientId={clientId}
+      travellerNum={travellerNum}
+    />;
+  }
+
+  // No game yet — storyteller hasn't generated roles
+  if (!grim?.generated || !grim?.seats?.length) {
+    return <WaitingForStoryteller />;
+  }
+
+  // Find any seat that this client has claimed
+  const mySeat = grim.seats.find(s =>
+    (s.claims || []).some(c => c.clientId === clientId)
+  );
+
+  if (!mySeat) {
+    return <SeatPicker
+      seats={grim.seats}
+      clientId={clientId}
+      onPicked={(seatNum) => setGame(loadGame())}
+    />;
+  }
+
+  if (!(mySeat.playerName || '').trim()) {
+    return <NameEntry
+      seat={mySeat}
+      onSubmit={(name) => setGame(updateSeat(mySeat.seatNum, s => ({ ...s, playerName: name })))}
+      onChangeSeat={() => {
+        const game = updateSeat(mySeat.seatNum, s => ({
+          ...s,
+          claims: (s.claims || []).filter(c => c.clientId !== clientId),
+        }));
+        setGame(game);
+      }}
+    />;
+  }
+
+  // Storyteller is showing the full grimoire snapshot to this seat (Spy ability etc.)
+  // Renders on top of whatever else is currently displayed.
+  if (grim.grimoireShownToSeat === mySeat.seatNum) {
+    return <GrimoireSnapshotOverlay grimoire={grim}
+      onAccept={() => setGame(((g) => {
+        const next = loadGame() || g;
+        next.grimoire = { ...(next.grimoire || {}), grimoireShownToSeat: null };
+        saveGame(next);
+        return next;
+      })(game))}
+    />;
+  }
+
+  // Storyteller has passed out this player's role → show their character.
+  if (mySeat.roleDealt) {
+    const setStatus = (status) => setGame(updateSeat(mySeat.seatNum, s => ({ ...s, playerStatus: status })));
+    if (mySeat.playerStatus === 'accepted') {
+      // Kazali special flow: after accepting, the player must pick which players
+      // become Minions. We gate the AcceptedScreen on those picks being submitted.
+      const needsKazaliPicks =
+        mySeat.actualRoleId === 'kazali' &&
+        !(grim.kazaliPicks && grim.kazaliPicks.length);
+      if (needsKazaliPicks) {
+        return <KazaliPicksScreen
+          mySeat={mySeat}
+          game={game}
+          onSubmit={(picks) => {
+            // Atomic write: update Kazali's seat AND every picked seat AND the
+            // grimoire.kazaliPicks marker in one localStorage write so the
+            // storyteller sees a consistent state.
+            const next = loadGame() || game;
+            if (!next?.grimoire) return;
+            const pickedBySeat = Object.fromEntries(picks.map(p => [p.seatNum, p.minionId]));
+            next.grimoire.seats = next.grimoire.seats.map(s => {
+              if (pickedBySeat[s.seatNum]) {
+                const minionId = pickedBySeat[s.seatNum];
+                const origId = s.previousRoleId || s.perceivedRoleId;
+                const origChar = CHAR_BY_ID[origId];
+                const existingReminders = s.reminders || [];
+                // Drop a reminder token of the original role on the seat so the
+                // storyteller can see at a glance that this player was converted
+                // and what they were before. Skip if the same marker is already
+                // present (re-runs of the picks flow).
+                const alreadyMarked = existingReminders.some(r =>
+                  r.kazaliOriginal && r.charId === origId);
+                const reminders = alreadyMarked ? existingReminders : [
+                  ...existingReminders,
+                  {
+                    charId: origId,
+                    label: `Was ${origChar?.name || origId}`,
+                    charName: origChar?.name,
+                    team: origChar?.team,
+                    kazaliOriginal: true,
+                  },
+                ];
+                return {
+                  ...s,
+                  // Remember what they were before Kazali chose them, so the role
+                  // reveal can explain the change ("you were X, Kazali made you Y").
+                  // Don't overwrite a previously-set previousRoleId — preserve the
+                  // earliest known role in case of repeated conversions.
+                  previousRoleId: origId,
+                  changedBy: 'kazali',
+                  perceivedRoleId: minionId,
+                  actualRoleId: minionId,
+                  reminders,
+                  // Reset deal status so the ST re-pushes the new role to the player.
+                  roleDealt: false,
+                  playerStatus: null,
+                };
+              }
+              return s;
+            });
+            next.grimoire.kazaliPicks = picks;
+            saveGame(next);
+            setGame(next);
+          }}
+        />;
+      }
+      return <AcceptedScreen seat={mySeat} />;
+    }
+    return <RoleReveal
+      seat={mySeat}
+      grimoire={grim}
+      bagCharacterIds={game?.bagCharacterIds || []}
+      onAccept={() => setStatus('accepted')}
+      onAsk={() => setStatus('asking')}
+    />;
+  }
+
+  return <WaitingForGame
+    seat={mySeat}
+    onChangeName={() => setGame(updateSeat(mySeat.seatNum, s => ({ ...s, playerName: '' })))}
+    onLeaveSeat={() => {
+      if (!confirm('Leave your seat? Someone else may take it.')) return;
+      const game = updateSeat(mySeat.seatNum, s => ({
+        ...s,
+        playerName: '',
+        claims: (s.claims || []).filter(c => c.clientId !== clientId),
+      }));
+      setGame(game);
+    }}
+  />;
+}
+
+// ---------------- Screens ----------------
+function ScreenShell({ children }) {
+  return (
+    <div className="min-h-[100dvh] flex flex-col gap-6 py-6">
+      <header className="text-center">
+        <h1 className="text-amber-200 text-xl font-semibold tracking-tight">Blood on the Clocktower</h1>
+        <p className="text-xs text-stone-500 mt-1">Player</p>
+      </header>
+      {children}
+    </div>
+  );
+}
+
+function WaitingForStoryteller() {
+  return (
+    <ScreenShell>
+      <section className="parchment rounded-lg p-6 text-center space-y-3">
+        <div className="text-3xl">🕯️</div>
+        <div className="text-amber-200 text-lg font-medium">Waiting for the storyteller…</div>
+        <p className="text-sm text-stone-400">
+          Once the storyteller has set up the game, you'll be able to pick your seat here.
+        </p>
+        <p className="text-xs text-stone-500 pt-4">
+          This page auto-updates — no need to refresh.
+        </p>
+      </section>
+    </ScreenShell>
+  );
+}
+
+function SeatPicker({ seats, clientId, onPicked }) {
+  const [error, setError] = useState(null);
+
+  const pick = (seatNum) => {
+    setError(null);
+    const game = loadGame();
+    if (!game?.grimoire?.seats) return;
+    const seat = game.grimoire.seats.find(s => s.seatNum === seatNum);
+    if (!seat) return;
+
+    const claims = seat.claims || [];
+    const alreadyMine = claims.some(c => c.clientId === clientId);
+    const claimedByOther = claims.some(c => c.clientId !== clientId);
+
+    if (claimedByOther && !alreadyMine) {
+      setError(`Seat #${seatNum} is already taken${seat.playerName ? ` by ${seat.playerName}` : ''}. Pick another.`);
+      return;
+    }
+
+    // Claim the seat (add our clientId)
+    const newClaims = alreadyMine ? claims : [...claims, { clientId, timestamp: Date.now() }];
+    game.grimoire.seats = game.grimoire.seats.map(s =>
+      s.seatNum === seatNum ? { ...s, claims: newClaims } : s
+    );
+    saveGame(game);
+    onPicked(seatNum);
+  };
+
+  return (
+    <ScreenShell>
+      <section className="parchment rounded-lg p-4 space-y-3">
+        <h2 className="text-amber-200 font-semibold text-lg">Pick your seat</h2>
+        <p className="text-xs text-stone-400">Tap the seat you're sitting in at the table.</p>
+        {error && (
+          <div className="text-sm text-red-400 bg-red-950/40 border border-red-700 rounded px-3 py-2">
+            {error}
+          </div>
+        )}
+        <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
+          {seats.map(seat => {
+            const taken = (seat.claims || []).length > 0;
+            return (
+              <button key={seat.seatNum}
+                onClick={() => pick(seat.seatNum)}
+                disabled={taken}
+                className={`seat-btn rounded-lg border flex flex-col items-center justify-center gap-0.5 p-2 transition
+                  ${taken
+                    ? 'bg-stone-900/60 border-stone-800 text-stone-600 cursor-not-allowed'
+                    : 'pill hover:border-amber-500 hover:text-amber-200 active:scale-95'}`}>
+                <span className="text-lg font-bold">#{seat.seatNum}</span>
+                {taken
+                  ? <span className="text-[10px] uppercase truncate w-full text-center">
+                      {seat.playerName ? seat.playerName : 'taken'}
+                    </span>
+                  : <span className="text-[10px] uppercase text-stone-500">open</span>}
+              </button>
+            );
+          })}
+        </div>
+      </section>
+    </ScreenShell>
+  );
+}
+
+function NameEntry({ seat, onSubmit, onChangeSeat }) {
+  const [name, setName] = useState(seat.playerName || '');
+  const trimmed = name.trim();
+  return (
+    <ScreenShell>
+      <section className="parchment rounded-lg p-4 space-y-3">
+        <div className="text-center">
+          <div className="text-xs text-stone-400 uppercase tracking-wider">You're at</div>
+          <div className="text-amber-200 text-3xl font-bold">Seat #{seat.seatNum}</div>
+        </div>
+        <label className="block">
+          <span className="text-sm text-stone-300">Your name</span>
+          <input
+            value={name}
+            onChange={e => setName(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter' && trimmed) onSubmit(trimmed); }}
+            autoFocus
+            maxLength={32}
+            placeholder="Type your name…"
+            className="mt-1 w-full bg-stone-900 border border-stone-700 rounded px-3 py-3 text-base"
+          />
+        </label>
+        <button onClick={() => onSubmit(trimmed)}
+          disabled={!trimmed}
+          className={`w-full py-3 rounded-lg text-base font-semibold transition
+            ${trimmed
+              ? 'bg-amber-600 hover:bg-amber-500 text-stone-950'
+              : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+          I'm ready
+        </button>
+        <button onClick={onChangeSeat}
+          className="w-full py-2 text-xs text-stone-400 hover:text-amber-200 underline underline-offset-2">
+          Wrong seat? Pick another
+        </button>
+      </section>
+    </ScreenShell>
+  );
+}
+
+function WaitingForGame({ seat, onChangeName, onLeaveSeat }) {
+  return (
+    <ScreenShell>
+      <section className="parchment rounded-lg p-6 text-center space-y-4">
+        <div>
+          <div className="text-xs text-stone-400 uppercase tracking-wider">Welcome</div>
+          <div className="text-amber-200 text-2xl font-bold">{seat.playerName}</div>
+          <div className="text-sm text-stone-400">Seat #{seat.seatNum}</div>
+        </div>
+        <div className="text-5xl">⏳</div>
+        <p className="text-sm text-stone-300">
+          You're checked in. The storyteller will start the game shortly.
+        </p>
+        <p className="text-xs text-stone-500">
+          Keep this page open. Your role will appear here when the game begins.
+        </p>
+        <div className="pt-4 border-t border-stone-800 flex flex-col gap-2">
+          <button onClick={onChangeName}
+            className="text-xs text-stone-400 hover:text-amber-200 underline underline-offset-2">
+            Edit name
+          </button>
+          <button onClick={onLeaveSeat}
+            className="text-xs text-stone-400 hover:text-red-400 underline underline-offset-2">
+            Leave seat
+          </button>
+        </div>
+      </section>
+    </ScreenShell>
+  );
+}
+
+function RoleReveal({ seat, grimoire, bagCharacterIds, onAccept, onAsk }) {
+  // Players see their PERCEIVED role (what they think they are).
+  // For Drunk-as-Chef, the player sees Chef. The Drunk-ness is the storyteller's secret.
+  const role = CHAR_BY_ID[seat.perceivedRoleId];
+  const actual = CHAR_BY_ID[seat.actualRoleId];
+  // Anyone holding a demon-team token sees bluffs. If they're actually the Lunatic,
+  // those bluffs come from grimoire.lunaticBluffs (fake info). Otherwise (real demon),
+  // grimoire.demonBluffs.
+  const isLunatic = seat.actualRoleId === 'lunatic';
+  const perceivedIsDemon = role?.team === 'demon';
+  // Summoner ability says "You get 3 bluffs" — same 3 as the demon-bluff slots,
+  // even though the Summoner is a Minion (and there's no Demon in play yet).
+  const isSummoner = seat.actualRoleId === 'summoner';
+  // Minions get their own bluffs ONLY if the Snitch is in play (Snitch ability:
+  // "Each Minion gets 3 bluffs."). We check the bag for Snitch and treat the
+  // perceived role here — a Spy holding a Townsfolk token wouldn't see minion
+  // bluffs because their perceived role is Townsfolk. But that's the official
+  // behavior: the Snitch grants bluffs to actual minions, and those minions know
+  // they're minions, so perceived === actual for them. We additionally check
+  // actualRoleId team so a Marionette (perceived minion, actual outsider)
+  // doesn't get bluffs they shouldn't have.
+  const snitchInPlay = (bagCharacterIds || []).includes('snitch');
+  const actualIsMinion = actual?.team === 'minion';
+  const perceivedIsMinion = role?.team === 'minion';
+  const showMinionBluffs = snitchInPlay && actualIsMinion && perceivedIsMinion;
+  const minionBluffsForMe = showMinionBluffs
+    ? ((grimoire?.minionBluffs || {})[seat.seatNum] || [null, null, null]).filter(Boolean)
+    : [];
+  // Summoner uses the demon-bluff pool; if Snitch ALSO marks this minion, prefer
+  // the minion-specific bluffs (which are per-seat and may be customized).
+  const showBluffs = perceivedIsDemon || showMinionBluffs || isSummoner;
+  const bluffs = showMinionBluffs
+    ? minionBluffsForMe
+    : (isLunatic
+      ? (grimoire?.lunaticBluffs || []).filter(Boolean)
+      : (grimoire?.demonBluffs || []).filter(Boolean));
+  const asking = seat.playerStatus === 'asking';
+
+  return (
+    <ScreenShell>
+      <section className="parchment rounded-lg p-5 text-center space-y-4">
+        <div>
+          <div className="text-xs text-stone-400 uppercase tracking-wider">{seat.playerName}</div>
+          <div className="text-amber-200/80 text-sm">Seat #{seat.seatNum}</div>
+        </div>
+
+        {/* Kazali-conversion banner: if the player was originally a different role
+            (i.e. they were a Townsfolk and the Kazali chose them to become a Minion),
+            show their original token + label so they know what they were and that
+            the Kazali changed them. */}
+        {seat.previousRoleId && seat.previousRoleId !== seat.perceivedRoleId && (() => {
+          const prev = CHAR_BY_ID[seat.previousRoleId];
+          const by = seat.changedBy === 'kazali' ? 'the Kazali' : 'the Storyteller';
+          return (
+            <div className="rounded-lg p-3 border-2 border-red-700 bg-red-950/40 text-center">
+              <div className="text-xs uppercase tracking-wider text-red-300 font-semibold mb-2">Your role has changed</div>
+              <div className="text-xs text-stone-300 mb-2">You were originally:</div>
+              <div className="flex flex-col items-center gap-1.5">
+                <div className="rounded-full overflow-hidden border-2 border-amber-700 w-20 h-20"
+                  style={{ backgroundImage: 'url(data/tokens/character-token-noise.webp)', backgroundSize: 'cover' }}>
+                  {iconUrl(seat.previousRoleId) && (
+                    <img src={iconUrl(seat.previousRoleId)} alt={prev?.name || ''} className="w-full h-full object-cover" />
+                  )}
+                </div>
+                <div className={`text-sm font-bold ${prev ? `team-${prev.team}` : ''}`}>
+                  {prev?.name || seat.previousRoleId}
+                </div>
+              </div>
+              <p className="text-xs text-stone-300 mt-3">
+                {by} has chosen you to become a Minion of the evil team. Your new role is shown below.
+              </p>
+            </div>
+          );
+        })()}
+
+        <div className="text-xs uppercase tracking-wider text-amber-300">Your role</div>
+
+        {/* Big round token */}
+        <div className="mx-auto rounded-full overflow-hidden border-4 border-amber-700 relative shadow-xl"
+          style={{ width: 'min(220px, 60vw)', aspectRatio: '1 / 1',
+                   backgroundImage: 'url(data/tokens/character-token-noise.webp)', backgroundSize: 'cover' }}>
+          {iconUrl(seat.perceivedRoleId) && (
+            <img src={iconUrl(seat.perceivedRoleId)} alt={role?.name || ''} className="w-full h-full object-cover" />
+          )}
+          <div className="absolute inset-x-0 bottom-0 bg-stone-950/85 px-2 py-2 text-center"
+            style={{ minHeight: '42%' }}>
+            <div className={`text-[10px] sm:text-xs leading-tight mb-1 text-stone-200 px-1`}
+              style={{ wordBreak: 'break-word' }}>
+              {role?.ability}
+            </div>
+            <div className={`text-sm sm:text-base font-bold leading-tight ${role ? `team-${role.team}` : ''}`}>
+              {role?.name || '?'}
+            </div>
+          </div>
+        </div>
+
+        {/* Big role name + ability outside the token for easy reading */}
+        <div className="pt-2">
+          <div className={`text-2xl font-bold ${role ? `team-${role.team}` : ''}`}>{role?.name}</div>
+          <p className="text-sm text-stone-300 mt-2 leading-relaxed">{role?.ability}</p>
+        </div>
+
+        {/* Bluffs — real demons see demonBluffs, lunatics see lunaticBluffs (their fake info),
+            minions see their own slot of minionBluffs only when Snitch is in play. */}
+        {showBluffs && (
+          <div className="pt-4 mt-2 border-t border-stone-800">
+            <div className="text-xs uppercase tracking-wider text-amber-300 mb-1">
+              {showMinionBluffs
+                ? 'Your bluffs (from the Snitch)'
+                : (isSummoner ? 'Your bluffs (Summoner)' : 'Your bluffs')}
+            </div>
+            <p className="text-xs text-stone-400 mb-3">3 roles you can claim to be</p>
+            <div className="grid grid-cols-3 gap-2">
+              {[0,1,2].map(i => {
+                // Summoner uses the demon-bluffs pool. Snitch-minion uses per-seat
+                // minion bluffs. Lunatic uses lunatic bluffs. Real demon uses demon bluffs.
+                const sourceArr = showMinionBluffs
+                  ? (grimoire?.minionBluffs || {})[seat.seatNum]
+                  : (isLunatic ? grimoire.lunaticBluffs : grimoire.demonBluffs);
+                const bId = sourceArr?.[i];
+                const bc = bId ? CHAR_BY_ID[bId] : null;
+                return (
+                  <div key={i} className="text-center">
+                    <div className="rounded-full overflow-hidden border-2 border-amber-700/70 mx-auto aspect-square w-full"
+                      style={{ backgroundImage: 'url(data/tokens/character-token-noise.webp)', backgroundSize: 'cover' }}>
+                      {bc && iconUrl(bId) ? (
+                        <img src={iconUrl(bId)} alt={bc.name} className="w-full h-full object-cover" />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center text-stone-600 text-xs">?</div>
+                      )}
+                    </div>
+                    {bc ? (
+                      <>
+                        <div className={`mt-1 text-[11px] font-medium team-${bc.team}`}>{bc.name}</div>
+                        <div className="text-[9px] text-stone-300/80 leading-tight mt-0.5">{bc.ability}</div>
+                      </>
+                    ) : (
+                      <div className="mt-1 text-[10px] text-stone-500 italic">(no bluff set)</div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Accept / Ask question controls */}
+        <div className="pt-4 border-t border-stone-800 space-y-2">
+          {asking && (
+            <div className="rounded p-2 text-sm bg-yellow-950/40 border border-yellow-700 text-yellow-200">
+              ✋ Storyteller notified. Wave them over to discuss.
+            </div>
+          )}
+          <button onClick={onAccept}
+            className="w-full py-3 rounded-lg text-base font-semibold bg-emerald-600 hover:bg-emerald-500 text-stone-950">
+            {asking ? 'Discussion done — Accept role' : 'Accept role'}
+          </button>
+          {!asking && (
+            <button onClick={onAsk}
+              className="w-full py-3 rounded-lg text-base font-medium bg-yellow-700 hover:bg-yellow-600 text-stone-100">
+              ✋ Ask question
+            </button>
+          )}
+          <p className="text-[11px] text-stone-500 text-center pt-1">
+            "Accept" hides your role from the screen so no one can peek over your shoulder.
+          </p>
+        </div>
+      </section>
+    </ScreenShell>
+  );
+}
+
+// Traveller player flow. The ST has given this player a link with ?t=<travellerNum>.
+// The traveller slot is created by the ST in advance, so we just auto-claim it,
+// collect the player's name, and (when the ST passes the role) show role reveal.
+function TravellerApp({ game, setGame, clientId, travellerNum }) {
+  const traveller = (game?.grimoire?.travellers || []).find(t => t.travellerNum === travellerNum);
+
+  // Auto-claim on first arrival (only if not already claimed by this client).
+  useEffect(() => {
+    if (!traveller) return;
+    const alreadyClaimed = (traveller.claims || []).some(c => c.clientId === clientId);
+    if (alreadyClaimed) return;
+    const next = updateTraveller(travellerNum, t => ({
+      ...t,
+      claims: [...(t.claims || []), { clientId, timestamp: Date.now() }],
+    }));
+    if (next) setGame(next);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [traveller?.travellerNum]);
+
+  if (!traveller) {
+    return (
+      <ScreenShell>
+        <section className="parchment rounded-lg p-6 text-center space-y-3">
+          <div className="text-amber-200 text-lg font-semibold">Traveller link not active</div>
+          <p className="text-sm text-stone-300">
+            The storyteller hasn't added Traveller <span className="text-amber-200 font-bold">T#{travellerNum}</span> yet —
+            or this slot has been removed.
+          </p>
+          <p className="text-xs text-stone-500">Ask the storyteller for the correct link, or refresh once they've added you.</p>
+        </section>
+      </ScreenShell>
+    );
+  }
+
+  // Name entry (similar to regular player flow).
+  if (!(traveller.playerName || '').trim()) {
+    return <TravellerNameEntry traveller={traveller}
+      onSubmit={(name) => setGame(updateTraveller(travellerNum, t => ({ ...t, playerName: name })))}
+    />;
+  }
+
+  // ST has dealt the role → show it.
+  if (traveller.roleDealt) {
+    const setStatus = (status) => setGame(updateTraveller(travellerNum, t => ({ ...t, playerStatus: status })));
+    if (traveller.playerStatus === 'accepted') {
+      // Synthesize a seat-shaped object for AcceptedScreen's display.
+      return <AcceptedScreen seat={{ seatNum: `T${travellerNum}`, playerName: traveller.playerName }} />;
+    }
+    return <TravellerRoleReveal
+      traveller={traveller}
+      onAccept={() => setStatus('accepted')}
+      onAsk={() => setStatus('asking')}
+    />;
+  }
+
+  // Waiting for ST to push role.
+  return (
+    <ScreenShell>
+      <section className="parchment rounded-lg p-5 text-center space-y-3">
+        <div className="text-xs uppercase tracking-wider text-purple-300">Traveller T#{travellerNum}</div>
+        <h2 className="text-amber-200 text-lg font-semibold">Welcome, {traveller.playerName}</h2>
+        <p className="text-sm text-stone-300">
+          You're in. Hold tight — the storyteller will hand you your role when they're ready.
+        </p>
+        <div className="text-xs text-stone-500 pt-2 border-t border-stone-800">
+          T#{travellerNum} · joined
+        </div>
+      </section>
+    </ScreenShell>
+  );
+}
+
+function TravellerNameEntry({ traveller, onSubmit }) {
+  const [name, setName] = useState('');
+  const trimmed = name.trim();
+  return (
+    <ScreenShell>
+      <section className="parchment rounded-lg p-5 space-y-4 text-center">
+        <div className="text-xs uppercase tracking-wider text-purple-300">Traveller T#{traveller.travellerNum}</div>
+        <h2 className="text-amber-200 text-lg font-semibold">Enter your name</h2>
+        <p className="text-xs text-stone-400">So the storyteller knows who's joining.</p>
+        <input value={name} onChange={e => setName(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter' && trimmed) onSubmit(trimmed); }}
+          autoFocus maxLength={32} placeholder="Your name"
+          className="w-full bg-stone-900 border border-stone-700 rounded px-3 py-3 text-base" />
+        <button onClick={() => trimmed && onSubmit(trimmed)}
+          disabled={!trimmed}
+          className={`w-full py-3 rounded-lg text-base font-semibold
+            ${trimmed ? 'bg-emerald-600 hover:bg-emerald-500 text-stone-950' : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+          Join
+        </button>
+      </section>
+    </ScreenShell>
+  );
+}
+
+function TravellerRoleReveal({ traveller, onAccept, onAsk }) {
+  const role = CHAR_BY_ID[traveller.charId];
+  const align = traveller.alignment || 'good';
+  const asking = traveller.playerStatus === 'asking';
+  return (
+    <ScreenShell>
+      <section className="parchment rounded-lg p-5 text-center space-y-4">
+        <div>
+          <div className="text-xs text-stone-400 uppercase tracking-wider">{traveller.playerName}</div>
+          <div className="text-purple-300 text-sm">Traveller T#{traveller.travellerNum}</div>
+        </div>
+
+        <div className="text-xs uppercase tracking-wider text-amber-300">Your role</div>
+
+        <div className="mx-auto rounded-full overflow-hidden border-4 border-purple-600 relative shadow-xl"
+          style={{ width: 'min(220px, 60vw)', aspectRatio: '1 / 1',
+                   backgroundImage: 'url(data/tokens/character-token-noise.webp)', backgroundSize: 'cover' }}>
+          {iconUrl(traveller.charId) && (
+            <img src={iconUrl(traveller.charId)} alt={role?.name || ''} className="w-full h-full object-cover" />
+          )}
+          <div className="absolute inset-x-0 bottom-0 bg-stone-950/85 px-2 py-2 text-center" style={{ minHeight: '42%' }}>
+            <div className="text-[10px] sm:text-xs leading-tight mb-1 text-stone-200 px-1">{role?.ability}</div>
+            <div className="text-sm sm:text-base font-bold leading-tight team-traveller">{role?.name || '?'}</div>
+          </div>
+        </div>
+
+        <div className="pt-2">
+          <div className="text-2xl font-bold team-traveller">{role?.name}</div>
+          <p className="text-sm text-stone-300 mt-2 leading-relaxed">{role?.ability}</p>
+        </div>
+
+        <div className={`rounded-lg p-3 border-2
+          ${align === 'evil' ? 'border-red-700 bg-red-950/40 text-red-200' : 'border-sky-700 bg-sky-950/40 text-sky-200'}`}>
+          <div className="text-xs uppercase tracking-wider">Your alignment</div>
+          <div className="text-2xl font-bold mt-1">{align === 'evil' ? 'EVIL' : 'GOOD'}</div>
+        </div>
+
+        <div className="pt-4 border-t border-stone-800 space-y-2">
+          {asking && (
+            <div className="rounded p-2 text-sm bg-yellow-950/40 border border-yellow-700 text-yellow-200">
+              ✋ Storyteller notified. Wave them over to discuss.
+            </div>
+          )}
+          <button onClick={onAccept}
+            className="w-full py-3 rounded-lg text-base font-semibold bg-emerald-600 hover:bg-emerald-500 text-stone-950">
+            {asking ? 'Discussion done — Accept role' : 'Accept role'}
+          </button>
+          {!asking && (
+            <button onClick={onAsk}
+              className="w-full py-3 rounded-lg text-base font-medium bg-yellow-700 hover:bg-yellow-600 text-stone-100">
+              ✋ Ask question
+            </button>
+          )}
+          <p className="text-[11px] text-stone-500 text-center pt-1">
+            "Accept" hides your role from the screen so no one can peek over your shoulder.
+          </p>
+        </div>
+      </section>
+    </ScreenShell>
+  );
+}
+
+// Standard bag composition per player count: [townsfolk, outsider, minion, demon].
+// Mirrors the storyteller's BAG table so we can derive the minion count without
+// piping it through state. Used by Kazali to know how many minions to pick.
+const STD_BAG = {
+  5:  [3, 0, 1, 1], 6:  [3, 1, 1, 1], 7:  [5, 0, 1, 1],
+  8:  [5, 1, 1, 1], 9:  [5, 2, 1, 1], 10: [7, 0, 2, 1],
+  11: [7, 1, 2, 1], 12: [7, 2, 2, 1], 13: [9, 0, 3, 1],
+  14: [9, 1, 3, 1], 15: [9, 2, 3, 1],
+};
+
+// Kazali setup picks. The Kazali player chooses which Townsfolk become Minions
+// (one minion per pick row). After submit, those seats' perceived AND actual roles
+// become the chosen minion role. The storyteller sees the picks list and the
+// seats auto-update so they can re-deal to the converted players.
+function KazaliPicksScreen({ mySeat, game, onSubmit }) {
+  const grim = game?.grimoire || {};
+  const seats = grim.seats || [];
+  const playerCount = game?.playerCount || seats.length || 0;
+  const baseBag = STD_BAG[playerCount] || [0, 0, 0, 0];
+  const minionCount = baseBag[2];
+
+  // Available minion choices = minions on the script (any of them, even if not
+  // already in play — Kazali freely picks). Sorted by name for scannability.
+  const scriptMinions = (game?.characterIds || [])
+    .map(id => CHAR_BY_ID[id])
+    .filter(c => c && c.team === 'minion')
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  // Seats Kazali can pick from = everyone except themselves.
+  const otherSeats = seats.filter(s => s.seatNum !== mySeat.seatNum);
+
+  // One row per minion slot. Each row has a seat + a minion id (both default to '').
+  const [picks, setPicks] = useState(
+    () => Array.from({ length: minionCount }, () => ({ seatNum: '', minionId: '' }))
+  );
+
+  const setRow = (i, patch) => setPicks(p => p.map((r, j) => j === i ? { ...r, ...patch } : r));
+
+  // Pre-compute "already used" sets so each subsequent row can disable conflicts.
+  const usedSeats = new Set(picks.map(p => p.seatNum).filter(Boolean));
+  const usedMinions = new Set(picks.map(p => p.minionId).filter(Boolean));
+
+  const allFilled = picks.every(p => p.seatNum && p.minionId);
+  const hasMinionsAvailable = scriptMinions.length >= minionCount;
+
+  if (minionCount === 0) {
+    // No minions in this player count? Bypass picks entirely — submit empty.
+    return (
+      <ScreenShell>
+        <section className="parchment rounded-lg p-5 text-center space-y-3">
+          <div className="text-amber-200 text-lg font-semibold">No minions to pick</div>
+          <p className="text-sm text-stone-400">
+            This game has 0 minions. Tap below to continue.
+          </p>
+          <button onClick={() => onSubmit([])}
+            className="w-full py-3 rounded-lg text-base font-semibold bg-emerald-600 hover:bg-emerald-500 text-stone-950">
+            Continue
+          </button>
+        </section>
+      </ScreenShell>
+    );
+  }
+
+  return (
+    <ScreenShell>
+      <section className="parchment rounded-lg p-5 space-y-4">
+        <div className="text-center">
+          <div className="text-xs uppercase tracking-wider text-red-300">You are the Kazali</div>
+          <h2 className="text-amber-200 text-xl font-bold mt-1">Choose your Minions</h2>
+          <p className="text-xs text-stone-400 mt-1">
+            Pick {minionCount} player{minionCount === 1 ? '' : 's'} and the minion role each becomes.
+          </p>
+        </div>
+
+        {!hasMinionsAvailable && (
+          <div className="rounded p-2 text-xs bg-red-950/40 border border-red-700 text-red-200">
+            ⚠ Only {scriptMinions.length} minion role{scriptMinions.length === 1 ? '' : 's'} on this script — you need {minionCount}. Storyteller may need to adjust the script.
+          </div>
+        )}
+
+        <div className="space-y-4">
+          {picks.map((row, i) => (
+            <div key={i} className="card rounded p-3 space-y-3">
+              <div className="text-xs uppercase tracking-wider text-amber-300">Minion #{i + 1}</div>
+
+              {/* Player list — tap a name to select. Used-elsewhere seats are dimmed. */}
+              <div>
+                <div className="text-[11px] text-stone-400 mb-1.5">Player</div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {otherSeats.map(s => {
+                    const taken = usedSeats.has(s.seatNum) && s.seatNum !== row.seatNum;
+                    const isSelected = row.seatNum === s.seatNum;
+                    return (
+                      <button key={s.seatNum}
+                        onClick={() => !taken && setRow(i, { seatNum: isSelected ? '' : s.seatNum })}
+                        disabled={taken}
+                        className={`text-left px-2.5 py-2 rounded border text-sm transition seat-btn
+                          ${isSelected
+                            ? 'border-amber-500 bg-amber-950/40 text-amber-200'
+                            : taken
+                              ? 'border-stone-800 bg-stone-900/40 text-stone-600 cursor-not-allowed line-through'
+                              : 'border-stone-700 hover:border-amber-700 text-stone-200'}`}>
+                        <div className="text-[10px] text-amber-200/70 uppercase tracking-wider">Seat #{s.seatNum}</div>
+                        <div className="font-medium truncate">{s.playerName || '(no name)'}</div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Minion icon grid — tap an icon to select. Used-elsewhere minions are dimmed. */}
+              <div>
+                <div className="text-[11px] text-stone-400 mb-1.5">Minion role</div>
+                <div className="grid grid-cols-3 gap-2">
+                  {scriptMinions.map(c => {
+                    const taken = usedMinions.has(c.id) && c.id !== row.minionId;
+                    const isSelected = row.minionId === c.id;
+                    return (
+                      <button key={c.id}
+                        onClick={() => !taken && setRow(i, { minionId: isSelected ? '' : c.id })}
+                        disabled={taken}
+                        title={c.ability}
+                        className={`text-center p-2 rounded border transition flex flex-col items-center gap-1
+                          ${isSelected
+                            ? 'border-amber-500 bg-amber-950/40 ring-2 ring-amber-500/40'
+                            : taken
+                              ? 'border-stone-800 bg-stone-900/40 opacity-40 cursor-not-allowed'
+                              : 'border-stone-700 hover:border-red-500'}`}>
+                        <div className="rounded-full overflow-hidden border-2 border-stone-700 w-12 h-12"
+                          style={{ backgroundImage: 'url(data/tokens/character-token-noise.webp)', backgroundSize: 'cover' }}>
+                          {iconUrl(c.id) && (
+                            <img src={iconUrl(c.id)} alt={c.name} className="w-full h-full object-cover" />
+                          )}
+                        </div>
+                        <div className={`text-[11px] font-medium leading-tight ${isSelected ? 'text-amber-200' : 'team-minion'}`}>
+                          {c.name}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+                {row.minionId && CHAR_BY_ID[row.minionId]?.ability && (
+                  <p className="text-[10px] text-stone-400 mt-2 leading-snug px-1">{CHAR_BY_ID[row.minionId].ability}</p>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <button onClick={() => onSubmit(picks)}
+          disabled={!allFilled || !hasMinionsAvailable}
+          className={`w-full py-3 rounded-lg text-base font-semibold transition
+            ${allFilled && hasMinionsAvailable
+              ? 'bg-emerald-600 hover:bg-emerald-500 text-stone-950 shadow-lg shadow-emerald-900/40'
+              : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+          Confirm picks
+        </button>
+        <p className="text-[11px] text-stone-500 text-center">
+          These will be sent to the storyteller and the chosen players' roles will update automatically.
+        </p>
+      </section>
+    </ScreenShell>
+  );
+}
+
+function AcceptedScreen({ seat }) {
+  return (
+    <ScreenShell>
+      <section className="parchment rounded-lg p-6 text-center space-y-4">
+        <div className="text-5xl">✓</div>
+        <div className="text-emerald-300 text-2xl font-bold">Role confirmed</div>
+        <p className="text-sm text-stone-300">
+          You're all set, <span className="text-amber-200 font-semibold">{seat.playerName}</span>.
+        </p>
+        <p className="text-xs text-stone-500">
+          Your role is hidden so no one can see it over your shoulder.
+          The storyteller will guide the rest of the game.
+        </p>
+        <div className="text-xs text-amber-200/80 pt-4 border-t border-stone-800">
+          Seat #{seat.seatNum}
+        </div>
+      </section>
+    </ScreenShell>
+  );
+}
+
+// Reminder rendered with all info visible (no hover required): round token icon
+// plus the source character's name and the reminder label, both as readable text.
+function MiniReminderToken({ reminder }) {
+  const c = CHAR_BY_ID[reminder.charId];
+  const img = iconUrl(reminder.charId);
+  return (
+    <div className="card rounded p-1.5 flex items-center gap-2"
+      style={{ minWidth: 0 }}>
+      <div className="relative inline-block flex-shrink-0"
+        style={{ width: 32, height: 32, aspectRatio: '1 / 1' }}>
+        <div className="rounded-full overflow-hidden border border-amber-700/70 bg-stone-900 w-full h-full"
+          style={{
+            backgroundImage: 'url(data/tokens/character-token-noise.webp)',
+            backgroundSize: 'cover',
+          }}>
+          {img && <img src={img} alt="" className="w-full h-full object-cover opacity-90" draggable={false} />}
+        </div>
+      </div>
+      <div className="min-w-0 leading-tight">
+        <div className={`text-[10px] font-medium truncate team-${c?.team || 'townsfolk'}`}>
+          {c?.name || reminder.charId}
+        </div>
+        <div className="text-[10px] text-amber-100 truncate">{reminder.label}</div>
+      </div>
+    </div>
+  );
+}
+
+// Fullscreen overlay showing the full grimoire to a player whose seat is the Spy
+// (or similar). Lists every seat with its real role, reminders, dead status, plus
+// the demon bluffs. Player taps "Got it" to dismiss.
+function GrimoireSnapshotOverlay({ grimoire, onAccept }) {
+  const seats = grimoire.seats || [];
+  const bluffs = (grimoire.demonBluffs || []).filter(Boolean);
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-950 overflow-y-auto">
+      <div className="max-w-md mx-auto p-4 space-y-4">
+        <header className="text-center py-2">
+          <div className="text-amber-300 uppercase text-xs tracking-widest">Grimoire snapshot</div>
+          <div className="text-stone-400 text-xs mt-1">The storyteller is sharing the full grimoire with you. Memorize what you need, then tap Got it.</div>
+        </header>
+
+        {/* Seats */}
+        <section className="space-y-1.5">
+          {seats.map(seat => {
+            const actual = CHAR_BY_ID[seat.actualRoleId];
+            const perceived = CHAR_BY_ID[seat.perceivedRoleId];
+            const misregistered = seat.actualRoleId !== seat.perceivedRoleId;
+            return (
+              <div key={seat.seatNum}
+                className={`card rounded p-2 flex items-start gap-2 ${seat.isDead ? 'opacity-50' : ''}`}>
+                <div className="flex-shrink-0 flex items-baseline gap-1.5">
+                  <span className="text-amber-200/80 text-sm font-bold">#{seat.seatNum}</span>
+                  {(seat.playerName || '').trim() && (
+                    <span className="text-xs text-stone-300 truncate max-w-[80px]">{seat.playerName}</span>
+                  )}
+                </div>
+                {iconUrl(seat.actualRoleId) && (
+                  <img src={iconUrl(seat.actualRoleId)} alt=""
+                    className={`w-10 h-10 rounded-full border border-stone-700 object-cover flex-shrink-0 ${seat.isDead ? 'grayscale' : ''}`} />
+                )}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className={`font-medium text-sm team-${actual?.team || 'townsfolk'}`}>{actual?.name || '?'}</span>
+                    {seat.isDead && <span className="text-[10px] uppercase text-red-400">dead</span>}
+                  </div>
+                  {misregistered && perceived && (
+                    <div className="text-[10px] italic text-stone-400">thinks they are {perceived.name}</div>
+                  )}
+                  {seat.reminders && seat.reminders.length > 0 && (
+                    <div className="flex flex-wrap gap-1 mt-1">
+                      {seat.reminders.map((r, i) => (
+                        <MiniReminderToken key={i} reminder={r} />
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </section>
+
+        {/* Demon bluffs */}
+        {bluffs.length > 0 && (
+          <section className="card rounded p-3">
+            <div className="text-[10px] uppercase tracking-wider text-amber-300 mb-2">Demon bluffs</div>
+            <div className="grid grid-cols-3 gap-2">
+              {bluffs.map((bId, i) => {
+                const bc = CHAR_BY_ID[bId];
+                return (
+                  <div key={i} className="text-center">
+                    {iconUrl(bId) && (
+                      <img src={iconUrl(bId)} alt=""
+                        className="w-12 h-12 rounded-full border border-amber-700/60 object-cover mx-auto" />
+                    )}
+                    <div className={`text-[11px] font-medium mt-1 team-${bc?.team || 'townsfolk'}`}>{bc?.name || '?'}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        )}
+
+        {/* Accept */}
+        <div className="sticky bottom-0 pt-2 pb-4 bg-gradient-to-t from-stone-950 via-stone-950 to-transparent">
+          <button onClick={onAccept}
+            className="w-full py-3 rounded-lg text-base font-semibold bg-emerald-600 hover:bg-emerald-500 text-stone-950">
+            ✓ Got it
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------- Mount ----------------
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
