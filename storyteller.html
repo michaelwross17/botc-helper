@@ -879,7 +879,14 @@ function App() {
     setShowRoleForSeat(null);
   }, [state.grimoire.generated, state.page]);
 
-  const update = (patch) => setState(s => ({ ...s, ...patch }));
+  // `update` accepts either a patch object OR a function (s => patch). The
+  // function form is required when chaining multiple updates in the same
+  // synchronous flow because React batches setState calls and a patch built
+  // from closure-captured state will overwrite earlier updates' changes.
+  const update = (patchOrFn) => setState(s => ({
+    ...s,
+    ...(typeof patchOrFn === 'function' ? patchOrFn(s) : patchOrFn),
+  }));
 
   // Toggle an optional ST feature (e.g. automation). Stored under state.features
   // so it round-trips through Firebase and survives reloads.
@@ -1225,18 +1232,23 @@ function App() {
       assignPendingRole(seatNum, charId);
       return;
     }
-    const seats = state.grimoire.seats.map(s =>
-      s.seatNum === seatNum
-        ? { ...s, reminders: [...(s.reminders || []), { charId, label }] }
-        : s
-    );
-    update({ grimoire: { ...state.grimoire, seats } });
-    // If this is a death reminder on a still-living seat, prompt the ST to
-    // confirm marking them dead (with any detected protections shown).
-    if (label === 'Dead') {
-      const seat = seats.find(s => s.seatNum === seatNum);
-      if (seat && !seat.isDead) queueDeathConfirm(seatNum, charId);
-    }
+    let queueDeath = false;
+    update(s => {
+      const seats = (s.grimoire.seats || []).map(seat =>
+        seat.seatNum === seatNum
+          ? { ...seat, reminders: [...(seat.reminders || []), { charId, label }] }
+          : seat
+      );
+      if (label === 'Dead') {
+        const target = seats.find(seat => seat.seatNum === seatNum);
+        if (target && !target.isDead) queueDeath = true;
+      }
+      return { grimoire: { ...s.grimoire, seats } };
+    });
+    // Side effect outside the functional updater so it runs once even if React
+    // re-invokes the updater (e.g. StrictMode). queueDeathConfirm only updates
+    // a different state variable, so it's safe to call here.
+    if (queueDeath) queueDeathConfirm(seatNum, charId);
   };
 
   // ---------------- Night-automation handlers ----------------
@@ -1833,10 +1845,25 @@ function App() {
     return normalizeDayNoms((g.nominationsByDay || {})[dayIdx]);
   };
   const writeDay = (dayIdx, next) => {
-    const g = state.grimoire;
-    const by = { ...(g.nominationsByDay || {}) };
-    by[dayIdx] = next;
-    update({ grimoire: { ...g, nominationsByDay: by } });
+    update(s => {
+      const g = s.grimoire;
+      const by = { ...(g.nominationsByDay || {}) };
+      by[dayIdx] = next;
+      return { grimoire: { ...g, nominationsByDay: by } };
+    });
+  };
+  // Append an arbitrary entry to a given day's nominations list (used for
+  // claim/special audit entries). Uses functional update for the same reason.
+  const appendDayEntry = (dayIdx, entry) => {
+    if (dayIdx == null) return;
+    update(s => {
+      const g = s.grimoire;
+      const by = { ...(g.nominationsByDay || {}) };
+      const cur = normalizeDayNoms(by[dayIdx]);
+      const id = 'e_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+      by[dayIdx] = { ...cur, nominations: [...cur.nominations, { id, ...entry }] };
+      return { grimoire: { ...g, nominationsByDay: by } };
+    });
   };
 
   const addNomination = (dayIdx, nominatorSeat, nomineeSeat) => {
@@ -1851,7 +1878,7 @@ function App() {
     });
     // Auto-trigger Virgin if automation is on and the nominee is the Virgin.
     if (state.features?.automation) {
-      tryFireVirgin(nominatorSeat, nomineeSeat);
+      tryFireVirgin(nominatorSeat, nomineeSeat, dayIdx);
     }
   };
   const updateNomination = (dayIdx, id, patch) => {
@@ -2011,18 +2038,20 @@ function App() {
 
   // Place an arbitrary reminder on a seat (used by ability resolvers).
   const _placeReminderInline = (seatNum, charId, label, extra = {}) => {
-    const seats = state.grimoire.seats.map(s =>
-      s.seatNum === seatNum
-        ? { ...s, reminders: [...(s.reminders || []), { charId, label, ...extra }] }
-        : s
-    );
-    update({ grimoire: { ...state.grimoire, seats } });
+    update(s => {
+      const seats = (s.grimoire.seats || []).map(seat =>
+        seat.seatNum === seatNum
+          ? { ...seat, reminders: [...(seat.reminders || []), { charId, label, ...extra }] }
+          : seat
+      );
+      return { grimoire: { ...s.grimoire, seats } };
+    });
   };
 
   // Slayer / Psychopath: claim + target. If real + sober → target dies +
   // "No ability" placed on claimant. If real + drunk/poisoned → ask ST. If
   // fake → dismissable banner only.
-  const resolveClaimAndKill = ({ roleId, label, claimantSeatNum, targetSeatNum }) => {
+  const resolveClaimAndKill = ({ roleId, label, claimantSeatNum, targetSeatNum, dayIdx }) => {
     const claimant = _seatBy(claimantSeatNum);
     const target = _seatBy(targetSeatNum);
     if (!claimant || !target) return;
@@ -2032,7 +2061,20 @@ function App() {
     const claimantLabel = _seatLabel(claimant);
     const targetLabel = _seatLabel(target);
     const roleName = (CHAR_BY_ID[roleId] || {}).name || label;
+    const targetChar = CHAR_BY_ID[target.actualRoleId];
+    const targetIsDemon = targetChar?.team === 'demon';
+    const targetIsRecluse = target.actualRoleId === 'recluse';
+    // Slayer requires a Demon target (or Recluse via ST decision). Psychopath
+    // kills any target. Configure per role:
+    const requiresDemonTarget = roleId === 'slayer';
+    const oncePerGame        = roleId === 'slayer';
+    // Audit: log every claim to the nominations table (even fake / no-effect).
+    const logAudit = (outcome) => appendDayEntry(dayIdx, {
+      kind: 'claim', roleId, claimantSeat: claimantSeatNum, targetSeat: targetSeatNum, outcome,
+    });
+    // Already-used real claimant → warn, log, no other effect.
     if (alreadyUsed && isReal) {
+      logAudit('already-used');
       addCornerPrompt({
         kind: 'warn',
         title: `${roleName} already used`,
@@ -2041,67 +2083,80 @@ function App() {
       });
       return;
     }
-    if (false && alreadyUsed && isReal) {
-      pushDayBanner({
-        kind: 'info',
-        text: `${claimantLabel} claimed ${roleName} on ${targetLabel} — they're the ${roleName} but the ability has already been used (No ability marker present). Nothing happens.`,
-      });
-      return;
-    }
+    // Fake claim — silently log, no popup.
     if (!isReal) {
-      // Fake claim — banner only.
-      pushDayBanner({
-        kind: 'fake',
-        text: `${claimantLabel} claimed ${roleName} on ${targetLabel} — not the ${roleName}. Nothing happens.`,
-      });
+      logAudit('fake');
       return;
     }
-    // Real claimant. Fire either immediately (sober) or after ST confirmation (drunk/poisoned).
-    const fire = () => {
-      // Place Dead on target → queues death-confirm via existing addReminder hook.
-      addReminder(targetSeatNum, roleId, 'Dead');
-      // Place "No ability" on claimant so the ability dims/locks in future.
+    // REAL claimant. Mark "No ability" for once-per-game roles regardless of
+    // whether the kill succeeds (the ability is consumed by the claim itself).
+    if (oncePerGame) {
       _placeReminderInline(claimantSeatNum, roleId, 'No ability');
+    }
+    // Drunk/poisoned real claimant → ability malfunctions, no kill, no popup.
+    if (afflicted) {
+      logAudit('drunk-no-kill');
+      return;
+    }
+    // Sober real claimant → resolve based on target / role rules.
+    if (requiresDemonTarget) {
+      if (targetIsDemon) {
+        // Real Slayer hits the Demon → kill, popup confirming.
+        addReminder(targetSeatNum, roleId, 'Dead');
+        logAudit('killed-demon');
+        addCornerPrompt({
+          kind: 'success',
+          title: `${roleName} fired`,
+          body: `${claimantLabel} killed ${targetLabel} (${targetChar?.name || target.actualRoleId}).`,
+          actions: [{ label: 'Got it', primary: true }],
+        });
+      } else if (targetIsRecluse) {
+        // Recluse may register as Demon → ask ST.
+        addCornerPrompt({
+          kind: 'warn',
+          title: `${roleName} on Recluse`,
+          body: `${claimantLabel} (real ${roleName}) targeted ${targetLabel} who is the Recluse. Recluse may register as the Demon — fire and kill?`,
+          actions: [
+            { label: 'Yes, kill', primary: true, onClick: () => {
+              addReminder(targetSeatNum, roleId, 'Dead');
+              logAudit('killed-recluse');
+            }},
+            { label: 'No', onClick: () => logAudit('recluse-spared') },
+          ],
+        });
+      } else {
+        // Real Slayer + non-Demon non-Recluse target → no kill, no popup. Audit only.
+        logAudit('no-effect');
+      }
+    } else {
+      // Psychopath-style: kills any target.
+      addReminder(targetSeatNum, roleId, 'Dead');
+      logAudit('killed');
       addCornerPrompt({
         kind: 'success',
         title: `${roleName} fired`,
-        body: `${claimantLabel} is the ${roleName} — ${targetLabel} marked dead.`,
+        body: `${claimantLabel} killed ${targetLabel}.`,
         actions: [{ label: 'Got it', primary: true }],
       });
-    };
-    if (afflicted) {
-      const cpId = addCornerPrompt({
-        kind: 'warn',
-        title: `${roleName} (drunk/poisoned)`,
-        body: `${claimantLabel} IS the ${roleName} but is drunk or poisoned. Fire the ability on ${targetLabel} anyway?`,
-        actions: [
-          { label: 'Fire anyway', primary: true, onClick: () => fire() },
-          { label: 'No effect', onClick: () => pushDayBanner({
-              kind: 'info',
-              text: `${claimantLabel}'s ${roleName} ability did not fire (drunk/poisoned).`,
-          }) },
-        ],
-      });
-    } else {
-      fire();
     }
   };
 
   // Mutant: claim only (publicly claims to be an Outsider while being the
   // Mutant). If real → prompt ST that they may be executed. If fake → banner.
-  const resolveMutantClaim = ({ claimantSeatNum }) => {
+  const resolveMutantClaim = ({ claimantSeatNum, dayIdx }) => {
     const claimant = _seatBy(claimantSeatNum);
     if (!claimant) return;
     const claimantLabel = _seatLabel(claimant);
     const isReal = claimant.actualRoleId === 'mutant';
     const afflicted = isDrunkOrPoisoned(claimant);
+    const logAudit = (outcome) => appendDayEntry(dayIdx, {
+      kind: 'claim', roleId: 'mutant', claimantSeat: claimantSeatNum, targetSeat: null, outcome,
+    });
     if (!isReal) {
-      pushDayBanner({
-        kind: 'fake',
-        text: `${claimantLabel} publicly claimed Outsider — not the Mutant. No execution required.`,
-      });
+      logAudit('fake');
       return;
     }
+    logAudit(afflicted ? 'mutant-drunk' : 'mutant-real');
     addCornerPrompt({
       kind: 'warn',
       title: `Mutant publicly claimed Outsider`,
@@ -2113,7 +2168,7 @@ function App() {
   // Virgin: auto-triggered when a Townsfolk nominates a Virgin who hasn't used
   // the ability yet. Pops a corner prompt so the ST confirms execution (handles
   // edge cases like Recluse registration).
-  const tryFireVirgin = (nominatorSeatNum, nomineeSeatNum) => {
+  const tryFireVirgin = (nominatorSeatNum, nomineeSeatNum, dayIdx) => {
     const nominator = _seatBy(nominatorSeatNum);
     const nominee = _seatBy(nomineeSeatNum);
     if (!nominator || !nominee) return;
@@ -2139,6 +2194,13 @@ function App() {
     const fire = () => {
       // Execute the nominator → place Dead → triggers death-confirm.
       addReminder(nominatorSeatNum, 'virgin', 'Dead');
+      // Audit: log a special entry only on actual execution.
+      appendDayEntry(dayIdx, {
+        kind: 'special',
+        text: `Virgin ability fired — ${_seatLabel(nominator)} executed for nominating the Virgin (${_seatLabel(nominee)}).`,
+        subjectSeat: nominatorSeatNum,
+        sourceRoleId: 'virgin',
+      });
       addCornerPrompt({
         kind: 'success',
         title: 'Virgin ability fired',
@@ -5719,8 +5781,9 @@ function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onS
   const resetAbility = () => { setActiveAbility(null); setPendingClaimant(null); };
   const handleAbilityTap = (seatNum) => {
     if (!activeAbility) return;
+    const dayIdx = grim.nominationsViewingDayIndex || 0;
     if (activeAbility.kind === 'claim-only') {
-      onResolveMutantClaim && onResolveMutantClaim({ claimantSeatNum: seatNum });
+      onResolveMutantClaim && onResolveMutantClaim({ claimantSeatNum: seatNum, dayIdx });
       resetAbility();
     } else if (activeAbility.kind === 'claim-target') {
       if (pendingClaimant == null) setPendingClaimant(seatNum);
@@ -5728,6 +5791,7 @@ function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onS
         onResolveClaimAndKill && onResolveClaimAndKill({
           roleId: activeAbility.id, label: activeAbility.label,
           claimantSeatNum: pendingClaimant, targetSeatNum: seatNum,
+          dayIdx,
         });
         resetAbility();
       }
@@ -5965,6 +6029,7 @@ function NominationsList({ nominations, seats, readOnly, onUpdate, onRemove }) {
           <NominationRow key={n.id}
             index={i + 1}
             nom={n}
+            seatById={seatById}
             nominator={seatById[n.nominatorSeat]}
             nominee={seatById[n.nomineeSeat]}
             readOnly={readOnly}
@@ -5977,7 +6042,81 @@ function NominationsList({ nominations, seats, readOnly, onUpdate, onRemove }) {
   );
 }
 
-function NominationRow({ index, nom, nominator, nominee, readOnly, onUpdate, onRemove }) {
+function NominationRow({ index, nom, seatById = {}, nominator, nominee, readOnly, onUpdate, onRemove }) {
+  // Claim entry (Slayer/Psychopath/Mutant): render compact with role icon +
+  // outcome badge; no votes tracked.
+  if (nom.kind === 'claim') {
+    const rc = CHAR_BY_ID[nom.roleId];
+    const cs = seatById[nom.claimantSeat];
+    const ts = nom.targetSeat != null ? seatById[nom.targetSeat] : null;
+    const outcomeText = ({
+      'killed-demon':   'killed (Demon hit)',
+      'killed':         'killed',
+      'killed-recluse': 'killed (Recluse, ST choice)',
+      'recluse-spared': 'spared (Recluse, ST choice)',
+      'drunk-no-kill':  'no effect (drunk/poisoned — ability consumed)',
+      'no-effect':      'no effect (target not the Demon — ability consumed)',
+      'fake':           'fake claim — no effect',
+      'already-used':   'already used — no effect',
+      'mutant-real':    'is the Mutant (ST may execute)',
+      'mutant-drunk':   'is the Mutant but drunk/poisoned (ST may waive)',
+    })[nom.outcome] || nom.outcome || '';
+    const outcomeColor = /killed/.test(nom.outcome || '') ? 'text-red-300'
+      : /fake|no-effect|already|drunk|spared/.test(nom.outcome || '') ? 'text-stone-400'
+      : 'text-amber-300';
+    return (
+      <li className="card rounded p-2.5 border-amber-700/40">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-stone-500 text-xs tabular-nums w-6">#{index}</span>
+          {iconUrl(nom.roleId) && (
+            <img src={iconUrl(nom.roleId)} alt=""
+              className="w-7 h-7 rounded-full border border-amber-700/60 object-cover flex-shrink-0" />
+          )}
+          <div className="flex-1 min-w-0 leading-tight">
+            <div className="text-sm">
+              <span className="text-amber-200 font-medium">{seatLabel(cs)}</span>
+              <span className="text-stone-500"> claimed </span>
+              <span className={`team-${rc?.team || 'townsfolk'} font-medium`}>{rc?.name || nom.roleId}</span>
+              {ts && (<>
+                <span className="text-stone-500"> on </span>
+                <span className="text-amber-200 font-medium">{seatLabel(ts)}</span>
+              </>)}
+            </div>
+            <div className={`text-[11px] ${outcomeColor} mt-0.5`}>{outcomeText}</div>
+          </div>
+          {!readOnly && (
+            <button onClick={onRemove}
+              title="Remove from log"
+              className="text-xs text-stone-400 hover:text-red-400">×</button>
+          )}
+        </div>
+      </li>
+    );
+  }
+  // Special entry (e.g. Virgin-triggered execution): plain text card.
+  if (nom.kind === 'special') {
+    const subj = nom.subjectSeat != null ? seatById[nom.subjectSeat] : null;
+    return (
+      <li className="card rounded p-2.5 border-red-700/50 bg-red-950/15">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-stone-500 text-xs tabular-nums w-6">#{index}</span>
+          {iconUrl(nom.sourceRoleId) && (
+            <img src={iconUrl(nom.sourceRoleId)} alt=""
+              className="w-7 h-7 rounded-full border border-red-700/60 object-cover flex-shrink-0" />
+          )}
+          <div className="flex-1 min-w-0 text-sm text-stone-200 leading-snug">
+            {nom.text || 'Special event'}
+          </div>
+          {!readOnly && (
+            <button onClick={onRemove}
+              title="Remove from log"
+              className="text-xs text-stone-400 hover:text-red-400">×</button>
+          )}
+        </div>
+      </li>
+    );
+  }
+  // Normal nomination
   const isSelfNom = nom.nominatorSeat === nom.nomineeSeat;
   return (
     <li className="card rounded p-3 space-y-2">
