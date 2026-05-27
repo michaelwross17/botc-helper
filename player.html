@@ -1284,9 +1284,11 @@ function NightInfoScreen({ mySeat, seats, prompt, onAck, onQuestion }) {
   } else if (info.type === 'seat+role') {
     const askSeat = seatBy[info.askSeat];
     const role = info.roleId ? CHAR_BY_ID[info.roleId] : null;
+    const topLabel = info.displayLabel || 'Your Grandchild is:';
+    const midLabel = info.displayRoleLabel || 'Their character is:';
     body = (
       <div className="space-y-4">
-        <div className="text-center text-sm text-stone-300">Your Grandchild is:</div>
+        <div className="text-center text-sm text-stone-300">{topLabel}</div>
         {askSeat ? (
           <div className="card rounded p-3 text-center">
             <div className="text-amber-200/80 text-xs">seat #{askSeat.seatNum}</div>
@@ -1295,7 +1297,7 @@ function NightInfoScreen({ mySeat, seats, prompt, onAck, onQuestion }) {
             </div>
           </div>
         ) : <div className="text-stone-500 italic text-center">(unknown seat)</div>}
-        <div className="text-center text-sm text-stone-300">Their character is:</div>
+        <div className="text-center text-sm text-stone-300">{midLabel}</div>
         {role ? (
           <div className="flex flex-col items-center gap-2">
             {iconUrl(role.id) && (
@@ -1442,11 +1444,6 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
     if (prompt.eligible === 'self' && !isSelf) return false;
     // target1any allows dead seats; everything else requires alive.
     if (prompt.action !== 'target1any' && s.isDead) return false;
-    // Devil's Advocate cannot pick the same player two nights in a row.
-    if (prompt.roleId === 'devilsadvocate' &&
-        (s.reminders || []).some(r => r && r.charId === 'devilsadvocate' && r.daChose)) {
-      return false;
-    }
     // Exorcist cannot pick the same player two nights in a row.
     if (prompt.roleId === 'exorcist' &&
         (s.reminders || []).some(r => r && r.charId === 'exorcist' && r.exChose)) {
@@ -1572,14 +1569,20 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
         )}
       </section>
 
-      <div className="grid grid-cols-2 gap-2 pt-1">
+      <div className={`grid ${isPoFlex ? 'grid-cols-3' : 'grid-cols-2'} gap-2 pt-1`}>
+        {isPoFlex && (
+          <button onClick={() => onSubmit([])}
+            className="py-3 rounded-lg text-sm font-semibold bg-stone-700 hover:bg-stone-600 text-stone-100 border border-stone-600">
+            ✕ Kill no one
+          </button>
+        )}
         <button onClick={() => onSubmit(picked, isGuess ? { guess: pickedGuess } : undefined)}
           disabled={!canSubmit}
           className={`py-3 rounded-lg text-base font-semibold transition
             ${canSubmit
               ? 'bg-emerald-600 hover:bg-emerald-500 text-stone-950 shadow-lg shadow-emerald-900/40'
               : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
-          Submit
+          {isPoFlex && picked.length === 0 ? 'Submit (kill 1)' : 'Submit'}
         </button>
         <button onClick={onQuestion}
           className="py-3 rounded-lg text-base font-semibold bg-stone-800 hover:bg-stone-700 text-amber-200 border border-amber-700/40">
@@ -1730,4 +1733,8 @@ function GrimoireSnapshotOverlay({ grimoire, onAccept }) {
 }
 
 // ---------------- Mount ----------------
-const root = Rea
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>

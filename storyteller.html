@@ -1735,84 +1735,6 @@ function App() {
             });
             next.__seatsCopy = seatsCopy;
           }
-          // Devil's Advocate: also place a permanent 'Chose' marker on the
-          // picked target so next night's picker can exclude them. Clear any
-          // prior DA 'Chose' from other seats first so only the latest pick
-          // is marked.
-          if (p.roleId === 'devilsadvocate' && targets.length > 0) {
-            const newTarget = targets[0];
-            const baseSeats = next.__seatsCopy || state.grimoire.seats;
-            const seatsCopy = baseSeats.map(s => {
-              const stripped = (s.reminders || []).filter(r =>
-                !(r && r.charId === 'devilsadvocate' && r.daChose));
-              if (s.seatNum === newTarget) {
-                const hasChose = stripped.some(r =>
-                  r && r.charId === 'devilsadvocate' && r.daChose);
-                if (!hasChose) {
-                  return { ...s, reminders: [...stripped, { charId: 'devilsadvocate', label: 'Chose', fromPrompt: true, daChose: true }] };
-                }
-              }
-              return { ...s, reminders: stripped };
-            });
-            next.__seatsCopy = seatsCopy;
-          }
-          // Po: 0-pick → place 'Hungry — 3 to kill' on Po; 1-pick → standard
-          // Dead on target; 3-pick → strip Hungry from Po and place Dead on
-          // each target. The default per-target placement above already drops
-          // 'Dead' on each target, so here we handle only the Hungry marker.
-          if (p.roleId === 'po') {
-            const baseSeats = next.__seatsCopy || state.grimoire.seats;
-            if (targets.length === 0) {
-              // Place Hungry on Po's own seat (idempotent).
-              const seatsCopy = baseSeats.map(s => {
-                if (s.seatNum !== seatNum) return s;
-                const hasHungry = (s.reminders || []).some(r =>
-                  r && r.charId === 'po' && /hungry|3 to kill/i.test(String(r.label || '')));
-                if (hasHungry) return s;
-                return { ...s, reminders: [...(s.reminders || []), { charId: 'po', label: 'Hungry', fromPrompt: true }] };
-              });
-              next.__seatsCopy = seatsCopy;
-            } else if (targets.length >= 3) {
-              // Strip Hungry from Po — she just used the boosted attack.
-              const seatsCopy = baseSeats.map(s => {
-                if (s.seatNum !== seatNum) return s;
-                const reminders = (s.reminders || []).filter(r =>
-                  !(r && r.charId === 'po' && /hungry|3 to kill/i.test(String(r.label || ''))));
-                if (reminders.length === (s.reminders || []).length) return s;
-                return { ...s, reminders };
-              });
-              next.__seatsCopy = seatsCopy;
-            }
-          }
-          // Moonchild submitted her pick — kill the target if good and place
-          // a 'Chose' marker on the Moonchild's own seat. Clear 'Triggered'.
-          if (p.roleId === 'moonchild' && targets.length === 1) {
-            const baseSeats = next.__seatsCopy || state.grimoire.seats;
-            const tgtSeat = baseSeats.find(s => s.seatNum === targets[0]);
-            const tgtTeam = (CHAR_BY_ID[tgtSeat?.actualRoleId] || {}).team;
-            const tgtIsGood = tgtTeam === 'townsfolk' || tgtTeam === 'outsider';
-            const mcSeat = baseSeats.find(s => s.seatNum === seatNum);
-            const mcAfflicted = mcSeat ? isDrunkOrPoisoned(mcSeat) : false;
-            // Clean Triggered + add Chose on Moonchild. Kill target if good
-            // AND Moonchild isn't drunk/poisoned.
-            const seatsCopy = baseSeats.map(s => {
-              if (s.seatNum === seatNum) {
-                const stripped = (s.reminders || []).filter(r =>
-                  !(r && r.charId === 'moonchild' && /trigger/i.test(String(r.label || ''))));
-                const hasChose = stripped.some(r =>
-                  r && r.charId === 'moonchild' && /^chose$/i.test(String(r.label || '')));
-                return { ...s, reminders: hasChose ? stripped : [...stripped, { charId: 'moonchild', label: 'Chose', fromPrompt: true }] };
-              }
-              if (s.seatNum === targets[0] && tgtIsGood && !mcAfflicted) {
-                const hasDead = (s.reminders || []).some(r =>
-                  r && r.charId === 'moonchild' && /^dead$/i.test(String(r.label || '')));
-                if (hasDead || s.isDead) return s;
-                return { ...s, isDead: true, reminders: [...(s.reminders || []), { charId: 'moonchild', label: 'Dead', fromPrompt: true }] };
-              }
-              return s;
-            });
-            next.__seatsCopy = seatsCopy;
-          }
           // oncePerGame target roles (Courtier, Assassin, etc.) place a
           // permanent 'No ability' on the actor's own seat so the night row
           // dims on subsequent nights.
@@ -2006,6 +1928,56 @@ function App() {
             );
             next.__seatsCopy = seatsCopy;
           }
+        }
+        // Po: runs unconditionally on 'submitted' so 0-pick reliably places
+        // 'Hungry' on Po regardless of which info/non-info branch we took.
+        if (p.roleId === 'po') {
+          const baseSeats = next.__seatsCopy || state.grimoire.seats;
+          if (targets.length === 0) {
+            const seatsCopy = baseSeats.map(s => {
+              if (s.seatNum !== seatNum) return s;
+              const hasHungry = (s.reminders || []).some(r =>
+                r && r.charId === 'po' && /hungry|3 to kill/i.test(String(r.label || '')));
+              if (hasHungry) return s;
+              return { ...s, reminders: [...(s.reminders || []), { charId: 'po', label: 'Hungry', fromPrompt: true }] };
+            });
+            next.__seatsCopy = seatsCopy;
+          } else if (targets.length >= 3) {
+            const seatsCopy = baseSeats.map(s => {
+              if (s.seatNum !== seatNum) return s;
+              const reminders = (s.reminders || []).filter(r =>
+                !(r && r.charId === 'po' && /hungry|3 to kill/i.test(String(r.label || ''))));
+              if (reminders.length === (s.reminders || []).length) return s;
+              return { ...s, reminders };
+            });
+            next.__seatsCopy = seatsCopy;
+          }
+        }
+        // Moonchild: same — runs unconditionally on 'submitted'.
+        if (p.roleId === 'moonchild' && targets.length === 1) {
+          const baseSeats = next.__seatsCopy || state.grimoire.seats;
+          const tgtSeat = baseSeats.find(s => s.seatNum === targets[0]);
+          const tgtTeam = (CHAR_BY_ID[tgtSeat?.actualRoleId] || {}).team;
+          const tgtIsGood = tgtTeam === 'townsfolk' || tgtTeam === 'outsider';
+          const mcSeat = baseSeats.find(s => s.seatNum === seatNum);
+          const mcAfflicted = mcSeat ? isDrunkOrPoisoned(mcSeat) : false;
+          const seatsCopy = baseSeats.map(s => {
+            if (s.seatNum === seatNum) {
+              const stripped = (s.reminders || []).filter(r =>
+                !(r && r.charId === 'moonchild' && /trigger/i.test(String(r.label || ''))));
+              const hasChose = stripped.some(r =>
+                r && r.charId === 'moonchild' && /^chose$/i.test(String(r.label || '')));
+              return { ...s, reminders: hasChose ? stripped : [...stripped, { charId: 'moonchild', label: 'Chose', fromPrompt: true }] };
+            }
+            if (s.seatNum === targets[0] && tgtIsGood && !mcAfflicted) {
+              const hasDead = (s.reminders || []).some(r =>
+                r && r.charId === 'moonchild' && /^dead$/i.test(String(r.label || '')));
+              if (hasDead || s.isDead) return s;
+              return { ...s, isDead: true, reminders: [...(s.reminders || []), { charId: 'moonchild', label: 'Dead', fromPrompt: true }] };
+            }
+            return s;
+          });
+          next.__seatsCopy = seatsCopy;
         }
         next[seatStr] = { ...p, status: 'done', doneAt: Date.now() };
         dirty = true;
@@ -8308,9 +8280,6 @@ function isReminderPermanent(reminder) {
   // Godfather "Died Today" persists into the night so the Godfather can
   // wake and use the trigger. After they act, it's cleared programmatically.
   if (reminder.charId === 'godfather' && /died today/i.test(reminder.label || '')) return true;
-  // Devil's Advocate "Chose" marker tracks previous-night pick so the next
-  // night's picker can exclude them. Cleared+replaced when DA picks again.
-  if (reminder.charId === 'devilsadvocate' && reminder.daChose) return true;
   // Exorcist 'Chose' (with exChose flag) tracks previous-night pick so the
   // picker excludes the same player two nights in a row. Cleared+replaced.
   if (reminder.charId === 'exorcist' && reminder.exChose) return true;
@@ -9998,7 +9967,13 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
       return { type: 'seat+role-pair', askSeat: pickedSeats[0], roles };
     }
     if (infoType === 'seat+role') {
-      return { type: 'seat+role', askSeat: pickedSeats[0], roleId: pickedRole };
+      return {
+        type: 'seat+role',
+        askSeat: pickedSeats[0],
+        roleId: pickedRole,
+        displayLabel: cfg.displayLabel || null,
+        displayRoleLabel: cfg.displayRoleLabel || null,
+      };
     }
     if (infoType === 'role-list') {
       return { type: 'role-list', roleIds: (pickedRole || '').split(',').filter(Boolean) };
@@ -10782,11 +10757,6 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
     if (eligible === 'others' && isSelf) return false;
     if (eligible === 'self' && !isSelf) return false;
     if (step.action !== 'target1any' && s.isDead) return false;
-    // Devil's Advocate cannot pick the same player two nights in a row.
-    if (step.char.id === 'devilsadvocate' &&
-        (s.reminders || []).some(r => r && r.charId === 'devilsadvocate' && r.daChose)) {
-      return false;
-    }
     // Exorcist cannot pick the same player two nights in a row.
     if (step.char.id === 'exorcist' &&
         (s.reminders || []).some(r => r && r.charId === 'exorcist' && r.exChose)) {
@@ -10955,9 +10925,11 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
     } else if (info.type === 'seat+role') {
       const askSeat = seatBy[info.askSeat];
       const role = info.roleId ? CHAR_BY_ID[info.roleId] : null;
+      const topLabel = info.displayLabel || 'Your Grandchild is:';
+      const midLabel = info.displayRoleLabel || 'Their character is:';
       infoBody = (
         <div className="space-y-4">
-          <div className="text-center text-sm text-stone-300">Your Grandchild is:</div>
+          <div className="text-center text-sm text-stone-300">{topLabel}</div>
           {askSeat ? (
             <div className="card rounded p-3 text-center">
               <div className="text-amber-200/80 text-xs">seat #{askSeat.seatNum}</div>
@@ -10966,7 +10938,7 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
               </div>
             </div>
           ) : <div className="text-stone-500 italic text-center">(unknown seat)</div>}
-          <div className="text-center text-sm text-stone-300">Their character is:</div>
+          <div className="text-center text-sm text-stone-300">{midLabel}</div>
           {role ? (
             <div className="flex flex-col items-center gap-2">
               {iconUrl(role.id) && (
@@ -11150,18 +11122,24 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
           </section>
         )}
 
-        <div className="grid grid-cols-2 gap-2 pt-1">
+        <div className={`grid ${isPoFlex && !isInfo ? 'grid-cols-3' : 'grid-cols-2'} gap-2 pt-1`}>
           <button onClick={onClose}
             className="py-3 rounded-lg text-base font-semibold bg-stone-800 hover:bg-stone-700 text-stone-300 border border-stone-700">
             Cancel
           </button>
+          {isPoFlex && !isInfo && (
+            <button onClick={() => { setPicked([]); setTimeout(doSubmit, 0); }}
+              className="py-3 rounded-lg text-sm font-semibold bg-stone-700 hover:bg-stone-600 text-stone-100 border border-stone-600">
+              ✕ Kill no one
+            </button>
+          )}
           <button onClick={doSubmit}
             disabled={!canSubmit}
             className={`py-3 rounded-lg text-base font-semibold transition
               ${canSubmit
                 ? 'bg-emerald-600 hover:bg-emerald-500 text-stone-950 shadow-lg shadow-emerald-900/40'
                 : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
-            {isInfo ? 'Got it' : 'Submit'}
+            {isInfo ? 'Got it' : (isPoFlex && picked.length === 0 ? 'Submit (kill 1)' : 'Submit')}
           </button>
         </div>
         <p className="text-[10px] text-stone-500 text-center">
@@ -11359,15 +11337,18 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
         (CHAR_BY_ID[s.actualRoleId] || {}).team === 'demon' &&
         (s.reminders || []).some(r => r && r.charId === 'exorcist' && /exorcised/i.test(String(r.label || ''))));
       if (exoSeat && exorcisedDemon) {
+        // Use exorcist as char.id so the modal header renders the Exorcist
+        // icon + name. The infoConfig carries a custom 'displayLabel' that
+        // overrides the default "Your Grandchild is:" wording on the demon's
+        // info display, plus a 'role-hidden' flag so the role token is shown
+        // without the seat-mode "Your Grandchild" preamble.
         const exorcistChar = CHAR_BY_ID['exorcist'] || { id: 'exorcist', name: 'Exorcist', team: 'townsfolk' };
         stepNum += 1;
-        const synthCharId = '_exorcist-show';
-        const synthChar = { id: synthCharId, name: 'Show Exorcism to Demon', team: 'townsfolk', ability: `Tell the Demon (seat #${exorcisedDemon.seatNum}) that the Exorcist (seat #${exoSeat.seatNum}) chose them. They do not wake tonight.` };
         const prompt = nightPrompts[exorcisedDemon.seatNum];
         steps.push({
           type: 'char',
           stepNum,
-          char: synthChar,
+          char: exorcistChar,
           seat: exorcisedDemon,
           reminder: '',
           isExtra: false,
@@ -11378,7 +11359,13 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
           oncePerGame: false,
           canSkip: false,
           infoType: 'seat+role',
-          infoConfig: { suggestion: 'exorcist-show', presetSeat: exoSeat.seatNum, presetRoleId: 'exorcist' },
+          infoConfig: {
+            suggestion: 'exorcist-show',
+            presetSeat: exoSeat.seatNum,
+            presetRoleId: 'exorcist',
+            displayLabel: 'You have been exorcised by:',
+            displayRoleLabel: 'The Exorcist',
+          },
           prompt,
         });
       }
