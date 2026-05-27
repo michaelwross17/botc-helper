@@ -10076,6 +10076,29 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }
           </ul>
         </div>
       );
+    } else if (info.type === 'role-list') {
+      const roles = (info.roleIds || []).map(id => CHAR_BY_ID[id]).filter(Boolean);
+      infoBody = (
+        <div className="space-y-3">
+          <div className="text-center text-sm text-stone-300">
+            These are the roles you learn about:
+          </div>
+          {roles.length === 0 ? (
+            <div className="text-center text-stone-500 italic">(none)</div>
+          ) : (
+            <ul className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+              {roles.map(rc => (
+                <li key={rc.id} className="card rounded p-2 flex flex-col items-center gap-1 text-center">
+                  {iconUrl(rc.id) && (
+                    <img src={iconUrl(rc.id)} alt="" className="w-16 h-16 rounded-full border-2 border-amber-700 object-cover" />
+                  )}
+                  <div className={`text-sm font-bold team-${rc.team}`}>{rc.name}</div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      );
     }
   }
 
