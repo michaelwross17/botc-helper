@@ -1863,6 +1863,11 @@ function App() {
       actions: [
         { label: 'Execute & advance', primary: true, onClick: () => {
           _executePlayer(onBlock.nomineeSeat);
+          // Record the execution so the Undertaker's night-suggest works.
+          // dayIdx here is the live day index — the day on which the execution
+          // happened. The Undertaker on the next night reads this via
+          // computeUndertakerSuggestion(ctx).
+          update(s => ({ grimoire: { ...s.grimoire, lastExecution: { seatNum: onBlock.nomineeSeat, dayIdx } } }));
           advanceToNight();
         }},
         { label: 'Skip execution', onClick: () => advanceToNight() },
@@ -4139,6 +4144,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         nominationsByDay={grim.nominationsByDay || {}}
         onPromoteScarletWoman={onPromoteScarletWoman}
         onStartShowGrimoire={onStartShowGrimoire}
+        lastExecution={grim.lastExecution || null}
       />
 
       <DealRolesButton
@@ -8042,6 +8048,33 @@ function computeTownCrierSuggestion(ctx) {
   };
 }
 
+// Undertaker: the perceived role of whoever was executed on the previous day.
+// Reads from ctx.lastExecution (set by advanceToNightWithExecution when the ST
+// confirms an execution). Only fires when:
+//   - lastExecution.dayIdx === viewingDayIndex - 1 (it was *yesterday's* exec)
+//   - the recorded seat is still dead (ST hasn't manually revived them)
+// Uses perceivedRoleId since the Undertaker sees the player's public character.
+function computeUndertakerSuggestion(ctx) {
+  if (!ctx) return null;
+  const lastEx = ctx.lastExecution;
+  if (!lastEx || lastEx.seatNum == null) return null;
+  if (lastEx.dayIdx !== (ctx.viewingDayIndex || 0) - 1) return null;
+  const seat = (ctx.seats || []).find(s => s.seatNum === lastEx.seatNum);
+  if (!seat || !seat.isDead) return null;
+  const roleId = seat.perceivedRoleId || seat.actualRoleId;
+  if (!roleId) return null;
+  const rc = CHAR_BY_ID[roleId];
+  return {
+    value: roleId,
+    breakdown: {
+      seatNum: lastEx.seatNum,
+      playerName: seat.playerName || null,
+      roleName: rc?.name || roleId,
+      misregistered: seat.actualRoleId !== seat.perceivedRoleId,
+    },
+  };
+}
+
 // Top-level dispatch — returns a suggestion for any info role we can compute.
 // ctx supplies extra context for roles that need history (viewingDayIndex,
 // nominationsByDay, daysSnapshots, etc.).
@@ -8053,6 +8086,7 @@ function infoSuggestion(roleId, mySeat, seats, ctx) {
     case 'mathematician': return computeMathematicianCount(seats);
     case 'flowergirl':    return computeFlowerGirlSuggestion(ctx);
     case 'towncrier':     return computeTownCrierSuggestion(ctx);
+    case 'undertaker':    return computeUndertakerSuggestion(ctx);
     default:              return null;
   }
 }
@@ -9007,12 +9041,12 @@ function SWPromoteModal({ step, onConfirm, onCancel }) {
 // On Send, calls onSend(payload) where payload describes what to reveal.
 // The parent then writes the prompt to Firebase (status='awaiting' + infoPayload)
 // and the player's phone shows NightInfoScreen.
-function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominationsByDay, daysSnapshots, onClose, onSend }) {
+function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominationsByDay, daysSnapshots, lastExecution, onClose, onSend }) {
   const def = NIGHT_ACTIONS[step.char.id] || {};
   const cfg = def.infoConfig || {};
   const infoType = def.infoType || 'manual';
   // Context bundle for infoSuggestion() — passed to history-dependent suggestions.
-  const suggestionCtx = { viewingDayIndex, nominationsByDay, daysSnapshots, seats };
+  const suggestionCtx = { viewingDayIndex, nominationsByDay, daysSnapshots, seats, lastExecution };
   // Selected values, kept in local state per type.
   const [pickedSeats, setPickedSeats] = useState([]);
   const [pickedRole, setPickedRole]   = useState('');
@@ -9216,23 +9250,55 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
           </>
         )}
 
-        {infoType === 'role' && (
-          <div>
-            <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">Pick the role to reveal</div>
-            <ul className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-72 overflow-y-auto">
-              {candidateRoles.map(rc => (
-                <li key={rc.id}>
-                  <button onClick={() => setPickedRole(rc.id)}
-                    className={`w-full card rounded px-2 py-1.5 flex items-center gap-2 text-left text-sm
-                      ${pickedRole === rc.id ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}`}>
-                    {iconUrl(rc.id) && <img src={iconUrl(rc.id)} alt="" className="w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0" />}
-                    <span className={`flex-1 min-w-0 truncate team-${rc.team}`}>{rc.name}</span>
+        {infoType === 'role' && (() => {
+          const suggestion = infoSuggestion(step.char.id, targetSeat, seats, suggestionCtx);
+          return (
+            <div>
+              <div className="flex items-baseline justify-between gap-2 mb-1.5">
+                <div className="text-xs uppercase tracking-wider text-amber-300">Pick the role to reveal</div>
+                {suggestion?.value && (
+                  <button onClick={() => setPickedRole(suggestion.value)}
+                    className={`text-[11px] px-2 py-1 rounded transition
+                      ${pickedRole === suggestion.value
+                        ? 'bg-emerald-700/60 text-emerald-100 border border-emerald-600'
+                        : 'pill hover:border-emerald-500 hover:text-emerald-200 text-emerald-300'}`}>
+                    {pickedRole === suggestion.value ? '✓ Suggested: ' : 'Suggested: '}
+                    <span className="font-bold">{(CHAR_BY_ID[suggestion.value] || {}).name || suggestion.value}</span>
                   </button>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
+                )}
+              </div>
+              <ul className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-72 overflow-y-auto">
+                {candidateRoles.map(rc => {
+                  const isSuggested = suggestion?.value === rc.id;
+                  return (
+                    <li key={rc.id}>
+                      <button onClick={() => setPickedRole(rc.id)}
+                        className={`w-full card rounded px-2 py-1.5 flex items-center gap-2 text-left text-sm
+                          ${pickedRole === rc.id
+                            ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700'
+                            : isSuggested
+                              ? 'border-emerald-600/70 hover:border-emerald-500'
+                              : 'hover:border-amber-500'}`}>
+                        {iconUrl(rc.id) && <img src={iconUrl(rc.id)} alt="" className="w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0" />}
+                        <span className={`flex-1 min-w-0 truncate team-${rc.team}`}>{rc.name}</span>
+                        {isSuggested && pickedRole !== rc.id && (
+                          <span className="w-2 h-2 rounded-full bg-emerald-500 flex-shrink-0"></span>
+                        )}
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+              {suggestion?.breakdown && step.char.id === 'undertaker' && (
+                <div className="mt-2 text-[10px] text-stone-500 leading-snug">
+                  Based on today's execution: seat #{suggestion.breakdown.seatNum}
+                  {suggestion.breakdown.playerName ? ` · ${suggestion.breakdown.playerName}` : ''}
+                  {suggestion.breakdown.misregistered ? ' (perceived role shown — actual differs).' : '.'}
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
         {infoType === 'number' && (() => {
           const suggestion = infoSuggestion(step.char.id, targetSeat, seats);
@@ -9917,7 +9983,8 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                               automation = false, nightPrompts = {}, readOnly = false,
                               onStartPrompt, onCancelPrompt, onMarkDone, onClearAllPrompts,
                               scriptCharIds = [], onOpenLocalPrompt,
-                              nominationsByDay = {}, onPromoteScarletWoman, onStartShowGrimoire }) {
+                              nominationsByDay = {}, onPromoteScarletWoman, onStartShowGrimoire,
+                              lastExecution = null }) {
   // Auto-expand when automation is on so the ST sees the interactive panel immediately.
   const [collapsed, setCollapsed] = useState(!automation);
   useEffect(() => { if (automation) setCollapsed(false); }, [automation]);
@@ -10173,6 +10240,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
           viewingDayIndex={viewingDayIndex}
           nominationsByDay={nominationsByDay}
           daysSnapshots={daysSnapshots}
+          lastExecution={lastExecution}
           onClose={closeInfoPicker}
           onSend={(payload) => {
             // For local players, don't push to a phone — open the on-ST overlay
