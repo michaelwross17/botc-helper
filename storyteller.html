@@ -1799,38 +1799,41 @@ function App() {
   };
   // Snapshot the current state as a finished day and start the next.
   // Top note persists across days; bottom note clears.
+  //
+  // Uses functional `update(s => ...)` so prior synchronous updates this
+  // batch (e.g. _executePlayer marking the on-block player dead, lastExecution
+  // being recorded) are preserved instead of being clobbered by a stale-
+  // closure spread.
   const advanceToNight = () => {
-    const g = state.grimoire;
-    const idx = g.days.length;
-    const snapshot = {
-      label: `Night ${idx} / Day ${idx + 1}`,
-      seats: JSON.parse(JSON.stringify(g.seats)),
-      demonBluffs: [...(g.demonBluffs || [])],
-      townSquareNotes: { ...(g.townSquareNotes || { above: '', below: '' }) },
-    };
-    // Strip transient reminders from each seat / traveller for the upcoming
-    // night. Permanent reminders (hidden role markers, once-per-game tokens,
-    // courtier countdown, etc.) are kept — see isReminderPermanent().
-    const filterReminders = (rs) => (rs || []).filter(isReminderPermanent);
-    const seatsForNewNight = (g.seats || []).map(s => ({
-      ...s,
-      reminders: filterReminders(s.reminders),
-    }));
-    const travellersForNewNight = (g.travellers || []).map(t => ({
-      ...t,
-      reminders: filterReminders(t.reminders),
-    }));
-    update({
-      grimoire: {
-        ...g,
-        seats: seatsForNewNight,
-        travellers: travellersForNewNight,
-        // Reset all night-phase prompts so the new night starts clean.
-        nightPrompts: {},
-        days: [...g.days, snapshot],
-        townSquareNotes: { above: g.townSquareNotes?.above || '', below: '' },
-        viewingDayIndex: g.days.length + 1, // viewing the new current day
-      },
+    update(s => {
+      const g = s.grimoire;
+      const idx = (g.days || []).length;
+      const snapshot = {
+        label: `Night ${idx} / Day ${idx + 1}`,
+        seats: JSON.parse(JSON.stringify(g.seats || [])),
+        demonBluffs: [...(g.demonBluffs || [])],
+        townSquareNotes: { ...(g.townSquareNotes || { above: '', below: '' }) },
+      };
+      const filterReminders = (rs) => (rs || []).filter(isReminderPermanent);
+      const seatsForNewNight = (g.seats || []).map(seat => ({
+        ...seat,
+        reminders: filterReminders(seat.reminders),
+      }));
+      const travellersForNewNight = (g.travellers || []).map(t => ({
+        ...t,
+        reminders: filterReminders(t.reminders),
+      }));
+      return {
+        grimoire: {
+          ...g,
+          seats: seatsForNewNight,
+          travellers: travellersForNewNight,
+          nightPrompts: {},
+          days: [...(g.days || []), snapshot],
+          townSquareNotes: { above: g.townSquareNotes?.above || '', below: '' },
+          viewingDayIndex: (g.days || []).length + 1,
+        },
+      };
     });
   };
   const setViewingDayIndex = (idx) => {
@@ -8048,12 +8051,13 @@ function computeTownCrierSuggestion(ctx) {
   };
 }
 
-// Undertaker: the perceived role of whoever was executed on the previous day.
+// Undertaker: the ACTUAL role of whoever was executed on the previous day.
 // Reads from ctx.lastExecution (set by advanceToNightWithExecution when the ST
 // confirms an execution). Only fires when:
 //   - lastExecution.dayIdx === viewingDayIndex - 1 (it was *yesterday's* exec)
 //   - the recorded seat is still dead (ST hasn't manually revived them)
-// Uses perceivedRoleId since the Undertaker sees the player's public character.
+// Uses actualRoleId — if a Drunk-who-thinks-they're-the-FT is executed, the
+// Undertaker learns "Drunk" (the real character), not "Fortune Teller".
 function computeUndertakerSuggestion(ctx) {
   if (!ctx) return null;
   const lastEx = ctx.lastExecution;
@@ -8061,7 +8065,7 @@ function computeUndertakerSuggestion(ctx) {
   if (lastEx.dayIdx !== (ctx.viewingDayIndex || 0) - 1) return null;
   const seat = (ctx.seats || []).find(s => s.seatNum === lastEx.seatNum);
   if (!seat || !seat.isDead) return null;
-  const roleId = seat.perceivedRoleId || seat.actualRoleId;
+  const roleId = seat.actualRoleId || seat.perceivedRoleId;
   if (!roleId) return null;
   const rc = CHAR_BY_ID[roleId];
   return {
@@ -9293,7 +9297,7 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
                 <div className="mt-2 text-[10px] text-stone-500 leading-snug">
                   Based on today's execution: seat #{suggestion.breakdown.seatNum}
                   {suggestion.breakdown.playerName ? ` · ${suggestion.breakdown.playerName}` : ''}
-                  {suggestion.breakdown.misregistered ? ' (perceived role shown — actual differs).' : '.'}
+                  {suggestion.breakdown.misregistered ? ' — actual role differs from what the player thought they were.' : '.'}
                 </div>
               )}
             </div>
