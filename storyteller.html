@@ -2048,6 +2048,22 @@ function App() {
     });
   };
 
+  // _killSeatDirect — places a Dead reminder AND marks seat.isDead in one
+  // atomic update, BYPASSING the death-confirm modal. Used by automation flows
+  // (Slayer, Virgin, etc.) where the ST has already approved the kill via the
+  // upstream corner popup — re-confirming via the generic death modal would be
+  // redundant.
+  const _killSeatDirect = (seatNum, causeCharId, label = 'Dead') => {
+    update(s => {
+      const seats = (s.grimoire.seats || []).map(seat =>
+        seat.seatNum === seatNum
+          ? { ...seat, isDead: true, reminders: [...(seat.reminders || []), { charId: causeCharId, label }] }
+          : seat
+      );
+      return { grimoire: { ...s.grimoire, seats } };
+    });
+  };
+
   // Slayer / Psychopath: claim + target. If real + sober → target dies +
   // "No ability" placed on claimant. If real + drunk/poisoned → ask ST. If
   // fake → dismissable banner only.
@@ -2101,8 +2117,8 @@ function App() {
     // Sober real claimant → resolve based on target / role rules.
     if (requiresDemonTarget) {
       if (targetIsDemon) {
-        // Real Slayer hits the Demon → kill, popup confirming.
-        addReminder(targetSeatNum, roleId, 'Dead');
+        // Real Slayer hits the Demon → kill immediately (no death-confirm).
+        _killSeatDirect(targetSeatNum, roleId);
         logAudit('killed-demon');
         addCornerPrompt({
           kind: 'success',
@@ -2118,7 +2134,7 @@ function App() {
           body: `${claimantLabel} (real ${roleName}) targeted ${targetLabel} who is the Recluse. Recluse may register as the Demon — fire and kill?`,
           actions: [
             { label: 'Yes, kill', primary: true, onClick: () => {
-              addReminder(targetSeatNum, roleId, 'Dead');
+              _killSeatDirect(targetSeatNum, roleId);
               logAudit('killed-recluse');
             }},
             { label: 'No', onClick: () => logAudit('recluse-spared') },
@@ -2129,8 +2145,8 @@ function App() {
         logAudit('no-effect');
       }
     } else {
-      // Psychopath-style: kills any target.
-      addReminder(targetSeatNum, roleId, 'Dead');
+      // Psychopath-style: kills any target. Direct kill (no death-confirm).
+      _killSeatDirect(targetSeatNum, roleId);
       logAudit('killed');
       addCornerPrompt({
         kind: 'success',
@@ -2192,8 +2208,9 @@ function App() {
       return;
     }
     const fire = () => {
-      // Execute the nominator → place Dead → triggers death-confirm.
-      addReminder(nominatorSeatNum, 'virgin', 'Dead');
+      // Execute the nominator directly (no death-confirm modal — ST already
+      // approved via the popup that called this fire()).
+      _killSeatDirect(nominatorSeatNum, 'virgin');
       // Audit: log a special entry only on actual execution.
       appendDayEntry(dayIdx, {
         kind: 'special',
@@ -2209,10 +2226,29 @@ function App() {
       });
     };
     if (nominatorAfflicted) {
-      pushDayBanner({
-        kind: 'info',
-        text: `${_seatLabel(nominator)} nominated the Virgin (${_seatLabel(nominee)}) — Virgin is drunk/poisoned, ability does not fire.`,
-      });
+      // Virgin's ability is malfunctioning — ST may still choose to execute
+      // the nominator (rule of cool / drunk override). Only ask for Townsfolk
+      // and Recluse nominators since other teams never trigger Virgin anyway.
+      if (isTownsfolk || isRecluse) {
+        const whoLabel = isRecluse ? 'Recluse (may register as Townsfolk)' : 'Townsfolk';
+        addCornerPrompt({
+          kind: 'warn',
+          title: 'Virgin drunk/poisoned',
+          body: `${_seatLabel(nominator)} (${whoLabel}) nominated the Virgin (${_seatLabel(nominee)}). The Virgin is drunk/poisoned — execute the nominator anyway? (ST decision)`,
+          actions: [
+            { label: 'Yes, execute', primary: true, onClick: () => fire() },
+            { label: 'No', onClick: () => pushDayBanner({
+                kind: 'info',
+                text: `Virgin (drunk/poisoned) did not execute ${_seatLabel(nominator)} — ST waived. Ability consumed.`,
+              }) },
+          ],
+        });
+      } else {
+        pushDayBanner({
+          kind: 'info',
+          text: `${_seatLabel(nominator)} nominated the Virgin (${_seatLabel(nominee)}) — Virgin is drunk/poisoned, ability does not fire. Ability consumed.`,
+        });
+      }
       return;
     }
     if (isRecluse) {
