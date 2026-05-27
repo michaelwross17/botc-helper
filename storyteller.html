@@ -8055,10 +8055,12 @@ function isReminderPermanent(reminder) {
   // Devil's Advocate "Chose" marker tracks previous-night pick so the next
   // night's picker can exclude them. Cleared+replaced when DA picks again.
   if (reminder.charId === 'devilsadvocate' && reminder.daChose) return true;
-  // Grandmother — ONLY the 'Grandchild' marker persists across nights so the
-  // demon-kill trigger can still fire. Other grandmother reminders (e.g. the
-  // night's 'Saw: <role>' info marker) are transient and clear at Go-to-Night.
+  // Grandmother — both the 'Grandchild' marker AND the first-night 'Saw: <role>'
+  // info marker persist for the whole game. The Grandmother only ever sees her
+  // grandchild once (on the first night) so the Saw marker stays placed for
+  // the rest of the game as a reference.
   if (reminder.charId === 'grandmother' && /grandchild|child/i.test(reminder.label || '')) return true;
+  if (reminder.charId === 'grandmother' && /^saw/i.test(reminder.label || '')) return true;
   return false;
 }
 
