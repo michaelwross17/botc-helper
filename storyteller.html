@@ -1701,6 +1701,17 @@ function App() {
             // The label includes the revealed role name so the ST can later
             // see exactly what was shown to the Grandmother.
             if (info.askSeat != null) {
+              // First, sweep any prior grandmother 'Saw*' markers off every
+              // seat — both to wipe leftovers from the earlier bug (where the
+              // marker was misplaced on the Grandmother) and to avoid stacking
+              // multiple 'Saw' markers if the ST re-runs the step in one night.
+              const sweepBase = next.__seatsCopy || state.grimoire.seats;
+              const swept = sweepBase.map(s => ({
+                ...s,
+                reminders: (s.reminders || []).filter(r =>
+                  !(r && r.charId === 'grandmother' && /^saw/i.test(String(r.label || '')))),
+              }));
+              next.__seatsCopy = swept;
               const shownRoleName = (CHAR_BY_ID[info.roleId] || {}).name || info.roleId || '';
               const label = shownRoleName ? `Saw: ${shownRoleName}` : (p.reminderLabel || 'Saw');
               placeOn(info.askSeat, label);
@@ -8001,9 +8012,6 @@ const PERMANENT_REMINDER_CHARS = new Set([
   'snitch',
   // Mezepheles (mad word — permanent ability loss)
   'mezepheles',
-  // Grandmother — the 'Grandchild' marker persists for the whole game so the
-  // demon-kill trigger can still fire on later nights.
-  'grandmother',
 ]);
 const PERMANENT_REMINDER_LABELS = new Set(['No ability', 'Used']);
 // Compute today's chopping-block state from a day's nominations + alive count.
@@ -8047,6 +8055,10 @@ function isReminderPermanent(reminder) {
   // Devil's Advocate "Chose" marker tracks previous-night pick so the next
   // night's picker can exclude them. Cleared+replaced when DA picks again.
   if (reminder.charId === 'devilsadvocate' && reminder.daChose) return true;
+  // Grandmother — ONLY the 'Grandchild' marker persists across nights so the
+  // demon-kill trigger can still fire. Other grandmother reminders (e.g. the
+  // night's 'Saw: <role>' info marker) are transient and clear at Go-to-Night.
+  if (reminder.charId === 'grandmother' && /grandchild|child/i.test(reminder.label || '')) return true;
   return false;
 }
 
