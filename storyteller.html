@@ -1837,6 +1837,39 @@ function App() {
     update({ grimoire: { ...state.grimoire, viewingDayIndex: idx } });
   };
 
+  // Wrapper around advanceToNight that first checks if there's a player on the
+  // chopping block (live day's nominations) and if so prompts the ST to execute
+  // them before snapshotting the day. Used by BOTH Go-to-night buttons (grim +
+  // nominations tab) so behavior is consistent.
+  const advanceToNightWithExecution = () => {
+    const g = state.grimoire;
+    const dayIdx = g.days ? g.days.length : 0;  // live day index
+    const dayRaw = (g.nominationsByDay || {})[dayIdx];
+    const noms = dayRaw ? normalizeDayNoms(dayRaw).nominations : [];
+    const aliveCount = (g.seats || []).filter(s => !s.isDead && s.actualRoleId).length;
+    const { onBlock } = computeChoppingBlock(noms, aliveCount);
+    const proceed = () => {
+      if (confirm(`Snapshot Night ${dayIdx} / Day ${dayIdx + 1} and move to Night ${dayIdx + 1} / Day ${dayIdx + 2}?`)) {
+        advanceToNight();
+      }
+    };
+    if (!onBlock) { proceed(); return; }
+    const blockSeat = (g.seats || []).find(s => s.seatNum === onBlock.nomineeSeat);
+    if (!blockSeat || blockSeat.isDead) { proceed(); return; }
+    addCornerPrompt({
+      kind: 'warn',
+      title: 'Execute before night?',
+      body: `${blockSeat.playerName ? blockSeat.playerName + ' (seat #' + blockSeat.seatNum + ')' : 'Seat #' + blockSeat.seatNum} is on the chopping block with ${onBlock.votes} votes. Execute them and advance?`,
+      actions: [
+        { label: 'Execute & advance', primary: true, onClick: () => {
+          _executePlayer(onBlock.nomineeSeat);
+          advanceToNight();
+        }},
+        { label: 'Skip execution', onClick: () => advanceToNight() },
+      ],
+    });
+  };
+
   // --- Nominations ---
   // Each day's entry shape: { nominations: [...], minionVoted: bool, demonVoted: bool }.
   // (Legacy localStorage may still have a bare array; normalizeDayNoms() handles it.)
@@ -2059,6 +2092,17 @@ function App() {
         seat.seatNum === seatNum
           ? { ...seat, isDead: true, reminders: [...(seat.reminders || []), { charId: causeCharId, label }] }
           : seat
+      );
+      return { grimoire: { ...s.grimoire, seats } };
+    });
+  };
+
+  // _executePlayer — marks a seat dead WITHOUT placing a reminder (regular
+  // town execution at end of day). Atomic functional update.
+  const _executePlayer = (seatNum) => {
+    update(s => {
+      const seats = (s.grimoire.seats || []).map(seat =>
+        seat.seatNum === seatNum ? { ...seat, isDead: true } : seat
       );
       return { grimoire: { ...s.grimoire, seats } };
     });
@@ -2461,6 +2505,7 @@ function App() {
           onSetDayVoting={setDayVoting}
           onSetViewingDay={setNominationsViewingDayIndex}
           onJumpToGrimoire={() => update({ page: 'grimoire' })}
+          onAdvanceToNight={advanceToNightWithExecution}
           onResolveClaimAndKill={resolveClaimAndKill}
           onResolveMutantClaim={resolveMutantClaim}
         />
@@ -2529,7 +2574,7 @@ function App() {
             ? 'Assign the Lunatic on the Grimoire first — otherwise the demon-token player who is actually the Lunatic would see the real Demon bluffs.'
             : null}
           onBeginGame={beginGame}
-          onAdvanceToNight={advanceToNight}
+          onAdvanceToNight={advanceToNightWithExecution}
           onSetViewingDayIndex={setViewingDayIndex}
           onSetView={setGrimoireView}
           onRegenerate={generateRoles}
@@ -5810,7 +5855,7 @@ function DayTabs({ days, viewingDayIndex, onSelect }) {
 // ---------------- Nominations page ----------------
 
 function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onSetViewingDay, onJumpToGrimoire,
-                            onResolveClaimAndKill, onResolveMutantClaim }) {
+                            onResolveClaimAndKill, onResolveMutantClaim, onAdvanceToNight }) {
   const grim = state.grimoire;
   const [activeAbility, setActiveAbility] = useState(null);
   const [pendingClaimant, setPendingClaimant] = useState(null);
@@ -5856,6 +5901,8 @@ function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onS
   const liveSeats = grim.seats || [];
   const snapSeats = isPast ? (days[viewingIdx]?.seats || liveSeats) : liveSeats;
   const day = normalizeDayNoms((grim.nominationsByDay || {})[viewingIdx]);
+  const aliveCount = (snapSeats || []).filter(s => !s.isDead && s.actualRoleId).length;
+  const choppingBlock = computeChoppingBlock(day.nominations, aliveCount);
 
   return (
     <div className="space-y-4">
@@ -5888,6 +5935,9 @@ function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onS
           abilityPendingSeat={pendingClaimant}
           onAbilityTap={handleAbilityTap}
           onCancelAbility={resetAbility}
+          dayNominations={day.nominations}
+          aliveCount={aliveCount}
+          choppingBlock={choppingBlock}
         />
       )}
 
@@ -5897,7 +5947,21 @@ function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onS
         readOnly={isPast}
         onUpdate={(id, patch) => onUpdate(viewingIdx, id, patch)}
         onRemove={(id) => onRemove(viewingIdx, id)}
+        onBlockNomineeSeat={choppingBlock.onBlock?.nomineeSeat ?? null}
       />
+
+      {/* Go to Night button at the bottom of the Nominations tab — same
+          handler as the grimoire's Go-to-night, includes the execution
+          check for whoever is currently on the chopping block. */}
+      {!isPast && grim.gameStarted && (
+        <BeginOrAdvanceButton
+          seats={liveSeats}
+          gameStarted={grim.gameStarted}
+          daysCount={days.length}
+          onBegin={() => {}}
+          onAdvance={onAdvanceToNight}
+        />
+      )}
     </div>
   );
 }
@@ -5956,9 +6020,14 @@ function DayVotingFlags({ day, readOnly, onChange }) {
 // Circular seat picker for creating a nomination. Same geometry as the grimoire,
 // but no center "Town Square" piece and no roles — just seat # + name on each disc.
 // Two-tap flow: tap nominator → tap nominee (or the same seat for self-nom).
-function CircularNominator({ seats, onNominate, abilityMode = null, abilityPendingSeat = null, onAbilityTap, onCancelAbility }) {
+function CircularNominator({ seats, onNominate, abilityMode = null, abilityPendingSeat = null, onAbilityTap, onCancelAbility,
+                              dayNominations = [], aliveCount = 0, choppingBlock = null }) {
   const [picked, setPicked] = useState(null); // seatNum of the first tap
   const N = Math.max(1, seats.length);
+  // Once-per-day rule: each seat can nominate once and be nominated once today.
+  const noms = (dayNominations || []).filter(n => !n.kind || n.kind === 'nomination');
+  const hasNominated = new Set(noms.map(n => n.nominatorSeat));
+  const hasBeenNominated = new Set(noms.map(n => n.nomineeSeat));
   const tokenRadiusPct = N >= 15 ? 44 : N >= 13 ? 42 : N >= 11 ? 40 : 38;
   const linearSpacingPct = N > 1 ? 2 * tokenRadiusPct * Math.sin(Math.PI / N) : 100;
   const cap = N >= 15 ? 13 : N >= 13 ? 14 : N >= 11 ? 16 : 18;
@@ -5970,11 +6039,20 @@ function CircularNominator({ seats, onNominate, abilityMode = null, abilityPendi
       onAbilityTap && onAbilityTap(seatNum);
       return;
     }
+    const seat = seats.find(s => s.seatNum === seatNum);
     if (picked == null) {
+      // First tap — selecting the NOMINATOR. Dead players cannot nominate.
+      // Players who have already nominated today cannot nominate again.
+      if (!seat || seat.isDead) return;
+      if (hasNominated.has(seatNum)) return;
       setPicked(seatNum);
       return;
     }
-    // Second tap → create nomination (allow self-nom)
+    // Second tap — selecting the NOMINEE. Dead seats are valid nominees
+    // (executing the dead is a thing). Block players who have already been
+    // nominated today.
+    if (!seat) return;
+    if (hasBeenNominated.has(seatNum)) return;
     onNominate(picked, seatNum);
     setPicked(null);
   };
@@ -6010,18 +6088,56 @@ function CircularNominator({ seats, onNominate, abilityMode = null, abilityPendi
         )}
       </div>
       <div className="relative mx-auto" style={{ width: 'min(560px, calc(100vw - 3rem))', aspectRatio: '1 / 1' }}>
+        {/* Center display — minimum votes + current chopping block */}
+        {!abilityMode && (
+          <div className="absolute pointer-events-none text-center"
+            style={{ left: '50%', top: '50%', transform: 'translate(-50%, -50%)', width: '60%' }}>
+            <div className="text-[10px] uppercase tracking-wider text-stone-400">Min votes</div>
+            <div className="text-3xl sm:text-4xl font-bold text-amber-200 leading-none">{choppingBlock?.minVotes ?? '—'}</div>
+            <div className="mt-2 text-[10px] uppercase tracking-wider text-stone-400">On the block</div>
+            {choppingBlock?.onBlock ? (() => {
+              const bs = seats.find(s => s.seatNum === choppingBlock.onBlock.nomineeSeat);
+              return (
+                <div className="text-sm sm:text-base font-bold text-red-300 leading-tight mt-0.5">
+                  #{choppingBlock.onBlock.nomineeSeat}{bs?.playerName ? ' · ' + bs.playerName : ''}
+                  <div className="text-[10px] text-stone-400 font-normal">({choppingBlock.onBlock.votes} votes)</div>
+                </div>
+              );
+            })() : (
+              <div className="text-xs text-stone-500 italic mt-0.5">no one yet</div>
+            )}
+            {choppingBlock && choppingBlock.nextNeeded > (choppingBlock.minVotes || 0) && (
+              <div className="text-[10px] text-stone-500 mt-1">next needs {choppingBlock.nextNeeded}+</div>
+            )}
+          </div>
+        )}
         {seats.map((seat, i) => {
           const angle = (i / N) * 2 * Math.PI - Math.PI / 2;
           const tx = 50 + tokenRadiusPct * Math.cos(angle);
           const ty = 50 + tokenRadiusPct * Math.sin(angle);
           const isPicked = highlighted === seat.seatNum;
+          // Determine if this seat is selectable in the CURRENT click stage.
+          const wouldBeNominator = picked == null && !abilityMode;
+          const wouldBeNominee   = picked != null && !abilityMode;
+          let disabledReason = null;
+          if (!abilityMode) {
+            if (wouldBeNominator && seat.isDead)                disabledReason = 'Dead — cannot nominate';
+            if (wouldBeNominator && hasNominated.has(seat.seatNum))    disabledReason = 'Already nominated today';
+            if (wouldBeNominee   && hasBeenNominated.has(seat.seatNum)) disabledReason = 'Already nominated today';
+          }
+          const dim = seat.isDead || disabledReason;
           return (
             <button key={seat.seatNum}
               onClick={() => handleTap(seat.seatNum)}
+              disabled={!!disabledReason}
+              title={disabledReason || undefined}
               className={`absolute rounded-full border-2 transition flex flex-col items-center justify-center text-center p-1 leading-tight overflow-hidden
                 ${isPicked
                   ? 'border-amber-400 ring-4 ring-amber-400/40 bg-amber-950/40'
-                  : 'border-stone-700 bg-stone-900/70 hover:border-amber-500 hover:bg-stone-900'}`}
+                  : disabledReason
+                    ? 'border-stone-800 bg-stone-900/40 cursor-not-allowed'
+                    : 'border-stone-700 bg-stone-900/70 hover:border-amber-500 hover:bg-stone-900'}
+                ${dim && !isPicked ? 'opacity-40' : ''}`}
               style={{
                 left: `${tx}%`,
                 top: `${ty}%`,
@@ -6044,7 +6160,7 @@ function CircularNominator({ seats, onNominate, abilityMode = null, abilityPendi
   );
 }
 
-function NominationsList({ nominations, seats, readOnly, onUpdate, onRemove }) {
+function NominationsList({ nominations, seats, readOnly, onUpdate, onRemove, onBlockNomineeSeat = null }) {
   if (!nominations.length) {
     return (
       <section className="parchment rounded-lg p-6 text-center text-sm text-stone-500 italic">
@@ -6071,6 +6187,7 @@ function NominationsList({ nominations, seats, readOnly, onUpdate, onRemove }) {
             readOnly={readOnly}
             onUpdate={(patch) => onUpdate(n.id, patch)}
             onRemove={() => onRemove(n.id)}
+            isOnBlock={onBlockNomineeSeat != null && n.nomineeSeat === onBlockNomineeSeat && (!n.kind || n.kind === 'nomination')}
           />
         ))}
       </ol>
@@ -6078,7 +6195,7 @@ function NominationsList({ nominations, seats, readOnly, onUpdate, onRemove }) {
   );
 }
 
-function NominationRow({ index, nom, seatById = {}, nominator, nominee, readOnly, onUpdate, onRemove }) {
+function NominationRow({ index, nom, seatById = {}, nominator, nominee, readOnly, onUpdate, onRemove, isOnBlock = false }) {
   // Claim entry (Slayer/Psychopath/Mutant): render compact with role icon +
   // outcome badge; no votes tracked.
   if (nom.kind === 'claim') {
@@ -6155,7 +6272,12 @@ function NominationRow({ index, nom, seatById = {}, nominator, nominee, readOnly
   // Normal nomination
   const isSelfNom = nom.nominatorSeat === nom.nomineeSeat;
   return (
-    <li className="card rounded p-3 space-y-2">
+    <li className={`card rounded p-3 space-y-2 ${isOnBlock ? 'border-red-500 ring-2 ring-red-700/40 bg-red-950/20' : ''}`}>
+      {isOnBlock && (
+        <div className="text-[10px] uppercase tracking-wider text-red-300 font-semibold">
+          ⛓ On the chopping block
+        </div>
+      )}
       <div className="flex items-center gap-2 flex-wrap">
         <span className="text-stone-500 text-xs tabular-nums w-6">#{index}</span>
         <span className="text-amber-200 font-medium">{seatLabel(nominator)}</span>
@@ -7049,7 +7171,7 @@ function BeginOrAdvanceButton({ seats, gameStarted, daysCount, onBegin, onAdvanc
 
   return (
     <section className="parchment rounded-lg p-4">
-      <button onClick={() => { if (confirm(`Snapshot ${currentLabel} and move to ${nextLabel}? Your top notes carry over; the bottom notes box will be cleared for the new day.`)) onAdvance(); }}
+      <button onClick={onAdvance}
         className="w-full py-3 rounded-lg text-base font-semibold bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40">
         Go to night → ({nextLabel})
       </button>
@@ -7661,6 +7783,31 @@ const PERMANENT_REMINDER_CHARS = new Set([
   'mezepheles',
 ]);
 const PERMANENT_REMINDER_LABELS = new Set(['No ability', 'Used']);
+// Compute today's chopping-block state from a day's nominations + alive count.
+// Returns { minVotes, onBlock: { nomineeSeat, votes } | null, nextNeeded }.
+//   - minVotes:    ceil(aliveCount / 2) — minimum to ever be on the block
+//   - onBlock:     the unique nominee with the most votes (if >= minVotes and
+//                  no tie). null if no candidate or a tie exists.
+//   - nextNeeded:  minimum votes needed for a subsequent nominee to take the
+//                  block. = max(minVotes, currentBlockVotes + 1) when blocked,
+//                  or maxVotes+1 if a tie exists at the top, or minVotes if
+//                  no candidate yet.
+function computeChoppingBlock(nominations, aliveCount) {
+  const minVotes = Math.max(1, Math.ceil((aliveCount || 0) / 2));
+  const noms = (nominations || []).filter(n => !n.kind || n.kind === 'nomination');
+  const qualifying = noms.filter(n => (n.votes || 0) >= minVotes);
+  if (qualifying.length === 0) {
+    return { minVotes, onBlock: null, nextNeeded: minVotes };
+  }
+  const maxVotes = Math.max(...qualifying.map(n => n.votes || 0));
+  const top = qualifying.filter(n => (n.votes || 0) === maxVotes);
+  if (top.length === 1) {
+    return { minVotes, onBlock: { nomineeSeat: top[0].nomineeSeat, votes: maxVotes }, nextNeeded: maxVotes + 1 };
+  }
+  // Tie at the top → no one on the block; next nomination needs to exceed the tie.
+  return { minVotes, onBlock: null, nextNeeded: maxVotes + 1 };
+}
+
 function isReminderPermanent(reminder) {
   if (!reminder) return false;
   if (reminder.hiddenRoleMarker) return true;
