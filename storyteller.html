@@ -1586,6 +1586,45 @@ function App() {
               newDeathConfirms.push({ seatNum: tnum, causeCharId: p.roleId });
             }
           }
+          // Devil's Advocate: also place a permanent 'Chose' marker on the
+          // picked target so next night's picker can exclude them. Clear any
+          // prior DA 'Chose' from other seats first so only the latest pick
+          // is marked.
+          if (p.roleId === 'devilsadvocate' && targets.length > 0) {
+            const newTarget = targets[0];
+            const baseSeats = next.__seatsCopy || state.grimoire.seats;
+            const seatsCopy = baseSeats.map(s => {
+              const stripped = (s.reminders || []).filter(r =>
+                !(r && r.charId === 'devilsadvocate' && r.daChose));
+              if (s.seatNum === newTarget) {
+                const hasChose = stripped.some(r =>
+                  r && r.charId === 'devilsadvocate' && r.daChose);
+                if (!hasChose) {
+                  return { ...s, reminders: [...stripped, { charId: 'devilsadvocate', label: 'Chose', fromPrompt: true, daChose: true }] };
+                }
+              }
+              return { ...s, reminders: stripped };
+            });
+            next.__seatsCopy = seatsCopy;
+          }
+          // oncePerGame target roles (Courtier, Assassin, etc.) place a
+          // permanent 'No ability' on the actor's own seat so the night row
+          // dims on subsequent nights.
+          const defForRoleT = NIGHT_ACTIONS[p.roleId];
+          if (defForRoleT && defForRoleT.oncePerGame) {
+            const baseSeats = next.__seatsCopy || state.grimoire.seats;
+            const ownSeat = baseSeats.find(s => s.seatNum === seatNum);
+            const alreadyNoAbility = (ownSeat?.reminders || []).some(r =>
+              r && /no ability/i.test(String(r.label || '')));
+            if (!alreadyNoAbility && ownSeat) {
+              const seatsCopy = baseSeats.map(s =>
+                s.seatNum === seatNum
+                  ? { ...s, reminders: [...(s.reminders || []), { charId: p.roleId, label: 'No ability', fromPrompt: true }] }
+                  : s
+              );
+              next.__seatsCopy = seatsCopy;
+            }
+          }
         } else if (isInfo && p.reminderLabel) {
           const info = p.infoPayload || {};
           // Helper: append a reminder to the given seat number.
@@ -7808,7 +7847,7 @@ const NIGHT_ACTIONS = {
   exorcist:      { action: 'target1',     reminder: 'Chose',       instruction: 'Choose a player (not the same as last night) — the Demon does not wake tonight.', eligible: 'others', phase: 'other' },
   courtier:      { action: 'target1',     reminder: 'Drunk 1',     instruction: 'Once per game, choose a player: they are drunk for 3 nights & 3 days.',
                    oncePerGame: true, canSkip: true },
-  devilsadvocate:{ action: 'target1',     reminder: 'Safe from execution', instruction: 'Choose a living Minion (different from last night): they are safe from execution today.',
+  devilsadvocate:{ action: 'target1',     reminder: 'Safe from execution', instruction: 'Choose a living player (different from last night): they are safe from execution today.',
                    eligible: 'others' },
   assassin:      { action: 'target1any',  reminder: 'Dead',        instruction: 'Once per game, at night, choose a player: they die, even if for some reason they could not.', phase: 'other',
                    oncePerGame: true, canSkip: true },
@@ -7918,6 +7957,9 @@ function isReminderPermanent(reminder) {
   // Godfather "Died Today" persists into the night so the Godfather can
   // wake and use the trigger. After they act, it's cleared programmatically.
   if (reminder.charId === 'godfather' && /died today/i.test(reminder.label || '')) return true;
+  // Devil's Advocate "Chose" marker tracks previous-night pick so the next
+  // night's picker can exclude them. Cleared+replaced when DA picks again.
+  if (reminder.charId === 'devilsadvocate' && reminder.daChose) return true;
   return false;
 }
 
@@ -9142,8 +9184,9 @@ function SWPromoteModal({ step, onConfirm, onCancel }) {
 // and the player's phone shows NightInfoScreen.
 function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominationsByDay, daysSnapshots, lastExecution, onClose, onSend }) {
   const def = NIGHT_ACTIONS[step.char.id] || {};
-  const cfg = def.infoConfig || {};
-  const infoType = def.infoType || 'manual';
+  // Step-level overrides (Godfather first night swaps to info-st role-list).
+  const cfg = step.infoConfig || def.infoConfig || {};
+  const infoType = step.infoType || def.infoType || 'manual';
   // Context bundle for infoSuggestion() — passed to history-dependent suggestions.
   const suggestionCtx = { viewingDayIndex, nominationsByDay, daysSnapshots, seats, lastExecution };
   // Selected values, kept in local state per type.
@@ -9899,6 +9942,11 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }
     if (eligible === 'others' && isSelf) return false;
     if (eligible === 'self' && !isSelf) return false;
     if (step.action !== 'target1any' && s.isDead) return false;
+    // Devil's Advocate cannot pick the same player two nights in a row.
+    if (step.char.id === 'devilsadvocate' &&
+        (s.reminders || []).some(r => r && r.charId === 'devilsadvocate' && r.daChose)) {
+      return false;
+    }
     return true;
   });
   const [picked, setPicked] = useState([]);
@@ -10323,6 +10371,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
       steps.push({ type: 'char', stepNum, char: c, seat: null, reminder, isExtra,
                    action: effectiveAction, instruction: def.instruction, reminderLabel: def.reminder,
                    requiresDeath: def.requiresDeath, oncePerGame: def.oncePerGame, canSkip: def.canSkip,
+                   infoType: def.infoType, infoConfig: def.infoConfig,
                    prompt: null });
     } else {
       for (const seat of matched) {
@@ -10331,6 +10380,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
         steps.push({ type: 'char', stepNum, char: c, seat, reminder, isExtra,
                      action: effectiveAction, instruction: def.instruction, reminderLabel: def.reminder,
                      requiresDeath: def.requiresDeath, oncePerGame: def.oncePerGame, canSkip: def.canSkip,
+                     infoType: def.infoType, infoConfig: def.infoConfig,
                      prompt });
       }
     }

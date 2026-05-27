@@ -1414,6 +1414,11 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
     if (prompt.eligible === 'self' && !isSelf) return false;
     // target1any allows dead seats; everything else requires alive.
     if (prompt.action !== 'target1any' && s.isDead) return false;
+    // Devil's Advocate cannot pick the same player two nights in a row.
+    if (prompt.roleId === 'devilsadvocate' &&
+        (s.reminders || []).some(r => r && r.charId === 'devilsadvocate' && r.daChose)) {
+      return false;
+    }
     return true;
   });
   const [picked, setPicked] = useState([]);
