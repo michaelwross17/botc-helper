@@ -1478,6 +1478,36 @@ function App() {
   // Shape: { seatNum, causeCharId } | null. causeCharId lets the modal
   // filter protections (Monk Safe doesn't apply to Slayer kills, etc.).
   const [deathConfirmInfo, setDeathConfirmInfo] = useState(null);
+  // Moonchild pick modal: when Moonchild dies, the ST sees a modal with a
+  // seat picker. On Apply, if target is good and Moonchild isn't afflicted
+  // the target dies via _killSeatDirect(target, 'moonchild', 'Dead').
+  const [moonchildPickSeat, setMoonchildPickSeat] = useState(null);
+  const cancelMoonchildPick = () => setMoonchildPickSeat(null);
+  const applyMoonchildPick = (targetSeatNum) => {
+    const mcSeat = (state.grimoire.seats || []).find(s => s.seatNum === moonchildPickSeat);
+    const tgtSeat = (state.grimoire.seats || []).find(s => s.seatNum === targetSeatNum);
+    if (!mcSeat || !tgtSeat) { setMoonchildPickSeat(null); return; }
+    const tgtTeam = (CHAR_BY_ID[tgtSeat.actualRoleId] || {}).team;
+    const tgtIsGood = tgtTeam === 'townsfolk' || tgtTeam === 'outsider';
+    const mcAfflicted = isDrunkOrPoisoned(mcSeat);
+    update(s => {
+      const seats = (s.grimoire.seats || []).map(seat => {
+        if (seat.seatNum === mcSeat.seatNum) {
+          const stripped = (seat.reminders || []).filter(r =>
+            !(r && r.charId === 'moonchild' && /trigger/i.test(String(r.label || ''))));
+          const hasChose = stripped.some(r =>
+            r && r.charId === 'moonchild' && /^chose$/i.test(String(r.label || '')));
+          return { ...seat, reminders: hasChose ? stripped : [...stripped, { charId: 'moonchild', label: 'Chose', fromPrompt: true }] };
+        }
+        if (seat.seatNum === tgtSeat.seatNum && tgtIsGood && !mcAfflicted && !seat.isDead) {
+          return { ...seat, isDead: true, reminders: [...(seat.reminders || []), { charId: 'moonchild', label: 'Dead', fromPrompt: true }] };
+        }
+        return seat;
+      });
+      return { grimoire: { ...s.grimoire, seats } };
+    });
+    setMoonchildPickSeat(null);
+  };
   const queueDeathConfirm = (seatNum, causeCharId) => {
     setDeathConfirmInfo({ seatNum, causeCharId: causeCharId || null });
   };
@@ -1495,6 +1525,20 @@ function App() {
     try {
       const dying = seats.find(s => s.seatNum === dyingSeatNum);
       if (!dying) return;
+      // Moonchild: if Moonchild just died (any cause during the night), place
+      // 'Triggered' so her natural night-order slot becomes an active step.
+      if (dying.actualRoleId === 'moonchild') {
+        const hasTrigger = (dying.reminders || []).some(r =>
+          r && r.charId === 'moonchild' && /trigger/i.test(String(r.label || '')));
+        if (!hasTrigger) {
+          const seatsT = state.grimoire.seats.map(s =>
+            s.seatNum === dyingSeatNum
+              ? { ...s, isDead: true, reminders: [...(s.reminders || []), { charId: 'moonchild', label: 'Triggered', fromPrompt: true }] }
+              : s
+          );
+          update({ grimoire: { ...state.grimoire, seats: seatsT } });
+        }
+      }
       const hasGrandchild = (dying.reminders || []).some(r =>
         r && r.charId === 'grandmother' && /grandchild|child/i.test(String(r.label || '')));
       const causeTeam = causeCharId ? (CHAR_BY_ID[causeCharId] || {}).team : null;
@@ -1656,6 +1700,41 @@ function App() {
               newDeathConfirms.push({ seatNum: tnum, causeCharId: p.roleId });
             }
           }
+          // Exorcist: place a permanent 'Chose' marker (with exChose flag)
+          // on the picked target — clears any prior exChose first so only the
+          // latest pick is marked. If the picked target is the Demon, also
+          // place an 'Exorcised' reminder on the demon (transient — cleared at
+          // Go-to-Night) which dims the demon's wake step tonight and triggers
+          // the synthetic 'Show Exorcism' step.
+          if (p.roleId === 'exorcist' && targets.length > 0) {
+            const newTarget = targets[0];
+            const baseSeats = next.__seatsCopy || state.grimoire.seats;
+            const tgtSeat = baseSeats.find(s => s.seatNum === newTarget);
+            const tgtIsDemon = tgtSeat && (CHAR_BY_ID[tgtSeat.actualRoleId] || {}).team === 'demon';
+            const seatsCopy = baseSeats.map(s => {
+              // Strip any prior exChose markers from every seat.
+              const stripped = (s.reminders || []).filter(r =>
+                !(r && r.charId === 'exorcist' && r.exChose));
+              if (s.seatNum === newTarget) {
+                const hasChose = stripped.some(r =>
+                  r && r.charId === 'exorcist' && r.exChose);
+                let reminders = stripped;
+                if (!hasChose) {
+                  reminders = [...reminders, { charId: 'exorcist', label: 'Chose', fromPrompt: true, exChose: true }];
+                }
+                if (tgtIsDemon) {
+                  const hasExorcised = reminders.some(r =>
+                    r && r.charId === 'exorcist' && /exorcised/i.test(String(r.label || '')));
+                  if (!hasExorcised) {
+                    reminders = [...reminders, { charId: 'exorcist', label: 'Exorcised', fromPrompt: true }];
+                  }
+                }
+                return { ...s, reminders };
+              }
+              return { ...s, reminders: stripped };
+            });
+            next.__seatsCopy = seatsCopy;
+          }
           // Devil's Advocate: also place a permanent 'Chose' marker on the
           // picked target so next night's picker can exclude them. Clear any
           // prior DA 'Chose' from other seats first so only the latest pick
@@ -1674,6 +1753,63 @@ function App() {
                 }
               }
               return { ...s, reminders: stripped };
+            });
+            next.__seatsCopy = seatsCopy;
+          }
+          // Po: 0-pick → place 'Hungry — 3 to kill' on Po; 1-pick → standard
+          // Dead on target; 3-pick → strip Hungry from Po and place Dead on
+          // each target. The default per-target placement above already drops
+          // 'Dead' on each target, so here we handle only the Hungry marker.
+          if (p.roleId === 'po') {
+            const baseSeats = next.__seatsCopy || state.grimoire.seats;
+            if (targets.length === 0) {
+              // Place Hungry on Po's own seat (idempotent).
+              const seatsCopy = baseSeats.map(s => {
+                if (s.seatNum !== seatNum) return s;
+                const hasHungry = (s.reminders || []).some(r =>
+                  r && r.charId === 'po' && /hungry|3 to kill/i.test(String(r.label || '')));
+                if (hasHungry) return s;
+                return { ...s, reminders: [...(s.reminders || []), { charId: 'po', label: 'Hungry', fromPrompt: true }] };
+              });
+              next.__seatsCopy = seatsCopy;
+            } else if (targets.length >= 3) {
+              // Strip Hungry from Po — she just used the boosted attack.
+              const seatsCopy = baseSeats.map(s => {
+                if (s.seatNum !== seatNum) return s;
+                const reminders = (s.reminders || []).filter(r =>
+                  !(r && r.charId === 'po' && /hungry|3 to kill/i.test(String(r.label || ''))));
+                if (reminders.length === (s.reminders || []).length) return s;
+                return { ...s, reminders };
+              });
+              next.__seatsCopy = seatsCopy;
+            }
+          }
+          // Moonchild submitted her pick — kill the target if good and place
+          // a 'Chose' marker on the Moonchild's own seat. Clear 'Triggered'.
+          if (p.roleId === 'moonchild' && targets.length === 1) {
+            const baseSeats = next.__seatsCopy || state.grimoire.seats;
+            const tgtSeat = baseSeats.find(s => s.seatNum === targets[0]);
+            const tgtTeam = (CHAR_BY_ID[tgtSeat?.actualRoleId] || {}).team;
+            const tgtIsGood = tgtTeam === 'townsfolk' || tgtTeam === 'outsider';
+            const mcSeat = baseSeats.find(s => s.seatNum === seatNum);
+            const mcAfflicted = mcSeat ? isDrunkOrPoisoned(mcSeat) : false;
+            // Clean Triggered + add Chose on Moonchild. Kill target if good
+            // AND Moonchild isn't drunk/poisoned.
+            const seatsCopy = baseSeats.map(s => {
+              if (s.seatNum === seatNum) {
+                const stripped = (s.reminders || []).filter(r =>
+                  !(r && r.charId === 'moonchild' && /trigger/i.test(String(r.label || ''))));
+                const hasChose = stripped.some(r =>
+                  r && r.charId === 'moonchild' && /^chose$/i.test(String(r.label || '')));
+                return { ...s, reminders: hasChose ? stripped : [...stripped, { charId: 'moonchild', label: 'Chose', fromPrompt: true }] };
+              }
+              if (s.seatNum === targets[0] && tgtIsGood && !mcAfflicted) {
+                const hasDead = (s.reminders || []).some(r =>
+                  r && r.charId === 'moonchild' && /^dead$/i.test(String(r.label || '')));
+                if (hasDead || s.isDead) return s;
+                return { ...s, isDead: true, reminders: [...(s.reminders || []), { charId: 'moonchild', label: 'Dead', fromPrompt: true }] };
+              }
+              return s;
             });
             next.__seatsCopy = seatsCopy;
           }
@@ -2390,6 +2526,21 @@ function App() {
         seat.seatNum === seatNum ? { ...seat, isDead: true } : seat
       );
       const executed = seats0.find(seat => seat.seatNum === seatNum);
+      // Moonchild execution: place 'Triggered' on the Moonchild and queue
+      // the popup so the ST picks her target. The popup fires after this
+      // update commits via the effect listener.
+      if (executed && executed.actualRoleId === 'moonchild') {
+        seats0.forEach((seat, i) => {
+          if (seat.seatNum !== seatNum) return;
+          const hasTrigger = (seat.reminders || []).some(r =>
+            r && r.charId === 'moonchild' && /trigger/i.test(String(r.label || '')));
+          if (!hasTrigger) {
+            seats0[i] = { ...seat, reminders: [...(seat.reminders || []), { charId: 'moonchild', label: 'Triggered', fromPrompt: true }] };
+          }
+        });
+        // Fire popup outside the updater on next tick.
+        setTimeout(() => setMoonchildPickSeat(seatNum), 0);
+      }
       const wasOutsider = executed && CHAR_BY_ID[executed.actualRoleId]?.team === 'outsider';
       let seats = seats0;
       if (wasOutsider) {
@@ -2929,6 +3080,14 @@ function App() {
           causeCharId={deathConfirmInfo.causeCharId}
           onConfirm={confirmDeath}
           onDismiss={dismissDeathConfirm}
+        />
+      )}
+      {moonchildPickSeat != null && (
+        <MoonchildPickModal
+          mcSeat={(state.grimoire.seats || []).find(s => s.seatNum === moonchildPickSeat)}
+          seats={state.grimoire.seats || []}
+          onApply={applyMoonchildPick}
+          onCancel={cancelMoonchildPick}
         />
       )}
 
@@ -8031,7 +8190,8 @@ const NIGHT_ACTIONS = {
   godfather:     { action: 'target1',     reminder: 'Dead',        instruction: 'An Outsider died today — choose a player to die tonight.', phase: 'other' },
   pukka:         { action: 'target1self', reminder: 'Poisoned',    instruction: 'Choose a player. They are poisoned; the previously poisoned player dies.' },
   shabaloth:     { action: 'target2',     reminder: 'Dead',        instruction: 'Choose 2 players — they die. A dead player you chose last night might be regurgitated.', phase: 'other' },
-  po:            { action: 'target1self', reminder: 'Dead',        instruction: 'Choose a player to kill, or 3 players if you chose no one last night.', phase: 'other' },
+  po:            { action: 'po-flex',     reminder: 'Dead',        instruction: 'Choose a player to kill, OR pick none. (Pick no one → next night you must pick 3.)', phase: 'other' },
+  moonchild:     { action: 'target1',     reminder: 'Chose',       instruction: 'You just died — choose any alive player. If they are good, they die.', eligible: 'all' },
   zombuul:       { action: 'target1',     reminder: 'Dead',        instruction: 'If no one died today, choose a player to die tonight.', phase: 'other' },
   innkeeper:     { action: 'target2+st-pick', reminder: 'Safe',     instruction: 'Choose 2 players — they are safe from the Demon tonight, but one becomes drunk.', phase: 'other' },
   gambler:       { action: 'target1+guess', reminder: 'Gambled',    instruction: 'Choose a player and guess their character. If wrong, you die.', phase: 'other' },
@@ -8151,6 +8311,17 @@ function isReminderPermanent(reminder) {
   // Devil's Advocate "Chose" marker tracks previous-night pick so the next
   // night's picker can exclude them. Cleared+replaced when DA picks again.
   if (reminder.charId === 'devilsadvocate' && reminder.daChose) return true;
+  // Exorcist 'Chose' (with exChose flag) tracks previous-night pick so the
+  // picker excludes the same player two nights in a row. Cleared+replaced.
+  if (reminder.charId === 'exorcist' && reminder.exChose) return true;
+  // Po 'Hungry' / '3 to kill' persists until Po next picks 3 players.
+  if (reminder.charId === 'po' && /hungry|3 to kill/i.test(reminder.label || '')) return true;
+  // Moonchild 'Triggered' (just died) persists until ST resolves the pick.
+  if (reminder.charId === 'moonchild' && /trigger/i.test(reminder.label || '')) return true;
+  // Demon 'Exorcised' persists for the night so the demon's wake step
+  // remains dim. Cleared at Go-to-Night (transient by default — see below).
+  // Note: this is intentionally NOT made permanent here; the standard
+  // transient-clearing on advanceToNight removes it automatically.
   // Grandmother — both the 'Grandchild' marker AND the first-night 'Saw: <role>'
   // info marker persist for the whole game. The Grandmother only ever sees her
   // grandchild once (on the first night) so the Saw marker stays placed for
@@ -9488,6 +9659,97 @@ function NightToastStack({ toasts, onDismiss }) {
 // so the ST can decide whether the death actually applies before marking
 // seat.isDead = true. Marking dead means the night phase will skip the seat
 // on subsequent wakes.
+function MoonchildPickModal({ mcSeat, seats, onApply, onCancel }) {
+  const [picked, setPicked] = useState(null);
+  if (!mcSeat) return null;
+  const afflicted = isDrunkOrPoisoned(mcSeat);
+  const alive = (seats || []).filter(s => !s.isDead && s.seatNum !== mcSeat.seatNum);
+  const pickedSeat = picked != null ? (seats || []).find(s => s.seatNum === picked) : null;
+  const pickedTeam = pickedSeat ? (CHAR_BY_ID[pickedSeat.actualRoleId] || {}).team : null;
+  const pickedIsGood = pickedTeam === 'townsfolk' || pickedTeam === 'outsider';
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-950/85 flex items-start sm:items-center justify-center p-2 sm:p-4 overflow-y-auto">
+      <div className="parchment rounded-lg p-4 sm:p-5 max-w-lg w-full space-y-3 my-4 border-2 border-amber-600/70">
+        <div className="flex items-center gap-3">
+          {iconUrl('moonchild') && (
+            <img src={iconUrl('moonchild')} alt=""
+              className="w-12 h-12 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
+          )}
+          <div className="flex-1 min-w-0">
+            <div className="text-[10px] uppercase tracking-wider text-amber-300">Outsider · trigger</div>
+            <div className="text-amber-200 text-lg font-bold leading-tight">Moonchild died — choose their target</div>
+            <div className="text-xs text-stone-400 mt-0.5">
+              seat #{mcSeat.seatNum}{mcSeat.playerName ? ' · ' + mcSeat.playerName : ''}
+            </div>
+          </div>
+        </div>
+        {afflicted && (
+          <div className="rounded-md p-2.5 border-2 border-red-600/70 bg-red-950/40 text-red-100 text-xs">
+            <span className="font-semibold">⚠ Moonchild is drunk/poisoned</span> — ability malfunctions; no one dies from this pick.
+          </div>
+        )}
+        <div className="text-[11px] text-stone-300 leading-snug border-l-2 border-amber-700/50 pl-2">
+          When the Moonchild dies, she publicly chooses 1 alive player. If that player is good, they die.
+        </div>
+        <div>
+          <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">Choose the target</div>
+          <ul className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-72 overflow-y-auto">
+            {alive.map(s => {
+              const isPicked = picked === s.seatNum;
+              const rc = CHAR_BY_ID[s.actualRoleId];
+              const team = rc?.team;
+              const isGood = team === 'townsfolk' || team === 'outsider';
+              return (
+                <li key={s.seatNum}>
+                  <button onClick={() => setPicked(s.seatNum)}
+                    className={`w-full card rounded px-2 py-1.5 flex items-center gap-2 text-left text-sm
+                      ${isPicked ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}`}>
+                    <span className="text-amber-200/80 text-xs w-6 text-center flex-shrink-0">#{s.seatNum}</span>
+                    {iconUrl(s.actualRoleId) && (
+                      <img src={iconUrl(s.actualRoleId)} alt=""
+                        className="w-8 h-8 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                    )}
+                    <div className="flex-1 min-w-0 leading-tight">
+                      <div className="truncate">{s.playerName || <span className="text-stone-500 italic">—</span>}</div>
+                      <div className={`text-[10px] uppercase tracking-wider truncate ${rc ? `team-${rc.team}` : 'text-stone-500'}`}>
+                        {rc?.name || '(no role)'} · {isGood ? 'good' : (team || 'unknown')}
+                      </div>
+                    </div>
+                    {isPicked && <span className="text-amber-300 text-base">✓</span>}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+        {pickedSeat && (
+          <div className={`text-xs p-2 rounded ${pickedIsGood && !afflicted ? 'bg-red-950/40 text-red-100 border border-red-600/70' : 'bg-stone-800/60 text-stone-300 border border-stone-700'}`}>
+            {afflicted
+              ? <>Drunk/poisoned — <span className="font-semibold">no kill</span>.</>
+              : pickedIsGood
+                ? <>Target is good — <span className="font-semibold">they will die</span>.</>
+                : <>Target is evil — <span className="font-semibold">nothing happens</span>.</>}
+          </div>
+        )}
+        <div className="grid grid-cols-2 gap-2 pt-1">
+          <button onClick={onCancel}
+            className="py-2.5 rounded-lg text-sm font-semibold bg-stone-800 hover:bg-stone-700 text-stone-300 border border-stone-700">
+            Cancel
+          </button>
+          <button onClick={() => picked != null && onApply(picked)}
+            disabled={picked == null}
+            className={`py-2.5 rounded-lg text-sm font-bold transition
+              ${picked != null
+                ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40'
+                : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+            Apply →
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function DeathConfirmModal({ seat, seats, causeCharId, onConfirm, onDismiss }) {
   if (!seat) return null;
   const c = CHAR_BY_ID[seat.actualRoleId];
@@ -9867,9 +10129,24 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
         {infoType === 'seat+role' && (() => {
           // Grandmother: pick one seat AND one role. Suggestion = whoever has
           // the Grandchild reminder, plus that seat's actualRoleId.
-          const suggestion = infoSuggestion(step.char.id, targetSeat, seats, suggestionCtx);
-          const sugSeat = suggestion?.value?.askSeat ?? null;
-          const sugRole = suggestion?.value?.roleId ?? null;
+          // Exorcist 'Show Exorcism' synthetic step: suggestion comes from
+          // infoConfig.presetSeat / presetRoleId (pre-determined).
+          const presetSeat = cfg.presetSeat;
+          const presetRoleId = cfg.presetRoleId;
+          const grandmotherSug = (presetSeat == null)
+            ? infoSuggestion(step.char.id, targetSeat, seats, suggestionCtx)
+            : null;
+          const sugSeat = presetSeat != null ? presetSeat : (grandmotherSug?.value?.askSeat ?? null);
+          const sugRole = presetRoleId || (grandmotherSug?.value?.roleId ?? null);
+          const sugBreakdownName = grandmotherSug?.breakdown?.playerName ?? (
+            presetSeat != null ? ((seats || []).find(s => s.seatNum === presetSeat) || {}).playerName : null
+          );
+          const sugBreakdownRoleName = grandmotherSug?.breakdown?.roleName ?? (
+            presetRoleId ? (CHAR_BY_ID[presetRoleId] || {}).name : null
+          );
+          const suggestion = (sugSeat != null || sugRole)
+            ? { value: { askSeat: sugSeat, roleId: sugRole }, breakdown: { playerName: sugBreakdownName, roleName: sugBreakdownRoleName } }
+            : null;
           const acceptSuggestion = () => {
             if (sugSeat != null) setPickedSeats([sugSeat]);
             if (sugRole) setPickedRole(sugRole);
@@ -10490,7 +10767,9 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
   const mySeat = step.seat;
   const isInfo = !!infoPayload;
   const isTwo = step.action === 'target2' || step.action === 'target2+yesno' || step.action === 'target2+number' || step.action === 'target2+st-pick';
-  const need = isTwo ? 2 : 1;
+  const isThree = step.action === 'target3';
+  const isPoFlex = step.action === 'po-flex';
+  const need = isThree ? 3 : (isTwo ? 2 : 1);
   // For canSkip oncePerGame abilities, start with a Use/Skip decision unless
   // the seat already used the ability.
   const defForRole = NIGHT_ACTIONS[step.char.id] || {};
@@ -10506,6 +10785,11 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
     // Devil's Advocate cannot pick the same player two nights in a row.
     if (step.char.id === 'devilsadvocate' &&
         (s.reminders || []).some(r => r && r.charId === 'devilsadvocate' && r.daChose)) {
+      return false;
+    }
+    // Exorcist cannot pick the same player two nights in a row.
+    if (step.char.id === 'exorcist' &&
+        (s.reminders || []).some(r => r && r.charId === 'exorcist' && r.exChose)) {
       return false;
     }
     return true;
@@ -10530,7 +10814,9 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
   const [pickedGuess, setPickedGuess] = useState('');
   const canSubmit = isInfo
     ? true
-    : (isGuess ? (picked.length === 1 && !!pickedGuess) : (picked.length === need));
+    : (isGuess
+        ? (picked.length === 1 && !!pickedGuess)
+        : (isPoFlex ? (picked.length <= 1) : (picked.length === need)));
 
   const doSubmit = () => {
     const v = isInfo ? [] : picked;
@@ -10807,9 +11093,11 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
           <section className="parchment rounded-lg p-3 sm:p-4 space-y-2">
             <div className="flex items-baseline justify-between gap-2">
               <h3 className="text-amber-200 font-semibold text-sm">
-                Choose {isTwo ? '2 players' : '1 player'}
+                {isPoFlex
+                  ? 'Choose 1 player or pick none'
+                  : (isThree ? 'Choose 3 players' : (isTwo ? 'Choose 2 players' : 'Choose 1 player'))}
               </h3>
-              <span className="text-xs text-stone-400">{picked.length} of {need} chosen</span>
+              <span className="text-xs text-stone-400">{picked.length} of {isPoFlex ? '0–1' : need} chosen</span>
             </div>
             <ul className="grid grid-cols-2 gap-1.5">
               {eligibleSeats.map(s => {
@@ -11007,6 +11295,43 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
         }
       }
     }
+    // Po: action flips between po-flex (default) and target3 when she has
+    // 'Hungry' reminder from a previous-night skip.
+    if (id === 'po') {
+      const poSeat = matched[0];
+      const hungry = !!(poSeat?.reminders || []).some(r =>
+        r && r.charId === 'po' && /hungry|3 to kill/i.test(String(r.label || '')));
+      if (hungry) {
+        def = { ...def, action: 'target3', instruction: 'You chose no one last night — you must choose 3 players to kill tonight.' };
+        effectiveAction = 'target3';
+      }
+    }
+    // Moonchild: only emit an active step on a night she has 'Triggered'
+    // (set when she just died via demon kill OR via execution). Otherwise
+    // dim — her ability only fires on the night of her death.
+    if (id === 'moonchild') {
+      const mcSeat = matched[0];
+      const triggered = !!(mcSeat?.reminders || []).some(r =>
+        r && r.charId === 'moonchild' && /trigger/i.test(String(r.label || '')));
+      if (!triggered) {
+        def = { ...def, action: 'passive', instruction: 'Moonchild has not died yet — does not wake.' };
+        effectiveAction = 'passive';
+      } else {
+        // Use the configured target1 action.
+        effectiveAction = def.action;
+      }
+    }
+    // Demon dim when exorcised: any demon seat carrying an 'Exorcised'
+    // reminder (placed by Exorcist) does not wake tonight.
+    if (CHAR_BY_ID[id]?.team === 'demon') {
+      const dSeat = matched[0];
+      const exorcised = !!(dSeat?.reminders || []).some(r =>
+        r && r.charId === 'exorcist' && /exorcised/i.test(String(r.label || '')));
+      if (exorcised) {
+        def = { ...def, action: 'passive', instruction: 'Exorcised by the Exorcist tonight — does not wake.' };
+        effectiveAction = 'passive';
+      }
+    }
     if (matched.length === 0 && isExtra) {
       // No-seat assignment (Lil' Monsta).
       stepNum += 1;
@@ -11024,6 +11349,38 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                      requiresDeath: def.requiresDeath, oncePerGame: def.oncePerGame, canSkip: def.canSkip,
                      infoType: def.infoType, infoConfig: def.infoConfig,
                      prompt });
+      }
+    }
+    // Synthetic 'Show Exorcism' step — emitted right after Exorcist's slot
+    // when she picked a Demon tonight. The Demon learns who exorcised them.
+    if (id === 'exorcist') {
+      const exoSeat = (seats || []).find(s => s.actualRoleId === 'exorcist');
+      const exorcisedDemon = (seats || []).find(s =>
+        (CHAR_BY_ID[s.actualRoleId] || {}).team === 'demon' &&
+        (s.reminders || []).some(r => r && r.charId === 'exorcist' && /exorcised/i.test(String(r.label || ''))));
+      if (exoSeat && exorcisedDemon) {
+        const exorcistChar = CHAR_BY_ID['exorcist'] || { id: 'exorcist', name: 'Exorcist', team: 'townsfolk' };
+        stepNum += 1;
+        const synthCharId = '_exorcist-show';
+        const synthChar = { id: synthCharId, name: 'Show Exorcism to Demon', team: 'townsfolk', ability: `Tell the Demon (seat #${exorcisedDemon.seatNum}) that the Exorcist (seat #${exoSeat.seatNum}) chose them. They do not wake tonight.` };
+        const prompt = nightPrompts[exorcisedDemon.seatNum];
+        steps.push({
+          type: 'char',
+          stepNum,
+          char: synthChar,
+          seat: exorcisedDemon,
+          reminder: '',
+          isExtra: false,
+          action: 'info-st',
+          instruction: `Show the Demon (#${exorcisedDemon.seatNum}${exorcisedDemon.playerName ? ' · ' + exorcisedDemon.playerName : ''}) the Exorcist token and point to the Exorcist (#${exoSeat.seatNum}${exoSeat.playerName ? ' · ' + exoSeat.playerName : ''}). The Demon does not wake tonight.`,
+          reminderLabel: '',
+          requiresDeath: false,
+          oncePerGame: false,
+          canSkip: false,
+          infoType: 'seat+role',
+          infoConfig: { suggestion: 'exorcist-show', presetSeat: exoSeat.seatNum, presetRoleId: 'exorcist' },
+          prompt,
+        });
       }
     }
   }

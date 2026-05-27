@@ -1431,7 +1431,9 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
     );
   }
   const isTwo = prompt.action === 'target2' || prompt.action === 'target2+yesno' || prompt.action === 'target2+number' || prompt.action === 'target2+st-pick';
-  const need = isTwo ? 2 : 1;
+  const isThree = prompt.action === 'target3';
+  const isPoFlex = prompt.action === 'po-flex';
+  const need = isThree ? 3 : (isTwo ? 2 : 1);
   // Filter eligible seats based on the action's eligibility rules.
   const eligibleSeats = (seats || []).filter(s => {
     if (!s) return false;
@@ -1443,6 +1445,11 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
     // Devil's Advocate cannot pick the same player two nights in a row.
     if (prompt.roleId === 'devilsadvocate' &&
         (s.reminders || []).some(r => r && r.charId === 'devilsadvocate' && r.daChose)) {
+      return false;
+    }
+    // Exorcist cannot pick the same player two nights in a row.
+    if (prompt.roleId === 'exorcist' &&
+        (s.reminders || []).some(r => r && r.charId === 'exorcist' && r.exChose)) {
       return false;
     }
     return true;
@@ -1461,7 +1468,7 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
   };
   const canSubmit = isGuess
     ? (picked.length === 1 && !!pickedGuess)
-    : (picked.length === need);
+    : (isPoFlex ? (picked.length <= 1) : (picked.length === need));
   const c = CHAR_BY_ID[prompt.roleId];
   const isQuestion = prompt.status === 'question';
 
@@ -1507,10 +1514,12 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
       <section className="parchment rounded-lg p-3 sm:p-4 space-y-2">
         <div className="flex items-baseline justify-between gap-2">
           <h3 className="text-amber-200 font-semibold text-sm">
-            Choose {isTwo ? '2 players' : '1 player'}
+            {isPoFlex
+              ? 'Choose 1 player or pick none'
+              : (isThree ? 'Choose 3 players' : (isTwo ? 'Choose 2 players' : 'Choose 1 player'))}
           </h3>
           <span className="text-xs text-stone-400">
-            {picked.length} of {need} chosen
+            {picked.length} of {isPoFlex ? '0–1' : need} chosen
           </span>
         </div>
         <ul className="grid grid-cols-2 gap-1.5">
@@ -1721,8 +1730,4 @@ function GrimoireSnapshotOverlay({ grimoire, onAccept }) {
 }
 
 // ---------------- Mount ----------------
-const root = ReactDOM.createRoot(document.getElementById('root'));
-root.render(<App />);
-</script>
-</body>
-</html>
+const root = Rea
