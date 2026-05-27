@@ -1641,6 +1641,16 @@ function App() {
               placeOn(seatNum, 'No ability');
             }
           }
+          // Godfather: after they act, remove the "Died Today" trigger.
+          if (p.roleId === 'godfather') {
+            const seatsBase = next.__seatsCopy || state.grimoire.seats;
+            const seatsCopy = seatsBase.map(s =>
+              s.seatNum === seatNum
+                ? { ...s, reminders: (s.reminders || []).filter(r => !(r && r.charId === 'godfather' && /died today/i.test(String(r.label || '')))) }
+                : s
+            );
+            next.__seatsCopy = seatsCopy;
+          }
         }
         next[seatStr] = { ...p, status: 'done', doneAt: Date.now() };
         dirty = true;
@@ -1840,10 +1850,20 @@ function App() {
         demonBluffs: [...(g.demonBluffs || [])],
         townSquareNotes: { ...(g.townSquareNotes || { above: '', below: '' }) },
       };
+      // Filter transient reminders, then bump Courtier "Drunk N" labels:
+      //   Drunk 1 → Drunk 2, Drunk 2 → Drunk 3, Drunk 3 → removed.
       const filterReminders = (rs) => (rs || []).filter(isReminderPermanent);
+      const bumpCourtier = (rs) => (rs || []).map(r => {
+        if (!r || r.charId !== 'courtier') return r;
+        const m = String(r.label || '').match(/^drunk\s*(\d+)?$/i);
+        if (!m) return r;
+        const n = m[1] ? parseInt(m[1], 10) : 1;
+        if (n >= 3) return null;     // remove on what would be the 4th night
+        return { ...r, label: `Drunk ${n + 1}` };
+      }).filter(Boolean);
       const seatsForNewNight = (g.seats || []).map(seat => ({
         ...seat,
-        reminders: filterReminders(seat.reminders),
+        reminders: bumpCourtier(filterReminders(seat.reminders)),
       }));
       const travellersForNewNight = (g.travellers || []).map(t => ({
         ...t,
@@ -1885,21 +1905,25 @@ function App() {
     if (!onBlock) { proceed(); return; }
     const blockSeat = (g.seats || []).find(s => s.seatNum === onBlock.nomineeSeat);
     if (!blockSeat || blockSeat.isDead) { proceed(); return; }
+    // Devil's Advocate protection check.
+    const daProtection = (blockSeat.reminders || []).some(r => r && r.charId === 'devilsadvocate' && /safe from execution/i.test(String(r.label || '')));
+    const daSeat = (g.seats || []).find(s => s.actualRoleId === 'devilsadvocate');
+    const daAfflicted = daSeat ? isDrunkOrPoisoned(daSeat) : false;
+    const blockLabel = blockSeat.playerName ? blockSeat.playerName + ' (seat #' + blockSeat.seatNum + ')' : 'Seat #' + blockSeat.seatNum;
+    const body = daProtection
+      ? `${blockLabel} is on the chopping block with ${onBlock.votes} votes — BUT they are protected from execution by the Devil's Advocate${daSeat ? ' (' + (daSeat.playerName || 'seat #' + daSeat.seatNum) + ')' : ''}.${daAfflicted ? ' Note: DA is drunk/poisoned — ability may not apply.' : ''} Execute anyway?`
+      : `${blockLabel} is on the chopping block with ${onBlock.votes} votes. Execute them and advance?`;
     addCornerPrompt({
       kind: 'warn',
-      title: 'Execute before night?',
-      body: `${blockSeat.playerName ? blockSeat.playerName + ' (seat #' + blockSeat.seatNum + ')' : 'Seat #' + blockSeat.seatNum} is on the chopping block with ${onBlock.votes} votes. Execute them and advance?`,
+      title: daProtection ? 'Execute (DA-protected)?' : 'Execute before night?',
+      body,
       actions: [
-        { label: 'Execute & advance', primary: true, onClick: () => {
+        { label: daProtection ? 'Execute anyway' : 'Execute & advance', primary: true, onClick: () => {
           _executePlayer(onBlock.nomineeSeat);
-          // Record the execution so the Undertaker's night-suggest works.
-          // dayIdx here is the live day index — the day on which the execution
-          // happened. The Undertaker on the next night reads this via
-          // computeUndertakerSuggestion(ctx).
           update(s => ({ grimoire: { ...s.grimoire, lastExecution: { seatNum: onBlock.nomineeSeat, dayIdx } } }));
           advanceToNight();
         }},
-        { label: 'Skip execution', onClick: () => advanceToNight() },
+        { label: daProtection ? 'Skip — DA protects' : 'Skip execution', onClick: () => advanceToNight() },
       ],
     });
   };
@@ -2132,12 +2156,26 @@ function App() {
   };
 
   // _executePlayer — marks a seat dead WITHOUT placing a reminder (regular
-  // town execution at end of day). Atomic functional update.
+  // town execution at end of day). Atomic functional update. Also fires the
+  // Godfather trigger: if the executed seat is an Outsider and the Godfather
+  // is alive, place a "Died Today" reminder on the Godfather so their row
+  // un-dims for tonight.
   const _executePlayer = (seatNum) => {
     update(s => {
-      const seats = (s.grimoire.seats || []).map(seat =>
+      const seats0 = (s.grimoire.seats || []).map(seat =>
         seat.seatNum === seatNum ? { ...seat, isDead: true } : seat
       );
+      const executed = seats0.find(seat => seat.seatNum === seatNum);
+      const wasOutsider = executed && CHAR_BY_ID[executed.actualRoleId]?.team === 'outsider';
+      let seats = seats0;
+      if (wasOutsider) {
+        seats = seats0.map(seat => {
+          if (seat.actualRoleId !== 'godfather' || seat.isDead) return seat;
+          const has = (seat.reminders || []).some(r => r && r.charId === 'godfather' && /died today/i.test(String(r.label || '')));
+          if (has) return seat;
+          return { ...seat, reminders: [...(seat.reminders || []), { charId: 'godfather', label: 'Died Today' }] };
+        });
+      }
       return { grimoire: { ...s.grimoire, seats } };
     });
   };
@@ -7768,8 +7806,10 @@ const NIGHT_ACTIONS = {
   innkeeper:     { action: 'target2',     reminder: 'Safe',        instruction: 'Choose 2 players — they are safe from the Demon tonight, but one becomes drunk.', phase: 'other' },
   gambler:       { action: 'target1self', reminder: 'Gambled',     instruction: 'Choose a player and guess their character. If wrong, you die.', phase: 'other' },
   exorcist:      { action: 'target1',     reminder: 'Chose',       instruction: 'Choose a player (not the same as last night) — the Demon does not wake tonight.', eligible: 'others', phase: 'other' },
-  courtier:      { action: 'target1',     reminder: 'Drunk',       instruction: 'Once per game, choose a player: they are drunk for 3 nights & 3 days.',
+  courtier:      { action: 'target1',     reminder: 'Drunk 1',     instruction: 'Once per game, choose a player: they are drunk for 3 nights & 3 days.',
                    oncePerGame: true, canSkip: true },
+  devilsadvocate:{ action: 'target1',     reminder: 'Safe from execution', instruction: 'Choose a living Minion (different from last night): they are safe from execution today.',
+                   eligible: 'others' },
   assassin:      { action: 'target1any',  reminder: 'Dead',        instruction: 'Once per game, at night, choose a player: they die, even if for some reason they could not.', phase: 'other',
                    oncePerGame: true, canSkip: true },
   professor:     { action: 'target1',     reminder: 'Used',        instruction: 'Once per game at night, choose a dead player — if they are a Townsfolk, they are resurrected.', phase: 'other' },
@@ -7872,8 +7912,12 @@ function isReminderPermanent(reminder) {
   if (reminder.scarletWomanOriginal) return true;
   if (PERMANENT_REMINDER_LABELS.has(reminder.label)) return true;
   if (PERMANENT_REMINDER_CHARS.has(reminder.charId)) return true;
-  // Courtier countdown — 3-night "Drunk" persists.
-  if (reminder.charId === 'courtier' && reminder.label === 'Drunk') return true;
+  // Courtier countdown — 3-night "Drunk 1/2/3" persists; advanceToNight
+  // increments and removes.
+  if (reminder.charId === 'courtier' && /^drunk\s*\d*$/i.test(reminder.label || '')) return true;
+  // Godfather "Died Today" persists into the night so the Godfather can
+  // wake and use the trigger. After they act, it's cleared programmatically.
+  if (reminder.charId === 'godfather' && /died today/i.test(reminder.label || '')) return true;
   return false;
 }
 
@@ -9166,6 +9210,8 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
     canSend = pickedYes === true || pickedYes === false;
   } else if (infoType === 'seat+role-pair') {
     canSend = pickedSeats.length === 1 && !!pickedRole && !!pickedFalseRole && pickedRole !== pickedFalseRole;
+  } else if (infoType === 'role-list') {
+    canSend = (pickedRole || '').split(',').filter(Boolean).length > 0;
   }
 
   const buildPayload = () => {
@@ -9181,6 +9227,9 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
       const roles = [pickedRole, pickedFalseRole];
       if (Math.random() < 0.5) roles.reverse();
       return { type: 'seat+role-pair', askSeat: pickedSeats[0], roles };
+    }
+    if (infoType === 'role-list') {
+      return { type: 'role-list', roleIds: (pickedRole || '').split(',').filter(Boolean) };
     }
     return null;
   };
@@ -9304,6 +9353,68 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
             )}
           </>
         )}
+
+        {infoType === 'role-list' && (() => {
+          // Auto-suggest: list of all in-play role IDs matching the team.
+          const teamFilter = (cfg.roleTeam || 'outsider');
+          const inPlay = (seats || [])
+            .map(s => s.actualRoleId)
+            .filter(id => id && CHAR_BY_ID[id]?.team === teamFilter);
+          const inPlaySet = new Set(inPlay);
+          // pickedRoles is stored as a comma-separated string in pickedRole
+          // to reuse the existing single-string state; for role-list we
+          // parse/format as a list.
+          const selected = (pickedRole || '').split(',').filter(Boolean);
+          const selectedSet = new Set(selected);
+          const toggleRoleInList = (rid) => {
+            const next = new Set(selectedSet);
+            if (next.has(rid)) next.delete(rid); else next.add(rid);
+            setPickedRole([...next].join(','));
+          };
+          const autoPick = () => setPickedRole(inPlay.join(','));
+          return (
+            <div>
+              <div className="flex items-baseline justify-between gap-2 mb-1.5">
+                <div className="text-xs uppercase tracking-wider text-amber-300">
+                  Pick the {teamFilter}{teamFilter.endsWith('s') ? '' : 's'} to reveal
+                </div>
+                {inPlay.length > 0 && (
+                  <button onClick={autoPick}
+                    className={`text-[11px] px-2 py-1 rounded transition
+                      ${selected.length === inPlay.length && inPlay.every(id => selectedSet.has(id))
+                        ? 'bg-emerald-700/60 text-emerald-100 border border-emerald-600'
+                        : 'pill hover:border-emerald-500 hover:text-emerald-200 text-emerald-300'}`}>
+                    Suggested: <span className="font-bold">in-play {teamFilter}s</span> ({inPlay.length})
+                  </button>
+                )}
+              </div>
+              <ul className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-72 overflow-y-auto">
+                {candidateRoles.filter(rc => rc.team === teamFilter).map(rc => {
+                  const isPicked = selectedSet.has(rc.id);
+                  const isSuggested = inPlaySet.has(rc.id);
+                  return (
+                    <li key={rc.id}>
+                      <button onClick={() => toggleRoleInList(rc.id)}
+                        className={`w-full card rounded px-2 py-1.5 flex items-center gap-2 text-left text-sm
+                          ${isPicked
+                            ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700'
+                            : isSuggested
+                              ? 'border-emerald-600/70 hover:border-emerald-500'
+                              : 'hover:border-amber-500'}`}>
+                        {iconUrl(rc.id) && <img src={iconUrl(rc.id)} alt="" className="w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0" />}
+                        <span className={`flex-1 min-w-0 truncate team-${rc.team}`}>{rc.name}</span>
+                        {isPicked && <span className="text-amber-300 text-base leading-none">✓</span>}
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+              <div className="mt-2 text-[10px] text-stone-500">
+                Selected: {selected.length === 0 ? '(none)' : selected.map(id => CHAR_BY_ID[id]?.name || id).join(', ')}
+              </div>
+            </div>
+          );
+        })()}
 
         {infoType === 'role' && (() => {
           const suggestion = infoSuggestion(step.char.id, targetSeat, seats, suggestionCtx);
@@ -10175,9 +10286,37 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
     const isExtra = extraSet.has(id);
     if (matched.length === 0 && !isExtra) continue;
     const reminder = (isFirstNight ? c.firstNightReminder : c.otherNightReminder) || '';
-    const def = nightActionFor(id);
-    const phaseOk = def.phase === 'both' || (def.phase === 'first' && isFirstNight) || (def.phase === 'other' && !isFirstNight);
-    const effectiveAction = phaseOk ? def.action : 'manual';
+    let def = nightActionFor(id);
+    let phaseOk = def.phase === 'both' || (def.phase === 'first' && isFirstNight) || (def.phase === 'other' && !isFirstNight);
+    let effectiveAction = phaseOk ? def.action : 'manual';
+    // Godfather is special: first night = info-st showing in-play Outsiders;
+    // other nights = target1 (kill someone) ONLY when Died Today is on their
+    // seat (set by _executePlayer when an Outsider is executed). Otherwise
+    // passive (dim, no Start button).
+    if (id === 'godfather') {
+      if (isFirstNight) {
+        def = {
+          ...def,
+          action: 'info-st',
+          instruction: 'You start knowing which Outsiders are in play.',
+          reminder: '',
+          infoType: 'role-list',
+          infoConfig: { roleTeam: 'outsider' },
+        };
+        effectiveAction = 'info-st';
+      } else {
+        const gfSeat = matched[0];
+        const hasDiedToday = !!(gfSeat?.reminders || []).some(r => r && r.charId === 'godfather' && /died today/i.test(String(r.label || '')));
+        if (hasDiedToday) {
+          // Default Godfather entry already has action: 'target1', reminder: 'Dead'.
+          // Use it as-is.
+          effectiveAction = def.action;
+        } else {
+          def = { ...def, action: 'passive', instruction: 'No Outsider died today — Godfather does not wake.' };
+          effectiveAction = 'passive';
+        }
+      }
+    }
     if (matched.length === 0 && isExtra) {
       // No-seat assignment (Lil' Monsta).
       stepNum += 1;
