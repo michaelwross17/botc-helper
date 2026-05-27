@@ -384,7 +384,7 @@ function App() {
             // 'awaiting-st-response' so the ST can pick the info to return.
             // For info acks (Got it on an info display) the prompt already has
             // an infoPayload — those go straight to 'submitted'.
-            const isTwoStep = (curr.action === 'target2+yesno' || curr.action === 'target1+role') && !curr.infoPayload;
+            const isTwoStep = (curr.action === 'target2+yesno' || curr.action === 'target1+role' || curr.action === 'target2+number') && !curr.infoPayload;
             const newStatus = isTwoStep ? 'awaiting-st-response' : 'submitted';
             // Preserve existing targets when info-acking with an empty array,
             // so the ST effect can still place the per-target reminders.
@@ -1429,7 +1429,7 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
       </ScreenShell>
     );
   }
-  const isTwo = prompt.action === 'target2' || prompt.action === 'target2+yesno';
+  const isTwo = prompt.action === 'target2' || prompt.action === 'target2+yesno' || prompt.action === 'target2+number';
   const need = isTwo ? 2 : 1;
   // Filter eligible seats based on the action's eligibility rules.
   const eligibleSeats = (seats || []).filter(s => {

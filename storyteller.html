@@ -1695,9 +1695,51 @@ function App() {
           } else if (info.type === 'yesno') {
             placeOn(seatNum, info.yes ? 'YES' : 'NO');
           } else if (info.type === 'seat+role') {
-            // Grandmother — a 'Saw' marker on her own seat confirms she's
-            // been shown her Grandchild and their character.
-            placeOn(seatNum, p.reminderLabel || 'Saw');
+            // Grandmother — the 'Saw: <role>' marker goes on the SHOWN seat
+            // (info.askSeat), which may differ from the true Grandchild if
+            // the Grandmother is drunk/poisoned and the ST gave false info.
+            // The label includes the revealed role name so the ST can later
+            // see exactly what was shown to the Grandmother.
+            if (info.askSeat != null) {
+              const shownRoleName = (CHAR_BY_ID[info.roleId] || {}).name || info.roleId || '';
+              const label = shownRoleName ? `Saw: ${shownRoleName}` : (p.reminderLabel || 'Saw');
+              placeOn(info.askSeat, label);
+            }
+          }
+          // Two-step picker actions (target2+yesno, target2+number,
+          // target1+role) only land on 'submitted' AFTER the ST has responded
+          // and the player has acked the info — by then isInfo is true so the
+          // target-action branch above is skipped. Place the target reminders
+          // here so two-step roles (Chambermaid, etc.) still get their per-
+          // target markers in the grimoire.
+          const defForTwoStep = NIGHT_ACTIONS[p.roleId] || {};
+          const twoStepActions = new Set(['target2+yesno', 'target2+number', 'target1+role']);
+          const tgtList = Array.isArray(p.targets)
+            ? p.targets
+            : (p.targets && typeof p.targets === 'object'
+                ? Object.keys(p.targets).sort((a, b) => Number(a) - Number(b)).map(k => p.targets[k])
+                : []);
+          if (twoStepActions.has(p.action) && tgtList.length > 0) {
+            const perTarget = Array.isArray(defForTwoStep.reminderPerTarget)
+              ? defForTwoStep.reminderPerTarget
+              : null;
+            const baseLabel = defForTwoStep.reminder || p.reminderLabel || 'Chose';
+            for (let i = 0; i < tgtList.length; i++) {
+              const tnum = tgtList[i];
+              const label = perTarget ? (perTarget[i] || perTarget[perTarget.length - 1]) : baseLabel;
+              const baseSeats = next.__seatsCopy || state.grimoire.seats;
+              const tseat = baseSeats.find(s => s.seatNum === tnum);
+              if (!tseat) continue;
+              const already = (tseat.reminders || []).some(r =>
+                r && r.charId === p.roleId && r.label === label && r.fromPrompt);
+              if (already) continue;
+              const seatsCopy = baseSeats.map(s =>
+                s.seatNum === tnum
+                  ? { ...s, reminders: [...(s.reminders || []), { charId: p.roleId, label, fromPrompt: true }] }
+                  : s
+              );
+              next.__seatsCopy = seatsCopy;
+            }
           }
           // oncePerGame roles (Ravenkeeper) also place a permanent
           // "No ability" reminder on their own seat so the night-phase row
@@ -7870,7 +7912,8 @@ const NIGHT_ACTIONS = {
                    infoType: 'number',     infoConfig: { min: 0, max: 6, label: 'evil pairs', display: 'You learn there are' } },
   empath:        { action: 'info-st',     reminder: 'Empath #',    instruction: 'You learn how many of your 2 alive neighbours are evil.',
                    infoType: 'number',     infoConfig: { min: 0, max: 2, label: 'evil neighbours', display: 'You sense' } },
-  chambermaid:   { action: 'target2+number', reminder: 'Chose',    instruction: 'Choose 2 alive players (not yourself): you learn how many of them woke tonight due to their ability.', eligible: 'others',
+  chambermaid:   { action: 'target2+number', reminder: 'Chose',    reminderPerTarget: ['Chose 1', 'Chose 2'],
+                   instruction: 'Choose 2 alive players (not yourself): you learn how many of them woke tonight due to their ability.', eligible: 'others',
                    responseConfig: { min: 0, max: 2, label: 'players woke', display: 'Players who woke tonight' } },
   grandmother:   { action: 'info-st',     reminder: 'Saw',         instruction: 'Show the Grandmother her Grandchild and their character.', phase: 'first',
                    infoType: 'seat+role',  infoConfig: { suggestion: 'grandchild' } },
@@ -8254,18 +8297,20 @@ function computeGrandmotherSuggestion(seats) {
   };
 }
 
-// Chambermaid suggestion: count how many of the 2 chosen seats have an actual
-// role that wakes tonight (i.e. NIGHT_ACTIONS entry with a real action and a
-// phase that matches the current night).
+// Chambermaid suggestion: count how many of the 2 chosen seats wake tonight
+// per the real night-order data (firstNight vs otherNight lists). We check
+// perceivedRoleId so Drunk-as-X / Marionette-as-X count when the player
+// THINKS they have an ability (the engine wakes them based on perceived).
+// Falls back to actualRoleId when perceived is missing.
 function computeChambermaidSuggestion(targetSeats, isFirstNight) {
   if (!Array.isArray(targetSeats) || targetSeats.length === 0) return null;
+  const nightOrder = window.BOTC_DATA?.nightOrder || { firstNight: [], otherNight: [] };
+  const orderList = isFirstNight ? (nightOrder.firstNight || []) : (nightOrder.otherNight || []);
+  const wakeSet = new Set(orderList);
   const wakeable = (seat) => {
-    const def = NIGHT_ACTIONS[seat?.actualRoleId];
-    if (!def) return false;
-    if (!def.action || def.action === 'manual' || def.action === 'passive') return false;
-    if (def.phase === 'first' && !isFirstNight) return false;
-    if (def.phase === 'other' && isFirstNight) return false;
-    return true;
+    const id = seat?.perceivedRoleId || seat?.actualRoleId;
+    if (!id) return false;
+    return wakeSet.has(id);
   };
   const woke = targetSeats.filter(wakeable);
   return {
@@ -10183,7 +10228,7 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }
   const c = CHAR_BY_ID[step.char.id];
   const mySeat = step.seat;
   const isInfo = !!infoPayload;
-  const isTwo = step.action === 'target2' || step.action === 'target2+yesno';
+  const isTwo = step.action === 'target2' || step.action === 'target2+yesno' || step.action === 'target2+number';
   const need = isTwo ? 2 : 1;
   // For canSkip oncePerGame abilities, start with a Use/Skip decision unless
   // the seat already used the ability.
