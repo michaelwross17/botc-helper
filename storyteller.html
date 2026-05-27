@@ -1259,20 +1259,30 @@ function App() {
   // reminder, transitions the prompt to 'done', and pushes a toast.
   const startNightPrompt = (seatNum, step, infoPayload) => {
     if (!seatNum) return;
-    const np = { ...(state.grimoire.nightPrompts || {}) };
-    np[seatNum] = {
-      roleId:        step.char.id,
-      action:        step.action,
-      instruction:   step.instruction || '',
-      reminderLabel: step.reminderLabel || '',
-      eligible:      (NIGHT_ACTIONS[step.char.id] && NIGHT_ACTIONS[step.char.id].eligible) || 'all',
-      status:        'awaiting',
-      targets:       null,
-      infoPayload:   infoPayload || null,
-      startedAt:     Date.now(),
-      nightIdx:      (state.grimoire.viewingDayIndex || 0),
-    };
-    update({ grimoire: { ...state.grimoire, nightPrompts: np } });
+    const defForRole = NIGHT_ACTIONS[step.char.id] || {};
+    // For canSkip oncePerGame abilities (Courtier, Assassin, Philosopher…),
+    // ask the player Use/Skip first instead of going straight to the picker.
+    // Info-st prompts (Washerwoman etc.) and prompts that already have an
+    // infoPayload (the ST has chosen info to deliver) skip this step.
+    const seatNow = (state.grimoire.seats || []).find(s => s.seatNum === seatNum);
+    const alreadyUsed = (seatNow?.reminders || []).some(r => r && /no ability/i.test(String(r.label || '')));
+    const useDecision = !!defForRole.canSkip && !infoPayload && !alreadyUsed;
+    update(s => {
+      const np = { ...(s.grimoire.nightPrompts || {}) };
+      np[seatNum] = {
+        roleId:        step.char.id,
+        action:        step.action,
+        instruction:   step.instruction || '',
+        reminderLabel: step.reminderLabel || '',
+        eligible:      defForRole.eligible || 'all',
+        status:        useDecision ? 'use-decision' : 'awaiting',
+        targets:       null,
+        infoPayload:   infoPayload || null,
+        startedAt:     Date.now(),
+        nightIdx:      (s.grimoire.viewingDayIndex || 0),
+      };
+      return { grimoire: { ...s.grimoire, nightPrompts: np } };
+    });
   };
   const cancelNightPrompt = (seatNum) => {
     if (!seatNum) return;
@@ -1349,7 +1359,12 @@ function App() {
     // Subsequent submission (info ack with infoPayload set) transitions to
     // 'submitted' so the existing effect places the 'Chose' reminders.
     const isPickerSubmitForTwoStep = (step.action === 'target2+yesno' || step.action === 'target1+role') && !infoPayload;
-    const newStatus = isPickerSubmitForTwoStep ? 'awaiting-st-response' : 'submitted';
+    // `skipped` is passed by the local overlay when the player chose Skip on a
+    // use/skip prompt. Sets status='declined' so the existing effect emits the
+    // "saved for later" toast and the No ability marker is NOT placed.
+    const newStatus = (targets && targets.__skipped)
+      ? 'declined'
+      : (isPickerSubmitForTwoStep ? 'awaiting-st-response' : 'submitted');
     // Preserve existing targets when caller didn't supply new ones (info ack).
     const newTargets = (Array.isArray(targets) && targets.length > 0)
       ? targets
@@ -1679,6 +1694,17 @@ function App() {
           seatNum,
           kind: 'question',
           text: `⚠ ${charName} (seat #${seatNum}${seat?.playerName ? ' · ' + seat.playerName : ''}) has a question — pull them aside.`,
+        });
+      } else if (p.status === 'declined') {
+        next[seatStr] = { ...p, status: 'done', declined: true, doneAt: Date.now() };
+        dirty = true;
+        const charName = (CHAR_BY_ID[p.roleId] || {}).name || p.roleId;
+        const seat = state.grimoire.seats.find(s => s.seatNum === seatNum);
+        newToasts.push({
+          id: `${seatNum}-skip-${p.startedAt || Date.now()}`,
+          seatNum,
+          kind: 'submitted',
+          text: `${charName} (seat #${seatNum}${seat?.playerName ? ' · ' + seat.playerName : ''}) chose NOT to use their ability tonight. (Ability saved for later.)`,
         });
       }
     }
@@ -7742,7 +7768,10 @@ const NIGHT_ACTIONS = {
   innkeeper:     { action: 'target2',     reminder: 'Safe',        instruction: 'Choose 2 players — they are safe from the Demon tonight, but one becomes drunk.', phase: 'other' },
   gambler:       { action: 'target1self', reminder: 'Gambled',     instruction: 'Choose a player and guess their character. If wrong, you die.', phase: 'other' },
   exorcist:      { action: 'target1',     reminder: 'Chose',       instruction: 'Choose a player (not the same as last night) — the Demon does not wake tonight.', eligible: 'others', phase: 'other' },
-  courtier:      { action: 'target1',     reminder: 'Drunk',       instruction: 'Choose a player. If they are the Demon, they are drunk for 3 nights and 3 days.' },
+  courtier:      { action: 'target1',     reminder: 'Drunk',       instruction: 'Once per game, choose a player: they are drunk for 3 nights & 3 days.',
+                   oncePerGame: true, canSkip: true },
+  assassin:      { action: 'target1any',  reminder: 'Dead',        instruction: 'Once per game, at night, choose a player: they die, even if for some reason they could not.', phase: 'other',
+                   oncePerGame: true, canSkip: true },
   professor:     { action: 'target1',     reminder: 'Used',        instruction: 'Once per game at night, choose a dead player — if they are a Townsfolk, they are resurrected.', phase: 'other' },
 
   // ===== Sects & Violets =====
@@ -7778,6 +7807,7 @@ function nightActionFor(roleId) {
     phase: def.phase || 'both',
     requiresDeath: !!def.requiresDeath,
     oncePerGame:   !!def.oncePerGame,
+    canSkip:       !!def.canSkip,
   };
 }
 
@@ -8191,7 +8221,11 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
   };
 
   let statusBadge = null;
-  if (prompt?.status === 'awaiting') {
+  if (prompt?.status === 'use-decision') {
+    statusBadge = <span className="text-[10px] uppercase text-amber-300 font-semibold">⌛ player choosing use/skip</span>;
+  } else if (prompt?.status === 'declined') {
+    statusBadge = <span className="text-[10px] uppercase text-stone-400 font-semibold">✕ skipped (saved for later)</span>;
+  } else if (prompt?.status === 'awaiting') {
     statusBadge = <span className="text-[10px] uppercase text-amber-300 font-semibold">⌛ awaiting player</span>;
   } else if (prompt?.status === 'submitted') {
     statusBadge = <span className="text-[10px] uppercase text-emerald-300 font-semibold">✓ submitted</span>;
@@ -8214,6 +8248,26 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
             className={`text-xs px-3 py-1 rounded pill hover:border-amber-500 hover:text-amber-200 ${prompt?.status === 'done' ? 'opacity-50' : ''}`}>
             {prompt?.status === 'done' ? '✓ Done' : 'Mark done'}
           </button>
+        ) : prompt?.status === 'use-decision' ? (
+          <>
+            <span className="text-xs text-amber-300 font-medium">Player deciding use/skip…</span>
+            <button onClick={onCancel}
+              className="text-xs px-2.5 py-1 rounded pill hover:border-red-500 hover:text-red-300 text-stone-400">
+              Cancel
+            </button>
+          </>
+        ) : prompt?.status === 'declined' ? (
+          <>
+            <span className="text-xs text-stone-400 font-medium">Saved for later</span>
+            <button onClick={onCancel}
+              className="text-xs px-2.5 py-1 rounded pill hover:border-stone-400 hover:text-stone-200">
+              Clear
+            </button>
+            <button onClick={onStart}
+              className="text-xs px-2.5 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
+              Re-prompt
+            </button>
+          </>
         ) : prompt?.status === 'awaiting' ? (
           <>
             <span className="text-xs text-amber-300 font-medium">Sent to player\'s phone…</span>
@@ -9722,6 +9776,11 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }
   const isInfo = !!infoPayload;
   const isTwo = step.action === 'target2' || step.action === 'target2+yesno';
   const need = isTwo ? 2 : 1;
+  // For canSkip oncePerGame abilities, start with a Use/Skip decision unless
+  // the seat already used the ability.
+  const defForRole = NIGHT_ACTIONS[step.char.id] || {};
+  const alreadyUsed = (mySeat.reminders || []).some(r => r && /no ability/i.test(String(r.label || '')));
+  const needsUseDecision = !!defForRole.canSkip && !isInfo && !alreadyUsed;
   const eligible = (NIGHT_ACTIONS[step.char.id] && NIGHT_ACTIONS[step.char.id].eligible) || 'all';
   const eligibleSeats = (seats || []).filter(s => {
     if (!s) return false;
@@ -9732,11 +9791,10 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }
     return true;
   });
   const [picked, setPicked] = useState([]);
-  // Internal phase: 'input' shows the picker/info; 'confirmed' shows a
-  // hand-the-phone-back screen that only the ST should tap to close.
-  // This prevents the local player from seeing the grimoire flash when the
-  // overlay closes on Submit.
-  const [phase, setPhase] = useState('input');
+  // Internal phase: 'use-decision' (optional, for canSkip roles) → 'input'
+  // → 'confirmed'. 'confirmed' shows a hand-the-phone-back screen so the
+  // local player never sees the grimoire flash when the overlay closes.
+  const [phase, setPhase] = useState(needsUseDecision ? 'use-decision' : 'input');
   // Remember what was submitted so the confirmation screen can echo it.
   const [submittedValue, setSubmittedValue] = useState(null);
 
@@ -9753,6 +9811,14 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }
     const v = isInfo ? [] : picked;
     onSubmit(v);                 // writes the prompt; overlay does NOT close here
     setSubmittedValue(isInfo ? 'info' : [...picked]);
+    setPhase('confirmed');
+  };
+  // Local player chose to skip — write status='declined' via the special
+  // sentinel array (submitLocalPrompt checks targets.__skipped).
+  const doSkip = () => {
+    const sentinel = []; sentinel.__skipped = true;
+    onSubmit(sentinel);
+    setSubmittedValue('skipped');
     setPhase('confirmed');
   };
 
@@ -9852,6 +9918,54 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }
         </div>
       );
     }
+  }
+
+  // Use-decision phase — for canSkip oncePerGame roles, ask "Use your X
+  // ability tonight?" with Use/Skip buttons before the picker.
+  if (phase === 'use-decision') {
+    const roleName = c?.name || step.char.id;
+    return (
+      <div className="fixed inset-0 z-50 bg-stone-950 overflow-y-auto p-3 sm:p-4">
+        <div className="max-w-md mx-auto space-y-4 py-4">
+          <div className="text-center text-xs uppercase tracking-wider text-purple-300">
+            🏠 Local player — show this to {mySeat.playerName || `seat #${mySeat.seatNum}`}
+          </div>
+          <section className="parchment rounded-lg p-4 sm:p-5 space-y-3 border-2 border-amber-600/70">
+            <div className="flex items-center gap-3">
+              {iconUrl(step.char.id) && (
+                <img src={iconUrl(step.char.id)} alt=""
+                  className="w-14 h-14 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
+              )}
+              <div className="min-w-0">
+                <div className={`text-xs uppercase tracking-wider team-${c?.team || 'townsfolk'}`}>{c?.team || 'role'}</div>
+                <div className="text-amber-200 text-lg font-bold">{roleName}</div>
+              </div>
+            </div>
+            <div className="text-sm text-stone-200 leading-relaxed border-l-2 border-amber-700/50 pl-3">
+              {step.instruction || c?.ability}
+            </div>
+          </section>
+          <section className="parchment rounded-lg p-5 text-center space-y-3">
+            <div className="text-stone-200 text-base">
+              Use your <span className="text-amber-200 font-semibold">{roleName}</span> ability tonight?
+            </div>
+            <div className="text-xs text-stone-500">
+              You can only use this ability once per game. Save it for later if you want.
+            </div>
+          </section>
+          <div className="grid grid-cols-2 gap-2 pt-1">
+            <button onClick={doSkip}
+              className="py-3 rounded-lg text-base font-semibold bg-stone-800 hover:bg-stone-700 text-stone-300 border border-stone-700">
+              No, save it
+            </button>
+            <button onClick={() => setPhase('input')}
+              className="py-3 rounded-lg text-base font-semibold bg-emerald-600 hover:bg-emerald-500 text-stone-950 shadow-lg shadow-emerald-900/40">
+              Yes, use it
+            </button>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   // Confirmation phase — shown after Submit. Fully opaque background hides the
@@ -10069,14 +10183,16 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
       stepNum += 1;
       steps.push({ type: 'char', stepNum, char: c, seat: null, reminder, isExtra,
                    action: effectiveAction, instruction: def.instruction, reminderLabel: def.reminder,
-                   requiresDeath: def.requiresDeath, oncePerGame: def.oncePerGame, prompt: null });
+                   requiresDeath: def.requiresDeath, oncePerGame: def.oncePerGame, canSkip: def.canSkip,
+                   prompt: null });
     } else {
       for (const seat of matched) {
         stepNum += 1;
         const prompt = nightPrompts[seat.seatNum];
         steps.push({ type: 'char', stepNum, char: c, seat, reminder, isExtra,
                      action: effectiveAction, instruction: def.instruction, reminderLabel: def.reminder,
-                     requiresDeath: def.requiresDeath, oncePerGame: def.oncePerGame, prompt });
+                     requiresDeath: def.requiresDeath, oncePerGame: def.oncePerGame, canSkip: def.canSkip,
+                     prompt });
       }
     }
   }
