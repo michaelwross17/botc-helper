@@ -375,6 +375,7 @@ function App() {
           mySeat={mySeat}
           seats={grim.seats}
           prompt={myPrompt}
+          scriptCharIds={game?.characterIds || []}
           onSubmit={(targets, extras) => {
             const next = loadGame() || game;
             if (!next?.grimoire) return;
@@ -1355,7 +1356,7 @@ function NightInfoScreen({ mySeat, seats, prompt, onAck, onQuestion }) {
 // 1 or 2 seats (based on prompt.action) and hits Submit or Question. Submit
 // writes the targets back; the ST's effect auto-places the reminder. Question
 // flags the ST to come over in person.
-function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseAbility, onSkipAbility }) {
+function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseAbility, onSkipAbility, scriptCharIds = [] }) {
   // Use-decision phase — for once-per-game canSkip roles, ask Use/Skip first.
   if (prompt.status === 'use-decision') {
     const c = CHAR_BY_ID[prompt.roleId];
@@ -1540,7 +1541,8 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
               <span className="text-xs text-stone-400">{pickedGuess ? '1' : '0'} of 1 chosen</span>
             </div>
             <ul className="grid grid-cols-2 gap-1.5 max-h-60 overflow-y-auto">
-              {(window.BOTC_DATA?.characters || [])
+              {(scriptCharIds || [])
+                .map(id => CHAR_BY_ID[id])
                 .filter(rc => rc && rc.team !== 'traveller')
                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
                 .map(rc => {

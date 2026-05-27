@@ -2887,6 +2887,7 @@ function App() {
           step={localOverlayStep.step}
           infoPayload={localOverlayStep.infoPayload}
           seats={state.grimoire.seats || []}
+          scriptCharIds={state.characterIds || []}
           onSubmit={submitLocalPrompt}
           onClose={closeLocalPrompt}
         />
@@ -10484,7 +10485,7 @@ function LocalGrimoireOverlay({ seat, grimoire, phase, onAck, onReturn, onCancel
 //   - infoPayload absent   → render the seat-picker variant (mirrors player's
 //                            NightPromptScreen) with Submit/Cancel
 // No Question button — for local players the ST IS the storyteller.
-function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }) {
+function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, scriptCharIds = [] }) {
   const c = CHAR_BY_ID[step.char.id];
   const mySeat = step.seat;
   const isInfo = !!infoPayload;
@@ -10838,7 +10839,8 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }
                   <span className="text-xs text-stone-400">{pickedGuess ? '1' : '0'} of 1 chosen</span>
                 </div>
                 <ul className="grid grid-cols-2 gap-1.5 max-h-60 overflow-y-auto">
-                  {(window.BOTC_DATA?.characters || [])
+                  {(scriptCharIds || [])
+                    .map(id => CHAR_BY_ID[id])
                     .filter(rc => rc && rc.team !== 'traveller')
                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
                     .map(rc => {
