@@ -1299,19 +1299,29 @@ function App() {
   const clearAllNightPrompts = () => {
     update({ grimoire: { ...state.grimoire, nightPrompts: {} } });
   };
-  // ST responds to a two-step prompt (Fortune Teller). Player has already
-  // submitted targets — now ST sets the infoPayload and flips status to
-  // 'awaiting' so the player phone picks up the result.
+  // ST responds to a two-step prompt (Fortune Teller, Innkeeper, Gambler, …).
+  // Player has already submitted targets — now ST sets the infoPayload. For
+  // actions whose player needs to ack info (FT, RK, Chambermaid) we flip to
+  // 'awaiting' so the phone shows NightInfoScreen. For actions where the ST's
+  // response IS the resolution and the player doesn't see anything new
+  // (Innkeeper picks who's drunk, Gambler verdict) we jump straight to
+  // 'submitted' so the effect runs immediately.
+  const NO_PLAYER_ACK_ACTIONS = new Set(['target2+st-pick', 'target1+guess']);
   const respondToNightPrompt = (seatNum, infoPayload) => {
     if (!seatNum) return;
     const np = { ...(state.grimoire.nightPrompts || {}) };
     const p = np[seatNum];
     if (!p) return;
-    np[seatNum] = { ...p, status: 'awaiting', infoPayload, respondedAt: Date.now() };
+    const noAck = NO_PLAYER_ACK_ACTIONS.has(p.action);
+    const newStatus = noAck ? 'submitted' : 'awaiting';
+    np[seatNum] = { ...p, status: newStatus, infoPayload, respondedAt: Date.now() };
     update({ grimoire: { ...state.grimoire, nightPrompts: np } });
-    // If this seat is local (no remote phone), open the local overlay with the
-    // info display so the local player can see YES/NO and tap Got it on this
-    // device. Otherwise the player's phone (remote) picks up the change.
+    // For player-ack actions on a local seat, open the local overlay with the
+    // info display so the local player can see the result on this device.
+    // Otherwise the player's phone (remote) picks up the 'awaiting' change.
+    // For no-ack actions, neither phone nor overlay needs to render — the
+    // existing 'submitted' effect runs the resolution.
+    if (noAck) return;
     const seat = (state.grimoire.seats || []).find(s => s.seatNum === seatNum);
     if (seat && seat.isLocal) {
       const c = CHAR_BY_ID[p.roleId];
@@ -1348,7 +1358,7 @@ function App() {
   // NOTE: we do NOT close the overlay here. The overlay component shows a
   // "return phone to storyteller" confirmation screen after submit so the local
   // player never sees the grimoire flash up. The ST taps Return to actually close.
-  const submitLocalPrompt = (targets) => {
+  const submitLocalPrompt = (targets, extras) => {
     if (!localOverlayStep) return;
     const { step, infoPayload } = localOverlayStep;
     const seatNum = step.seat.seatNum;
@@ -1358,7 +1368,7 @@ function App() {
     // the prompt as 'awaiting-st-response' so the ST sees the response popup.
     // Subsequent submission (info ack with infoPayload set) transitions to
     // 'submitted' so the existing effect places the 'Chose' reminders.
-    const isPickerSubmitForTwoStep = (step.action === 'target2+yesno' || step.action === 'target1+role' || step.action === 'target2+number') && !infoPayload;
+    const isPickerSubmitForTwoStep = (step.action === 'target2+yesno' || step.action === 'target1+role' || step.action === 'target2+number' || step.action === 'target2+st-pick' || step.action === 'target1+guess') && !infoPayload;
     // `skipped` is passed by the local overlay when the player chose Skip on a
     // use/skip prompt. Sets status='declined' so the existing effect emits the
     // "saved for later" toast and the No ability marker is NOT placed.
@@ -1383,6 +1393,7 @@ function App() {
       decidedAt:     Date.now(),
       isLocal:       true,
       nightIdx:      (state.grimoire.viewingDayIndex || 0),
+      ...(extras && typeof extras === 'object' ? extras : {}),
     };
     update({ grimoire: { ...state.grimoire, nightPrompts: np } });
     // Overlay closes via closeLocalPrompt when the ST taps Return to storyteller.
@@ -1558,6 +1569,37 @@ function App() {
     });
   }, [JSON.stringify(state.grimoire.nightPrompts || {})]);
 
+  // Effect: Innkeeper-style intermediate placement. When the prompt parks at
+  // 'awaiting-st-response' (player has submitted, ST hasn't responded yet)
+  // we drop the target reminder on each chosen seat so the ST can see the
+  // grimoire state while deciding. Idempotent — skips when already placed.
+  useEffect(() => {
+    if (!loaded || isSpectator) return;
+    const prompts = state.grimoire.nightPrompts || {};
+    let mutated = null;
+    for (const [seatStr, p] of Object.entries(prompts)) {
+      if (!p || p.status !== 'awaiting-st-response') continue;
+      if (p.action !== 'target2+st-pick') continue;
+      const tgts = Array.isArray(p.targets) ? p.targets : [];
+      if (tgts.length === 0) continue;
+      const label = p.reminderLabel || 'Safe';
+      const seatsArr = mutated || (state.grimoire.seats || []);
+      let changed = false;
+      const nextSeats = seatsArr.map(s => {
+        if (!tgts.includes(s.seatNum)) return s;
+        const already = (s.reminders || []).some(r =>
+          r && r.charId === p.roleId && r.label === label && r.fromPrompt);
+        if (already) return s;
+        changed = true;
+        return { ...s, reminders: [...(s.reminders || []), { charId: p.roleId, label, fromPrompt: true }] };
+      });
+      if (changed) mutated = nextSeats;
+    }
+    if (mutated) {
+      update({ grimoire: { ...state.grimoire, seats: mutated } });
+    }
+  }, [JSON.stringify(state.grimoire.nightPrompts || {}), JSON.stringify(state.grimoire.seats || [])]);
+
   // Effect: when a prompt transitions to 'submitted', auto-place the reminder
   // on each target seat, push a toast, and mark the prompt 'done'. When it
   // transitions to 'question', push a question-toast and leave the prompt
@@ -1724,7 +1766,7 @@ function App() {
           // here so two-step roles (Chambermaid, etc.) still get their per-
           // target markers in the grimoire.
           const defForTwoStep = NIGHT_ACTIONS[p.roleId] || {};
-          const twoStepActions = new Set(['target2+yesno', 'target2+number', 'target1+role']);
+          const twoStepActions = new Set(['target2+yesno', 'target2+number', 'target1+role', 'target2+st-pick', 'target1+guess']);
           const tgtList = Array.isArray(p.targets)
             ? p.targets
             : (p.targets && typeof p.targets === 'object'
@@ -1763,6 +1805,59 @@ function App() {
               r && /no ability/i.test(String(r.label || '')));
             if (!alreadyNoAbility) {
               placeOn(seatNum, 'No ability');
+            }
+          }
+          // Innkeeper: place 'Drunk' on the chosen seat and remove 'Safe'
+          // from any seats the ST untoggled (drunk/poisoned Innkeeper case).
+          if (p.action === 'target2+st-pick' && p.infoPayload) {
+            const ipl = p.infoPayload || {};
+            const drunkSeat = (typeof ipl.drunkSeat === 'number') ? ipl.drunkSeat : null;
+            const safesToKeep = new Set(Array.isArray(ipl.safeSeats) ? ipl.safeSeats : (Array.isArray(p.targets) ? p.targets : []));
+            const targetsArr = Array.isArray(p.targets) ? p.targets : [];
+            const baseSeats = next.__seatsCopy || state.grimoire.seats;
+            const seatsCopy = baseSeats.map(s => {
+              if (!targetsArr.includes(s.seatNum)) return s;
+              let reminders = (s.reminders || []).slice();
+              // Remove our placed 'Safe' if this seat is NOT in safesToKeep.
+              if (!safesToKeep.has(s.seatNum)) {
+                reminders = reminders.filter(r =>
+                  !(r && r.charId === p.roleId && /safe/i.test(String(r.label || '')) && r.fromPrompt));
+              }
+              // Place 'Drunk' on the chosen seat (if any) — idempotent.
+              if (drunkSeat === s.seatNum) {
+                const hasDrunk = reminders.some(r =>
+                  r && r.charId === p.roleId && /drunk/i.test(String(r.label || '')) && r.fromPrompt);
+                if (!hasDrunk) {
+                  reminders.push({ charId: p.roleId, label: 'Drunk', fromPrompt: true });
+                }
+              }
+              return { ...s, reminders };
+            });
+            next.__seatsCopy = seatsCopy;
+          }
+          // Gambler: if the ST verdict says the gambler dies, kill the gambler
+          // via the direct-kill path (places 'Dead' on the gambler's own seat
+          // with charId='gambler' so the marker icon is the Gambler).
+          if (p.action === 'target1+guess' && p.infoPayload) {
+            const ipl = p.infoPayload || {};
+            if (ipl.lives === false) {
+              const baseSeats = next.__seatsCopy || state.grimoire.seats;
+              const gSeat = baseSeats.find(s => s.seatNum === seatNum);
+              if (gSeat && !gSeat.isDead) {
+                const hasDead = (gSeat.reminders || []).some(r =>
+                  r && r.charId === 'gambler' && /^dead$/i.test(String(r.label || '')));
+                const seatsCopy = baseSeats.map(s =>
+                  s.seatNum === seatNum
+                    ? { ...s,
+                        isDead: true,
+                        reminders: hasDead
+                          ? s.reminders
+                          : [...(s.reminders || []), { charId: 'gambler', label: 'Dead', fromPrompt: true }],
+                      }
+                    : s
+                );
+                next.__seatsCopy = seatsCopy;
+              }
             }
           }
           // Godfather: after they act, remove the "Died Today" trigger.
@@ -7937,8 +8032,8 @@ const NIGHT_ACTIONS = {
   shabaloth:     { action: 'target2',     reminder: 'Dead',        instruction: 'Choose 2 players — they die. A dead player you chose last night might be regurgitated.', phase: 'other' },
   po:            { action: 'target1self', reminder: 'Dead',        instruction: 'Choose a player to kill, or 3 players if you chose no one last night.', phase: 'other' },
   zombuul:       { action: 'target1',     reminder: 'Dead',        instruction: 'If no one died today, choose a player to die tonight.', phase: 'other' },
-  innkeeper:     { action: 'target2',     reminder: 'Safe',        instruction: 'Choose 2 players — they are safe from the Demon tonight, but one becomes drunk.', phase: 'other' },
-  gambler:       { action: 'target1self', reminder: 'Gambled',     instruction: 'Choose a player and guess their character. If wrong, you die.', phase: 'other' },
+  innkeeper:     { action: 'target2+st-pick', reminder: 'Safe',     instruction: 'Choose 2 players — they are safe from the Demon tonight, but one becomes drunk.', phase: 'other' },
+  gambler:       { action: 'target1+guess', reminder: 'Gambled',    instruction: 'Choose a player and guess their character. If wrong, you die.', phase: 'other' },
   exorcist:      { action: 'target1',     reminder: 'Chose',       instruction: 'Choose a player (not the same as last night) — the Demon does not wake tonight.', eligible: 'others', phase: 'other' },
   courtier:      { action: 'target1',     reminder: 'Drunk 1',     instruction: 'Once per game, choose a player: they are drunk for 3 nights & 3 days.',
                    oncePerGame: true, canSkip: true },
@@ -8680,10 +8775,25 @@ function STResponseCard({ seatNum, prompt, seats, scriptCharIds = [], onSend }) 
   const askerAfflicted = isDrunkOrPoisoned(mySeat);
   const isRolePick = prompt.action === 'target1+role';
   const isNumberPick = prompt.action === 'target2+number';
+  const isInnkeeperPick = prompt.action === 'target2+st-pick';
+  const isGambler = prompt.action === 'target1+guess';
   // Auto-suggested role for target1+role = the chosen seat's actualRoleId.
   const suggestedRoleId = isRolePick && targetSeats[0] ? targetSeats[0].actualRoleId : null;
   const [pickedRole, setPickedRole] = useState('');
   const [pickedNumber, setPickedNumber] = useState(null);
+  // Innkeeper state: which target gets Drunk, and which Safes to keep
+  // (only relevant when the Innkeeper is drunk/poisoned).
+  const [drunkSeat, setDrunkSeat] = useState(null);
+  const [safeSeats, setSafeSeats] = useState(() => targetSeats.map(s => s.seatNum));
+  // Gambler verdict: null (unset) → true (lives) / false (dies).
+  const [verdict, setVerdict] = useState(null);
+  // Gambler correctness suggestion = guess matches the target's actualRoleId.
+  const gamblerTarget = isGambler ? targetSeats[0] : null;
+  const gamblerGuess = isGambler ? (prompt.guess || null) : null;
+  const gamblerCorrect = isGambler && gamblerTarget && gamblerGuess
+    ? gamblerTarget.actualRoleId === gamblerGuess
+    : null;
+  const gamblerSuggestion = isGambler ? gamblerCorrect : null;  // true = lives suggested, false = dies suggested
   // Number-pick suggestion (Chambermaid): count seats whose role wakes tonight.
   // The night phase isn't tracked on the prompt itself; infer from viewingDayIndex
   // when present, else default to other-night (Chambermaid is rarely a first-night
@@ -8770,8 +8880,144 @@ function STResponseCard({ seatNum, prompt, seats, scriptCharIds = [], onSend }) 
         </ul>
       </div>
 
-      {/* Branch on response shape: yes/no buttons for FT, role grid for RK-style, number buttons for Chambermaid */}
-      {isNumberPick ? (
+      {/* Branch on response shape: yes/no buttons for FT, role grid for RK-style, number buttons for Chambermaid, Innkeeper/Gambler get their own forms */}
+      {isInnkeeperPick ? (
+        <div>
+          {askerAfflicted && (
+            <div className="text-[11px] text-amber-200/90 mb-2">
+              Innkeeper is drunk/poisoned — you may remove either or both Safe markers (and skip the Drunk pick).
+            </div>
+          )}
+          <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">
+            Pick which is drunk{askerAfflicted ? ' (optional)' : ''} · uncheck Safe to remove that marker
+          </div>
+          <ul className="space-y-1.5">
+            {targetSeats.map(ts => {
+              const rc = CHAR_BY_ID[ts.actualRoleId];
+              const isDrunk = drunkSeat === ts.seatNum;
+              const keepSafe = safeSeats.includes(ts.seatNum);
+              return (
+                <li key={ts.seatNum} className="card rounded p-2">
+                  <div className="flex items-start gap-2">
+                    <span className="text-amber-200/80 text-xs w-6 text-center flex-shrink-0 pt-1">#{ts.seatNum}</span>
+                    {iconUrl(ts.actualRoleId) && (
+                      <img src={iconUrl(ts.actualRoleId)} alt=""
+                        className="w-9 h-9 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                    )}
+                    <div className="flex-1 min-w-0 leading-tight">
+                      <div className="text-sm truncate">{ts.playerName || <span className="text-stone-500 italic">—</span>}</div>
+                      <div className={`text-[10px] uppercase tracking-wider truncate ${rc ? `team-${rc.team}` : 'text-stone-500'}`}>
+                        {rc?.name || '(no role)'}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3 mt-2 pl-8">
+                    <button onClick={() => setDrunkSeat(isDrunk ? null : ts.seatNum)}
+                      className={`text-[11px] px-2 py-1 rounded transition
+                        ${isDrunk
+                          ? 'bg-amber-600 text-stone-950 font-semibold'
+                          : 'pill hover:border-amber-500 hover:text-amber-200'}`}>
+                      {isDrunk ? '✓ Drunk' : 'Make drunk'}
+                    </button>
+                    <label className={`text-[11px] flex items-center gap-1 cursor-pointer ${askerAfflicted ? 'text-stone-300' : 'text-stone-500'}`}>
+                      <input type="checkbox"
+                        checked={keepSafe}
+                        disabled={!askerAfflicted}
+                        onChange={(e) => {
+                          if (e.target.checked) setSafeSeats(prev => [...new Set([...prev, ts.seatNum])]);
+                          else setSafeSeats(prev => prev.filter(n => n !== ts.seatNum));
+                        }}
+                        className="w-3.5 h-3.5 accent-amber-600" />
+                      Keep Safe marker
+                    </label>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+          <div className="grid grid-cols-1 gap-2 pt-3">
+            <button onClick={() => onSend({ type: 'innkeeper', drunkSeat, safeSeats: [...safeSeats] })}
+              disabled={!askerAfflicted && drunkSeat == null}
+              className={`py-3 rounded-lg text-base font-bold transition
+                ${(askerAfflicted || drunkSeat != null)
+                  ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40'
+                  : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+              Apply →
+            </button>
+          </div>
+        </div>
+      ) : isGambler ? (
+        <div>
+          <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">Gambler's guess</div>
+          {gamblerGuess ? (() => {
+            const guessRc = CHAR_BY_ID[gamblerGuess];
+            const targetRc = gamblerTarget ? CHAR_BY_ID[gamblerTarget.actualRoleId] : null;
+            return (
+              <div className="card rounded p-2 flex items-center gap-2 mb-2">
+                {iconUrl(gamblerGuess) && (
+                  <img src={iconUrl(gamblerGuess)} alt=""
+                    className="w-9 h-9 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                )}
+                <div className="flex-1 min-w-0 leading-tight">
+                  <div className={`text-sm font-semibold truncate team-${guessRc?.team || 'townsfolk'}`}>
+                    Guessed: {guessRc?.name || gamblerGuess}
+                  </div>
+                  {gamblerTarget && (
+                    <div className="text-[11px] text-stone-400 truncate">
+                      About #{gamblerTarget.seatNum}{gamblerTarget.playerName ? ' · ' + gamblerTarget.playerName : ''} (actually <span className={`team-${targetRc?.team || 'townsfolk'} font-medium`}>{targetRc?.name || '?'}</span>)
+                    </div>
+                  )}
+                </div>
+                {gamblerCorrect != null && (
+                  <span className={`text-[11px] px-2 py-0.5 rounded font-bold ${gamblerCorrect ? 'bg-emerald-700/60 text-emerald-100' : 'bg-red-700/60 text-red-100'}`}>
+                    {gamblerCorrect ? 'CORRECT' : 'WRONG'}
+                  </span>
+                )}
+              </div>
+            );
+          })() : (
+            <div className="text-[11px] text-stone-500 italic mb-2">No guess recorded.</div>
+          )}
+          <div className="flex items-baseline justify-between gap-2 mb-1.5">
+            <span className="text-xs uppercase tracking-wider text-amber-300">Verdict</span>
+            {gamblerSuggestion != null && (
+              <span className={`text-[10px] ${gamblerSuggestion ? 'text-emerald-300' : 'text-red-300'} font-bold`}>
+                Suggested: {gamblerSuggestion ? 'LIVES' : 'DIES'}
+              </span>
+            )}
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <button onClick={() => setVerdict(true)}
+              className={`py-3 rounded-lg text-sm font-bold transition
+                ${verdict === true
+                  ? 'bg-emerald-600 text-stone-950'
+                  : gamblerSuggestion === true
+                    ? 'pill border-emerald-600/70 text-emerald-200 hover:border-emerald-500'
+                    : 'pill hover:border-emerald-500 hover:text-emerald-200'}`}>
+              Gambler LIVES
+            </button>
+            <button onClick={() => setVerdict(false)}
+              className={`py-3 rounded-lg text-sm font-bold transition
+                ${verdict === false
+                  ? 'bg-red-600 text-stone-100'
+                  : gamblerSuggestion === false
+                    ? 'pill border-red-600/70 text-red-200 hover:border-red-500'
+                    : 'pill hover:border-red-500 hover:text-red-200'}`}>
+              Gambler DIES
+            </button>
+          </div>
+          <div className="grid grid-cols-1 gap-2 pt-3">
+            <button onClick={() => onSend({ type: 'verdict', lives: verdict, guess: gamblerGuess })}
+              disabled={verdict == null}
+              className={`py-3 rounded-lg text-base font-bold transition
+                ${verdict != null
+                  ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40'
+                  : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+              Apply →
+            </button>
+          </div>
+        </div>
+      ) : isNumberPick ? (
         <div>
           <div className="flex items-baseline justify-between gap-2 mb-1.5">
             <span className="text-xs uppercase tracking-wider text-amber-300">Send the count</span>
@@ -10242,7 +10488,7 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }
   const c = CHAR_BY_ID[step.char.id];
   const mySeat = step.seat;
   const isInfo = !!infoPayload;
-  const isTwo = step.action === 'target2' || step.action === 'target2+yesno' || step.action === 'target2+number';
+  const isTwo = step.action === 'target2' || step.action === 'target2+yesno' || step.action === 'target2+number' || step.action === 'target2+st-pick';
   const need = isTwo ? 2 : 1;
   // For canSkip oncePerGame abilities, start with a Use/Skip decision unless
   // the seat already used the ability.
@@ -10278,11 +10524,17 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }
       return [...prev, seatNum];
     });
   };
-  const canSubmit = isInfo ? true : picked.length === need;
+  // Gambler-only: in addition to picking 1 seat, the player picks 1 role guess.
+  const isGuess = step.action === 'target1+guess';
+  const [pickedGuess, setPickedGuess] = useState('');
+  const canSubmit = isInfo
+    ? true
+    : (isGuess ? (picked.length === 1 && !!pickedGuess) : (picked.length === need));
 
   const doSubmit = () => {
     const v = isInfo ? [] : picked;
-    onSubmit(v);                 // writes the prompt; overlay does NOT close here
+    const extras = isGuess ? { guess: pickedGuess } : undefined;
+    onSubmit(v, extras);         // writes the prompt; overlay does NOT close here
     setSubmittedValue(isInfo ? 'info' : [...picked]);
     setPhase('confirmed');
   };
@@ -10579,6 +10831,32 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }
                 );
               })}
             </ul>
+            {isGuess && (
+              <div className="mt-3 pt-3 border-t border-stone-800">
+                <div className="flex items-baseline justify-between gap-2 mb-1.5">
+                  <h3 className="text-amber-200 font-semibold text-sm">Guess their character</h3>
+                  <span className="text-xs text-stone-400">{pickedGuess ? '1' : '0'} of 1 chosen</span>
+                </div>
+                <ul className="grid grid-cols-2 gap-1.5 max-h-60 overflow-y-auto">
+                  {(window.BOTC_DATA?.characters || [])
+                    .filter(rc => rc && rc.team !== 'traveller')
+                    .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+                    .map(rc => {
+                      const isPickedRole = pickedGuess === rc.id;
+                      return (
+                        <li key={rc.id}>
+                          <button onClick={() => setPickedGuess(rc.id)}
+                            className={`w-full card rounded px-2 py-1.5 flex items-center gap-2 text-left text-sm
+                              ${isPickedRole ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}`}>
+                            {iconUrl(rc.id) && <img src={iconUrl(rc.id)} alt="" className="w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0" />}
+                            <span className={`flex-1 min-w-0 truncate team-${rc.team}`}>{rc.name}</span>
+                          </button>
+                        </li>
+                      );
+                    })}
+                </ul>
+              </div>
+            )}
           </section>
         )}
 

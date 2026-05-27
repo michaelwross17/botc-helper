@@ -375,7 +375,7 @@ function App() {
           mySeat={mySeat}
           seats={grim.seats}
           prompt={myPrompt}
-          onSubmit={(targets) => {
+          onSubmit={(targets, extras) => {
             const next = loadGame() || game;
             if (!next?.grimoire) return;
             const np = { ...(next.grimoire.nightPrompts || {}) };
@@ -384,14 +384,14 @@ function App() {
             // 'awaiting-st-response' so the ST can pick the info to return.
             // For info acks (Got it on an info display) the prompt already has
             // an infoPayload — those go straight to 'submitted'.
-            const isTwoStep = (curr.action === 'target2+yesno' || curr.action === 'target1+role' || curr.action === 'target2+number') && !curr.infoPayload;
+            const isTwoStep = (curr.action === 'target2+yesno' || curr.action === 'target1+role' || curr.action === 'target2+number' || curr.action === 'target2+st-pick' || curr.action === 'target1+guess') && !curr.infoPayload;
             const newStatus = isTwoStep ? 'awaiting-st-response' : 'submitted';
             // Preserve existing targets when info-acking with an empty array,
             // so the ST effect can still place the per-target reminders.
             const newTargets = (Array.isArray(targets) && targets.length > 0)
               ? targets
               : (curr.targets || targets);
-            np[mySeat.seatNum] = { ...curr, status: newStatus, targets: newTargets, decidedAt: Date.now() };
+            np[mySeat.seatNum] = { ...curr, status: newStatus, targets: newTargets, decidedAt: Date.now(), ...(extras && typeof extras === 'object' ? extras : {}) };
             next.grimoire.nightPrompts = np;
             saveGame(next);
             setGame(next);
@@ -1429,7 +1429,7 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
       </ScreenShell>
     );
   }
-  const isTwo = prompt.action === 'target2' || prompt.action === 'target2+yesno' || prompt.action === 'target2+number';
+  const isTwo = prompt.action === 'target2' || prompt.action === 'target2+yesno' || prompt.action === 'target2+number' || prompt.action === 'target2+st-pick';
   const need = isTwo ? 2 : 1;
   // Filter eligible seats based on the action's eligibility rules.
   const eligibleSeats = (seats || []).filter(s => {
@@ -1447,6 +1447,9 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
     return true;
   });
   const [picked, setPicked] = useState([]);
+  // Gambler-only: a role guess in addition to the seat pick.
+  const isGuess = prompt.action === 'target1+guess';
+  const [pickedGuess, setPickedGuess] = useState('');
   // If status flipped to 'question' on this device (rare race), bail out.
   const togglePick = (seatNum) => {
     setPicked(prev => {
@@ -1455,7 +1458,9 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
       return [...prev, seatNum];
     });
   };
-  const canSubmit = picked.length === need;
+  const canSubmit = isGuess
+    ? (picked.length === 1 && !!pickedGuess)
+    : (picked.length === need);
   const c = CHAR_BY_ID[prompt.roleId];
   const isQuestion = prompt.status === 'question';
 
@@ -1528,10 +1533,36 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
             );
           })}
         </ul>
+        {isGuess && (
+          <div className="mt-3 pt-3 border-t border-stone-800">
+            <div className="flex items-baseline justify-between gap-2 mb-1.5">
+              <h3 className="text-amber-200 font-semibold text-sm">Guess their character</h3>
+              <span className="text-xs text-stone-400">{pickedGuess ? '1' : '0'} of 1 chosen</span>
+            </div>
+            <ul className="grid grid-cols-2 gap-1.5 max-h-60 overflow-y-auto">
+              {(window.BOTC_DATA?.characters || [])
+                .filter(rc => rc && rc.team !== 'traveller')
+                .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+                .map(rc => {
+                  const isPickedRole = pickedGuess === rc.id;
+                  return (
+                    <li key={rc.id}>
+                      <button onClick={() => setPickedGuess(rc.id)}
+                        className={`w-full card rounded px-2 py-1.5 flex items-center gap-2 text-left text-sm
+                          ${isPickedRole ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}`}>
+                        {iconUrl(rc.id) && <img src={iconUrl(rc.id)} alt="" className="w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0" />}
+                        <span className={`flex-1 min-w-0 truncate team-${rc.team}`}>{rc.name}</span>
+                      </button>
+                    </li>
+                  );
+                })}
+            </ul>
+          </div>
+        )}
       </section>
 
       <div className="grid grid-cols-2 gap-2 pt-1">
-        <button onClick={() => onSubmit(picked)}
+        <button onClick={() => onSubmit(picked, isGuess ? { guess: pickedGuess } : undefined)}
           disabled={!canSubmit}
           className={`py-3 rounded-lg text-base font-semibold transition
             ${canSubmit
