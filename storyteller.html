@@ -1358,7 +1358,7 @@ function App() {
     // the prompt as 'awaiting-st-response' so the ST sees the response popup.
     // Subsequent submission (info ack with infoPayload set) transitions to
     // 'submitted' so the existing effect places the 'Chose' reminders.
-    const isPickerSubmitForTwoStep = (step.action === 'target2+yesno' || step.action === 'target1+role') && !infoPayload;
+    const isPickerSubmitForTwoStep = (step.action === 'target2+yesno' || step.action === 'target1+role' || step.action === 'target2+number') && !infoPayload;
     // `skipped` is passed by the local overlay when the player chose Skip on a
     // use/skip prompt. Sets status='declined' so the existing effect emits the
     // "saved for later" toast and the No ability marker is NOT placed.
@@ -1472,11 +1472,39 @@ function App() {
   };
   const confirmDeath = () => {
     if (!deathConfirmInfo) return;
+    const { seatNum: dyingSeatNum, causeCharId } = deathConfirmInfo;
     const seats = state.grimoire.seats.map(s =>
-      s.seatNum === deathConfirmInfo.seatNum ? { ...s, isDead: true } : s
+      s.seatNum === dyingSeatNum ? { ...s, isDead: true } : s
     );
     update({ grimoire: { ...state.grimoire, seats } });
     setDeathConfirmInfo(null);
+    // Grandmother trigger — if the seat that just died has the Grandmother's
+    // Grandchild reminder AND the killer is a Demon, ask the ST to also kill
+    // the Grandmother (corner popup, dismissable).
+    try {
+      const dying = seats.find(s => s.seatNum === dyingSeatNum);
+      if (!dying) return;
+      const hasGrandchild = (dying.reminders || []).some(r =>
+        r && r.charId === 'grandmother' && /grandchild|child/i.test(String(r.label || '')));
+      const causeTeam = causeCharId ? (CHAR_BY_ID[causeCharId] || {}).team : null;
+      if (!hasGrandchild || causeTeam !== 'demon') return;
+      const gmSeat = seats.find(s => s.actualRoleId === 'grandmother' && !s.isDead);
+      if (!gmSeat) return;
+      const gmLabel = `#${gmSeat.seatNum}${gmSeat.playerName ? ' · ' + gmSeat.playerName : ''}`;
+      const dyingLabel = `#${dying.seatNum}${dying.playerName ? ' · ' + dying.playerName : ''}`;
+      const demonName = (CHAR_BY_ID[causeCharId] || {}).name || causeCharId;
+      addCornerPrompt({
+        kind: 'warn',
+        title: 'Grandmother trigger',
+        body: `The Grandchild (${dyingLabel}) was killed by the ${demonName}. The Grandmother (${gmLabel}) dies too.`,
+        actions: [
+          { label: 'Kill Grandmother', primary: true, onClick: () => {
+            _killSeatDirect(gmSeat.seatNum, 'grandmother');
+          }},
+          { label: 'Skip' },
+        ],
+      });
+    } catch (_) { /* never let the trigger break the kill */ }
   };
   const dismissDeathConfirm = () => setDeathConfirmInfo(null);
   const dismissResponsePopup = (seatNum) => {
@@ -1666,6 +1694,10 @@ function App() {
             placeOn(seatNum, String(info.number));
           } else if (info.type === 'yesno') {
             placeOn(seatNum, info.yes ? 'YES' : 'NO');
+          } else if (info.type === 'seat+role') {
+            // Grandmother — a 'Saw' marker on her own seat confirms she's
+            // been shown her Grandchild and their character.
+            placeOn(seatNum, p.reminderLabel || 'Saw');
           }
           // oncePerGame roles (Ravenkeeper) also place a permanent
           // "No ability" reminder on their own seat so the night-phase row
@@ -1721,6 +1753,11 @@ function App() {
             const askS = state.grimoire.seats.find(s => s.seatNum === info.askSeat);
             const names = (info.roles || []).map(id => (CHAR_BY_ID[id] || {}).name || id).join(' / ');
             shown = `about #${info.askSeat}${askS?.playerName ? ' ' + askS.playerName : ''} → ${names}`;
+          }
+          else if (info.type === 'seat+role') {
+            const askS = state.grimoire.seats.find(s => s.seatNum === info.askSeat);
+            const rName = (CHAR_BY_ID[info.roleId] || {}).name || info.roleId || '?';
+            shown = `Grandchild = #${info.askSeat}${askS?.playerName ? ' ' + askS.playerName : ''} · ${rName}`;
           }
           else shown = JSON.stringify(info);
           toastText = `${charName} (seat #${seatNum}${seat?.playerName ? ' · ' + seat.playerName : ''}) acknowledged: ${shown}${manualSuffix}`;
@@ -7833,6 +7870,10 @@ const NIGHT_ACTIONS = {
                    infoType: 'number',     infoConfig: { min: 0, max: 6, label: 'evil pairs', display: 'You learn there are' } },
   empath:        { action: 'info-st',     reminder: 'Empath #',    instruction: 'You learn how many of your 2 alive neighbours are evil.',
                    infoType: 'number',     infoConfig: { min: 0, max: 2, label: 'evil neighbours', display: 'You sense' } },
+  chambermaid:   { action: 'target2+number', reminder: 'Chose',    instruction: 'Choose 2 alive players (not yourself): you learn how many of them woke tonight due to their ability.', eligible: 'others',
+                   responseConfig: { min: 0, max: 2, label: 'players woke', display: 'Players who woke tonight' } },
+  grandmother:   { action: 'info-st',     reminder: 'Saw',         instruction: 'Show the Grandmother her Grandchild and their character.', phase: 'first',
+                   infoType: 'seat+role',  infoConfig: { suggestion: 'grandchild' } },
   undertaker:    { action: 'info-st',     reminder: 'Saw',         instruction: 'You learn which character was executed today.', phase: 'other',
                    infoType: 'role',       infoConfig: { display: 'The executed player was the' } },
 
@@ -7917,6 +7958,9 @@ const PERMANENT_REMINDER_CHARS = new Set([
   'snitch',
   // Mezepheles (mad word — permanent ability loss)
   'mezepheles',
+  // Grandmother — the 'Grandchild' marker persists for the whole game so the
+  // demon-kill trigger can still fire on later nights.
+  'grandmother',
 ]);
 const PERMANENT_REMINDER_LABELS = new Set(['No ability', 'Used']);
 // Compute today's chopping-block state from a day's nominations + alive count.
@@ -8192,6 +8236,46 @@ function computeUndertakerSuggestion(ctx) {
   };
 }
 
+// Grandmother first-night suggestion: find the seat with the Grandchild
+// reminder placed by 'grandmother' (or 'Child' as a forgiving fallback) and
+// return that seat + its actual role.
+function computeGrandmotherSuggestion(seats) {
+  const child = (seats || []).find(s => (s.reminders || []).some(r =>
+    r && r.charId === 'grandmother' && /grandchild|child/i.test(String(r.label || ''))));
+  if (!child) return null;
+  return {
+    value: { askSeat: child.seatNum, roleId: child.actualRoleId || null },
+    breakdown: {
+      seatNum: child.seatNum,
+      playerName: child.playerName || null,
+      roleId: child.actualRoleId || null,
+      roleName: (CHAR_BY_ID[child.actualRoleId] || {}).name || child.actualRoleId || null,
+    },
+  };
+}
+
+// Chambermaid suggestion: count how many of the 2 chosen seats have an actual
+// role that wakes tonight (i.e. NIGHT_ACTIONS entry with a real action and a
+// phase that matches the current night).
+function computeChambermaidSuggestion(targetSeats, isFirstNight) {
+  if (!Array.isArray(targetSeats) || targetSeats.length === 0) return null;
+  const wakeable = (seat) => {
+    const def = NIGHT_ACTIONS[seat?.actualRoleId];
+    if (!def) return false;
+    if (!def.action || def.action === 'manual' || def.action === 'passive') return false;
+    if (def.phase === 'first' && !isFirstNight) return false;
+    if (def.phase === 'other' && isFirstNight) return false;
+    return true;
+  };
+  const woke = targetSeats.filter(wakeable);
+  return {
+    value: woke.length,
+    breakdown: {
+      wokeSeats: woke.map(s => s.seatNum),
+    },
+  };
+}
+
 // Top-level dispatch — returns a suggestion for any info role we can compute.
 // ctx supplies extra context for roles that need history (viewingDayIndex,
 // nominationsByDay, daysSnapshots, etc.).
@@ -8204,6 +8288,7 @@ function infoSuggestion(roleId, mySeat, seats, ctx) {
     case 'flowergirl':    return computeFlowerGirlSuggestion(ctx);
     case 'towncrier':     return computeTownCrierSuggestion(ctx);
     case 'undertaker':    return computeUndertakerSuggestion(ctx);
+    case 'grandmother':   return computeGrandmotherSuggestion(seats);
     default:              return null;
   }
 }
@@ -8422,6 +8507,21 @@ function listSetupReminders(seats, doneMap) {
       autoDetected: auto,
     });
   }
+  const gmSeat = (seats || []).find(s => s.actualRoleId === 'grandmother');
+  if (gmSeat) {
+    const auto = (seats || []).some(s => (s.reminders || []).some(r =>
+      r && r.charId === 'grandmother' && /grandchild|child/i.test(r.label || '')
+    ));
+    const manual = !!doneMap['grandmother-grandchild'];
+    items.push({
+      id: 'grandmother-grandchild',
+      title: 'Place the Grandchild marker',
+      description: 'Place the "Grandchild" reminder on any player. On the first night the Grandmother will be shown this player and their character; if a Demon kills them later, the Grandmother dies too.',
+      icon: 'grandmother',
+      done: auto || manual,
+      autoDetected: auto,
+    });
+  }
   return items;
 }
 
@@ -8520,9 +8620,18 @@ function STResponseCard({ seatNum, prompt, seats, scriptCharIds = [], onSend }) 
   const targetSeats = targets.map(n => seats.find(s => s.seatNum === n)).filter(Boolean);
   const askerAfflicted = isDrunkOrPoisoned(mySeat);
   const isRolePick = prompt.action === 'target1+role';
+  const isNumberPick = prompt.action === 'target2+number';
   // Auto-suggested role for target1+role = the chosen seat's actualRoleId.
   const suggestedRoleId = isRolePick && targetSeats[0] ? targetSeats[0].actualRoleId : null;
   const [pickedRole, setPickedRole] = useState('');
+  const [pickedNumber, setPickedNumber] = useState(null);
+  // Number-pick suggestion (Chambermaid): count seats whose role wakes tonight.
+  // The night phase isn't tracked on the prompt itself; infer from viewingDayIndex
+  // when present, else default to other-night (Chambermaid is rarely a first-night
+  // resolve target since the ST sees both nights identically).
+  const numberSuggestion = isNumberPick
+    ? computeChambermaidSuggestion(targetSeats, (prompt.nightIdx || 0) === 0)
+    : null;
   // Auto-suggest YES if any target is demon-team or has a Red Herring reminder.
   const yesReason = [];
   for (const ts of targetSeats) {
@@ -8602,8 +8711,55 @@ function STResponseCard({ seatNum, prompt, seats, scriptCharIds = [], onSend }) 
         </ul>
       </div>
 
-      {/* Branch on response shape: yes/no buttons for FT, role grid for Ravenkeeper-style */}
-      {isRolePick ? (
+      {/* Branch on response shape: yes/no buttons for FT, role grid for RK-style, number buttons for Chambermaid */}
+      {isNumberPick ? (
+        <div>
+          <div className="flex items-baseline justify-between gap-2 mb-1.5">
+            <span className="text-xs uppercase tracking-wider text-amber-300">Send the count</span>
+            {numberSuggestion != null && (
+              <button onClick={() => setPickedNumber(numberSuggestion.value)}
+                className={`text-[11px] px-2 py-1 rounded transition
+                  ${pickedNumber === numberSuggestion.value
+                    ? 'bg-emerald-700/60 text-emerald-100 border border-emerald-600'
+                    : 'pill hover:border-emerald-500 hover:text-emerald-200 text-emerald-300'}`}>
+                {pickedNumber === numberSuggestion.value ? '✓ Suggested: ' : 'Suggested: '}
+                <span className="font-bold">{numberSuggestion.value}</span>
+              </button>
+            )}
+          </div>
+          {numberSuggestion?.breakdown?.wokeSeats && numberSuggestion.breakdown.wokeSeats.length > 0 && (
+            <div className="text-[10px] text-stone-400 mb-1.5">
+              Wakeful chosen: {numberSuggestion.breakdown.wokeSeats.map(n => '#' + n).join(', ')}
+            </div>
+          )}
+          <div className="flex items-center justify-center gap-3 py-2">
+            {[0, 1, 2].map(n => {
+              const isSug = numberSuggestion?.value === n;
+              return (
+                <button key={n} onClick={() => setPickedNumber(n)}
+                  className={`w-14 h-14 rounded-lg text-2xl font-bold transition
+                    ${pickedNumber === n
+                      ? 'bg-amber-600 text-stone-950'
+                      : isSug
+                        ? 'pill border-emerald-600/70 text-emerald-200 hover:border-emerald-500'
+                        : 'pill hover:border-amber-500'}`}>
+                  {n}
+                </button>
+              );
+            })}
+          </div>
+          <div className="grid grid-cols-1 gap-2 pt-3">
+            <button onClick={() => onSend({ type: 'number', number: pickedNumber })}
+              disabled={pickedNumber == null}
+              className={`py-3 rounded-lg text-base font-bold transition
+                ${pickedNumber != null
+                  ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40'
+                  : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+              Send count →
+            </button>
+          </div>
+        </div>
+      ) : isRolePick ? (
         <div>
           <div className="flex items-baseline justify-between gap-2 mb-1.5">
             <span className="text-xs uppercase tracking-wider text-amber-300">Pick the role to reveal</span>
@@ -9253,6 +9409,8 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
     canSend = pickedYes === true || pickedYes === false;
   } else if (infoType === 'seat+role-pair') {
     canSend = pickedSeats.length === 1 && !!pickedRole && !!pickedFalseRole && pickedRole !== pickedFalseRole;
+  } else if (infoType === 'seat+role') {
+    canSend = pickedSeats.length === 1 && !!pickedRole;
   } else if (infoType === 'role-list') {
     canSend = (pickedRole || '').split(',').filter(Boolean).length > 0;
   }
@@ -9270,6 +9428,9 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
       const roles = [pickedRole, pickedFalseRole];
       if (Math.random() < 0.5) roles.reverse();
       return { type: 'seat+role-pair', askSeat: pickedSeats[0], roles };
+    }
+    if (infoType === 'seat+role') {
+      return { type: 'seat+role', askSeat: pickedSeats[0], roleId: pickedRole };
     }
     if (infoType === 'role-list') {
       return { type: 'role-list', roleIds: (pickedRole || '').split(',').filter(Boolean) };
@@ -9396,6 +9557,100 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
             )}
           </>
         )}
+
+        {infoType === 'seat+role' && (() => {
+          // Grandmother: pick one seat AND one role. Suggestion = whoever has
+          // the Grandchild reminder, plus that seat's actualRoleId.
+          const suggestion = infoSuggestion(step.char.id, targetSeat, seats, suggestionCtx);
+          const sugSeat = suggestion?.value?.askSeat ?? null;
+          const sugRole = suggestion?.value?.roleId ?? null;
+          const acceptSuggestion = () => {
+            if (sugSeat != null) setPickedSeats([sugSeat]);
+            if (sugRole) setPickedRole(sugRole);
+          };
+          const sugBoth = sugSeat != null && sugRole &&
+            pickedSeats.length === 1 && pickedSeats[0] === sugSeat && pickedRole === sugRole;
+          return (
+            <>
+              <div>
+                <div className="flex items-baseline justify-between gap-2 mb-1.5">
+                  <div className="text-xs uppercase tracking-wider text-amber-300">
+                    Pick the seat to reveal
+                  </div>
+                  {suggestion && (
+                    <button onClick={acceptSuggestion}
+                      className={`text-[11px] px-2 py-1 rounded transition
+                        ${sugBoth
+                          ? 'bg-emerald-700/60 text-emerald-100 border border-emerald-600'
+                          : 'pill hover:border-emerald-500 hover:text-emerald-200 text-emerald-300'}`}>
+                      {sugBoth ? '✓ Suggested: ' : 'Suggested: '}
+                      <span className="font-bold">
+                        #{sugSeat}{suggestion.breakdown?.playerName ? ' · ' + suggestion.breakdown.playerName : ''} · {suggestion.breakdown?.roleName || '?'}
+                      </span>
+                    </button>
+                  )}
+                </div>
+                <ul className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-48 overflow-y-auto">
+                  {(seats || []).map(s => {
+                    const picked = pickedSeats.includes(s.seatNum);
+                    const rc = CHAR_BY_ID[s.actualRoleId];
+                    const isSug = sugSeat === s.seatNum;
+                    return (
+                      <li key={s.seatNum}>
+                        <button onClick={() => setPickedSeats([s.seatNum])}
+                          className={`w-full card rounded px-2 py-1.5 flex items-center gap-2 text-left text-sm
+                            ${picked
+                              ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700'
+                              : isSug ? 'border-emerald-600/70 hover:border-emerald-500' : 'hover:border-amber-500'}
+                            ${s.isDead ? 'opacity-60' : ''}`}>
+                          <span className="text-amber-200/80 text-xs w-6 text-center flex-shrink-0">#{s.seatNum}</span>
+                          {iconUrl(s.actualRoleId) ? (
+                            <img src={iconUrl(s.actualRoleId)} alt=""
+                              className="w-8 h-8 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                          ) : (
+                            <span className="w-8 h-8 flex-shrink-0"></span>
+                          )}
+                          <div className="flex-1 min-w-0 leading-tight">
+                            <div className="truncate">{s.playerName || <span className="text-stone-500 italic">—</span>}</div>
+                            <div className={`text-[10px] uppercase tracking-wider truncate ${rc ? `team-${rc.team}` : 'text-stone-500'}`}>
+                              {rc?.name || '(no role)'}
+                            </div>
+                          </div>
+                          {picked && <span className="text-amber-300 text-base">✓</span>}
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+              <div>
+                <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">
+                  Pick the role to reveal
+                </div>
+                <ul className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-48 overflow-y-auto">
+                  {candidateRoles.map(rc => {
+                    const isSug = sugRole === rc.id;
+                    return (
+                      <li key={rc.id}>
+                        <button onClick={() => setPickedRole(rc.id)}
+                          className={`w-full card rounded px-2 py-1.5 flex items-center gap-2 text-left text-sm
+                            ${pickedRole === rc.id
+                              ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700'
+                              : isSug ? 'border-emerald-600/70 hover:border-emerald-500' : 'hover:border-amber-500'}`}>
+                          {iconUrl(rc.id) && <img src={iconUrl(rc.id)} alt="" className="w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0" />}
+                          <span className={`flex-1 min-w-0 truncate team-${rc.team}`}>{rc.name}</span>
+                          {isSug && pickedRole !== rc.id && (
+                            <span className="w-2 h-2 rounded-full bg-emerald-500 flex-shrink-0"></span>
+                          )}
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            </>
+          );
+        })()}
 
         {infoType === 'role-list' && (() => {
           // Auto-suggest: list of all in-play role IDs matching the team.
@@ -10097,6 +10352,31 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose }
               ))}
             </ul>
           )}
+        </div>
+      );
+    } else if (info.type === 'seat+role') {
+      const askSeat = seatBy[info.askSeat];
+      const role = info.roleId ? CHAR_BY_ID[info.roleId] : null;
+      infoBody = (
+        <div className="space-y-4">
+          <div className="text-center text-sm text-stone-300">Your Grandchild is:</div>
+          {askSeat ? (
+            <div className="card rounded p-3 text-center">
+              <div className="text-amber-200/80 text-xs">seat #{askSeat.seatNum}</div>
+              <div className="text-lg text-amber-100 font-semibold truncate">
+                {askSeat.playerName || <span className="text-stone-500 italic">—</span>}
+              </div>
+            </div>
+          ) : <div className="text-stone-500 italic text-center">(unknown seat)</div>}
+          <div className="text-center text-sm text-stone-300">Their character is:</div>
+          {role ? (
+            <div className="flex flex-col items-center gap-2">
+              {iconUrl(role.id) && (
+                <img src={iconUrl(role.id)} alt="" className="w-24 h-24 rounded-full border-2 border-amber-700 object-cover" />
+              )}
+              <div className={`text-2xl font-bold team-${role.team}`}>{role.name}</div>
+            </div>
+          ) : <div className="text-stone-400 italic text-center">(no role)</div>}
         </div>
       );
     }

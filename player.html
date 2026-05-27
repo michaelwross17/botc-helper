@@ -1280,6 +1280,31 @@ function NightInfoScreen({ mySeat, seats, prompt, onAck, onQuestion }) {
         </ul>
       </div>
     );
+  } else if (info.type === 'seat+role') {
+    const askSeat = seatBy[info.askSeat];
+    const role = info.roleId ? CHAR_BY_ID[info.roleId] : null;
+    body = (
+      <div className="space-y-4">
+        <div className="text-center text-sm text-stone-300">Your Grandchild is:</div>
+        {askSeat ? (
+          <div className="card rounded p-3 text-center">
+            <div className="text-amber-200/80 text-xs">seat #{askSeat.seatNum}</div>
+            <div className="text-lg text-amber-100 font-semibold truncate">
+              {askSeat.playerName || <span className="text-stone-500 italic">—</span>}
+            </div>
+          </div>
+        ) : <div className="text-stone-500 italic text-center">(unknown seat)</div>}
+        <div className="text-center text-sm text-stone-300">Their character is:</div>
+        {role ? (
+          <div className="flex flex-col items-center gap-2">
+            {iconUrl(role.id) && (
+              <img src={iconUrl(role.id)} alt="" className="w-24 h-24 rounded-full border-2 border-amber-700 object-cover" />
+            )}
+            <div className={`text-2xl font-bold team-${role.team}`}>{role.name}</div>
+          </div>
+        ) : <div className="text-stone-400 italic text-center">(no role)</div>}
+      </div>
+    );
   } else {
     body = <div className="text-stone-400 italic text-center">(no info)</div>;
   }
