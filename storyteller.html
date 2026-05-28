@@ -2416,9 +2416,20 @@ function App() {
         if (n >= 3) return null;     // remove on what would be the 4th night
         return { ...r, label: `Drunk ${n + 1}` };
       }).filter(Boolean);
+      // Minstrel: 2-night countdown. Placed when a minion is executed; the
+      // marker should last through this night + the following day, ending
+      // at the second Go-to-Night.  Drunk 1 -> Drunk 2 -> null.
+      const bumpMinstrel = (rs) => (rs || []).map(r => {
+        if (!r || r.charId !== 'minstrel') return r;
+        const m = String(r.label || '').match(/^drunk\s*(\d+)?$/i);
+        if (!m) return r;
+        const n = m[1] ? parseInt(m[1], 10) : 1;
+        if (n >= 2) return null;     // remove at the next Go-to-Night
+        return { ...r, label: `Drunk ${n + 1}` };
+      }).filter(Boolean);
       const seatsForNewNight = (g.seats || []).map(seat => ({
         ...seat,
-        reminders: bumpCourtier(filterReminders(seat.reminders)),
+        reminders: bumpMinstrel(bumpCourtier(filterReminders(seat.reminders))),
       }));
       const travellersForNewNight = (g.travellers || []).map(t => ({
         ...t,
@@ -2499,8 +2510,86 @@ function App() {
       body,
       actions: [
         { label: executeLabel, primary: true, onClick: () => {
+          // Capture metadata about the executed seat BEFORE we mutate.
+          const execSeat = (g.seats || []).find(s => s.seatNum === onBlock.nomineeSeat);
+          const execTeam = (CHAR_BY_ID[execSeat?.actualRoleId] || {}).team;
+          const mmSeat = (g.seats || []).find(s => s.actualRoleId === 'mastermind' && !s.isDead && s.seatNum !== onBlock.nomineeSeat);
+          const minstrelSeat = (g.seats || []).find(s => s.actualRoleId === 'minstrel' && !s.isDead && s.seatNum !== onBlock.nomineeSeat);
+          const minstrelAfflicted = minstrelSeat ? isDrunkOrPoisoned(minstrelSeat) : false;
+          const masterFires  = execTeam === 'demon'  && !!mmSeat;
+          const minstrelFires = execTeam === 'minion' && !!minstrelSeat;
+
           _executePlayer(onBlock.nomineeSeat);
           update(s => ({ grimoire: { ...s.grimoire, lastExecution: { seatNum: onBlock.nomineeSeat, dayIdx } } }));
+
+          // Minstrel: place 'Drunk 1' on every non-Minstrel seat. The
+          // marker is permanent (handled by isReminderPermanent above) and
+          // ticks down via bumpMinstrel in subsequent advanceToNight calls.
+          // Helper closes over minstrelSeat so the Minstrel herself is
+          // excluded.
+          const _applyMinstrel = () => {
+            update(s => {
+              const seats = (s.grimoire.seats || []).map(seat => {
+                if (!minstrelSeat || seat.seatNum === minstrelSeat.seatNum) return seat;
+                const has = (seat.reminders || []).some(r =>
+                  r && r.charId === 'minstrel' && /^drunk\s*\d*$/i.test(String(r.label || '')));
+                if (has) return seat;
+                return { ...seat, reminders: [...(seat.reminders || []), { charId: 'minstrel', label: 'Drunk 1', fromPrompt: true }] };
+              });
+              return { grimoire: { ...s.grimoire, seats } };
+            });
+          };
+          const _cancelMinstrel = () => {
+            update(s => {
+              const seats = (s.grimoire.seats || []).map(seat => {
+                const reminders = (seat.reminders || []).filter(r =>
+                  !(r && r.charId === 'minstrel' && /^drunk\s*\d*$/i.test(String(r.label || ''))));
+                if (reminders.length === (seat.reminders || []).length) return seat;
+                return { ...seat, reminders };
+              });
+              return { grimoire: { ...s.grimoire, seats } };
+            });
+          };
+
+          if (minstrelFires) {
+            // Always place markers immediately so they're present through
+            // the Go-to-Night that's about to fire (and get bumped to
+            // 'Drunk 2'). The afflicted popup includes a Cancel action that
+            // strips them after the fact.
+            _applyMinstrel();
+            const minstrelLabel = minstrelSeat.playerName ? minstrelSeat.playerName + ' (seat #' + minstrelSeat.seatNum + ')' : 'seat #' + minstrelSeat.seatNum;
+            const execLabel    = execSeat?.playerName    ? execSeat.playerName    + ' (seat #' + execSeat.seatNum    + ')' : 'seat #' + execSeat?.seatNum;
+            if (minstrelAfflicted) {
+              addCornerPrompt({
+                kind: 'warn',
+                title: 'Minstrel ability (afflicted)',
+                body: `Minion ${execLabel} was executed and the Minstrel ${minstrelLabel} is alive but DRUNK/POISONED. 'Drunk' markers have been placed on every other player; cancel them if her ability shouldn't fire.`,
+                actions: [
+                  { label: 'Keep markers', primary: true },
+                  { label: 'Cancel markers', onClick: _cancelMinstrel },
+                ],
+              });
+            } else {
+              addCornerPrompt({
+                kind: 'success',
+                title: 'Minstrel ability fired',
+                body: `Minion ${execLabel} was executed. The Minstrel ${minstrelLabel} is alive and sober — every other non-traveller player is now drunk until dusk tomorrow.`,
+                actions: [{ label: 'OK', primary: true }],
+              });
+            }
+          }
+
+          if (masterFires) {
+            const mmLabel = mmSeat.playerName ? mmSeat.playerName + ' (seat #' + mmSeat.seatNum + ')' : 'seat #' + mmSeat.seatNum;
+            const execLabel = execSeat?.playerName ? execSeat.playerName + ' (seat #' + execSeat.seatNum + ')' : 'seat #' + execSeat?.seatNum;
+            addCornerPrompt({
+              kind: 'warn',
+              title: 'Mastermind alive — game continues',
+              body: `The Demon ${execLabel} was executed, BUT the Mastermind ${mmLabel} is alive. The game does NOT end. Do not announce the Demon's death. Play 1 more day — if anyone is executed tomorrow, their team loses.`,
+              actions: [{ label: 'Got it', primary: true }],
+            });
+          }
+
           advanceToNight();
         }},
         { label: skipLabel, onClick: () => advanceToNight() },
@@ -8545,6 +8634,9 @@ function isReminderPermanent(reminder) {
   // Courtier countdown — 3-night "Drunk 1/2/3" persists; advanceToNight
   // increments and removes.
   if (reminder.charId === 'courtier' && /^drunk\s*\d*$/i.test(reminder.label || '')) return true;
+  // Minstrel countdown — 2-night "Drunk 1/2" placed on every non-Minstrel
+  // seat after a minion is executed. advanceToNight bumps + removes.
+  if (reminder.charId === 'minstrel' && /^drunk\s*\d*$/i.test(reminder.label || '')) return true;
   // Godfather "Died Today" persists into the night so the Godfather can
   // wake and use the trigger. After they act, it's cleared programmatically.
   if (reminder.charId === 'godfather' && /died today/i.test(reminder.label || '')) return true;
