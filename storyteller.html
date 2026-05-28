@@ -1613,6 +1613,49 @@ function App() {
     });
   }, [JSON.stringify(state.grimoire.nightPrompts || {})]);
 
+  // Effect: Po reconcile — runs independently of the main submitted-prompts
+  // effect. For every Po prompt in 'submitted' or 'done', ensures the seat's
+  // Hungry reminder reflects the latest target count:
+  //   - 0 targets → place 'Hungry' if missing
+  //   - 3+ targets → strip 'Hungry' if present
+  // Robust against races in the main effect's seat-copy accumulator (which
+  // can silently lose writes if another branch overwrites __seatsCopy).
+  useEffect(() => {
+    if (!loaded || isSpectator) return;
+    const prompts = state.grimoire.nightPrompts || {};
+    let nextSeats = null;
+    for (const [seatStr, p] of Object.entries(prompts)) {
+      if (!p || p.roleId !== 'po') continue;
+      if (p.status !== 'submitted' && p.status !== 'done') continue;
+      const poSeatNum = Number(seatStr);
+      const baseSeats = nextSeats || state.grimoire.seats || [];
+      const poSeat = baseSeats.find(s => s.seatNum === poSeatNum);
+      if (!poSeat) continue;
+      const targets = Array.isArray(p.targets)
+        ? p.targets
+        : (p.targets ? [p.targets] : []);
+      const hasHungry = (poSeat.reminders || []).some(r =>
+        r && r.charId === 'po' && /hungry|3 to kill/i.test(String(r.label || '')));
+      if (targets.length === 0 && !hasHungry) {
+        nextSeats = baseSeats.map(s =>
+          s.seatNum === poSeatNum
+            ? { ...s, reminders: [...(s.reminders || []), { charId: 'po', label: 'Hungry', fromPrompt: true }] }
+            : s
+        );
+      } else if (targets.length >= 3 && hasHungry) {
+        nextSeats = baseSeats.map(s =>
+          s.seatNum === poSeatNum
+            ? { ...s, reminders: (s.reminders || []).filter(r =>
+                !(r && r.charId === 'po' && /hungry|3 to kill/i.test(String(r.label || '')))) }
+            : s
+        );
+      }
+    }
+    if (nextSeats) {
+      update({ grimoire: { ...state.grimoire, seats: nextSeats } });
+    }
+  }, [JSON.stringify(state.grimoire.nightPrompts || {}), JSON.stringify(state.grimoire.seats || [])]);
+
   // Effect: Innkeeper-style intermediate placement. When the prompt parks at
   // 'awaiting-st-response' (player has submitted, ST hasn't responded yet)
   // we drop the target reminder on each chosen seat so the ST can see the
@@ -11284,21 +11327,11 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
         effectiveAction = 'target3';
       }
     }
-    // Moonchild: only emit an active step on a night she has 'Triggered'
-    // (set when she just died via demon kill OR via execution). Otherwise
-    // dim — her ability only fires on the night of her death.
-    if (id === 'moonchild') {
-      const mcSeat = matched[0];
-      const triggered = !!(mcSeat?.reminders || []).some(r =>
-        r && r.charId === 'moonchild' && /trigger/i.test(String(r.label || '')));
-      if (!triggered) {
-        def = { ...def, action: 'passive', instruction: 'Moonchild has not died yet — does not wake.' };
-        effectiveAction = 'passive';
-      } else {
-        // Use the configured target1 action.
-        effectiveAction = def.action;
-      }
-    }
+    // Moonchild: skip her natural night-order slot entirely. When triggered,
+    // a synthetic step is injected right after the Dawn ceremony (see the
+    // post-loop block below) so the ST handles her pick while announcing
+    // morning deaths.
+    if (id === 'moonchild') continue;
     // Demon dim when exorcised: any demon seat carrying an 'Exorcised'
     // reminder (placed by Exorcist) does not wake tonight.
     if (CHAR_BY_ID[id]?.team === 'demon') {
@@ -11368,6 +11401,49 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
           },
           prompt,
         });
+      }
+    }
+  }
+  // Moonchild after-dawn injection. When any Moonchild seat carries the
+  // 'Triggered' reminder, splice a synthetic step right after the Dawn
+  // ceremony so the ST handles her pick while announcing morning deaths.
+  {
+    const triggeredMc = (seats || []).find(s =>
+      s.actualRoleId === 'moonchild' &&
+      (s.reminders || []).some(r => r && r.charId === 'moonchild' && /trigger/i.test(String(r.label || '')))
+    );
+    if (triggeredMc) {
+      const mcChar = CHAR_BY_ID['moonchild'] || { id: 'moonchild', name: 'Moonchild', team: 'outsider' };
+      const prompt = nightPrompts[triggeredMc.seatNum];
+      const dawnIdx = steps.findIndex(s => s.type === 'ceremony' && s.id === 'dawn');
+      const mcStep = {
+        type: 'char',
+        char: mcChar,
+        seat: triggeredMc,
+        reminder: '',
+        isExtra: false,
+        action: 'target1',
+        instruction: 'The Moonchild just died — they publicly choose 1 alive player. If that player is good, they die.',
+        reminderLabel: 'Chose',
+        requiresDeath: false,
+        oncePerGame: false,
+        canSkip: false,
+        infoType: undefined,
+        infoConfig: undefined,
+        prompt,
+      };
+      if (dawnIdx >= 0) {
+        steps.splice(dawnIdx + 1, 0, mcStep);
+      } else {
+        steps.push(mcStep);
+      }
+      // Renumber stepNum on char steps so the UI shows clean ordering.
+      let n = 0;
+      for (const s of steps) {
+        if (s.type === 'char') {
+          n += 1;
+          s.stepNum = n;
+        }
       }
     }
   }
