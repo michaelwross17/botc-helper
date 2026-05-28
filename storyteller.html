@@ -2129,6 +2129,55 @@ function App() {
             }
           }
         }
+        // Pukka — after the standard per-target loop places the new
+        // 'Pukka: Poisoned' marker on this night's pick, scan all ALIVE
+        // seats for the 'Pukka: Dead' marker (placed there at last
+        // Go-to-Night by converting the previous night's Poisoned).
+        // For each, fire a corner popup with protection reasons and
+        // Kill / Skip actions. Killing uses _killSeatDirect so Fool /
+        // Sailor / etc. auto-protections still apply; the marker is
+        // stripped first so the kill's own Dead reminder doesn't
+        // duplicate it. Skip just strips the marker.
+        if (p.roleId === 'pukka') {
+          const baseSeats = next.__seatsCopy || state.grimoire.seats;
+          const marked = baseSeats.filter(s =>
+            !s.isDead && (s.reminders || []).some(r =>
+              r && r.charId === 'pukka' && /^dead$/i.test(String(r.label || ''))));
+          for (const ms of marked) {
+            const stripPukkaDead = (sn) => {
+              update(s => {
+                const seats = (s.grimoire.seats || []).map(s0 => {
+                  if (s0.seatNum !== sn) return s0;
+                  const reminders = (s0.reminders || []).filter(r =>
+                    !(r && r.charId === 'pukka' && /^dead$/i.test(String(r.label || ''))));
+                  return { ...s0, reminders };
+                });
+                return { grimoire: { ...s.grimoire, seats } };
+              });
+            };
+            const seatLabel = ms.playerName ? ms.playerName + ' (seat #' + ms.seatNum + ')' : 'seat #' + ms.seatNum;
+            const protectionInfo = checkDeathProtection(ms, state.grimoire.seats || [], 'pukka');
+            const reasonsBlock = protectionInfo.reasons.length > 0
+              ? '\n\nProtection:\n• ' + protectionInfo.reasons.join('\n• ')
+              : '';
+            const targetSeatNum = ms.seatNum;
+            setTimeout(() => addCornerPrompt({
+              kind: 'warn',
+              title: 'Pukka kill',
+              body: 'Pukka poisoned ' + seatLabel + ' last night. They die tonight (after the previously-poisoned heals).' + reasonsBlock,
+              actions: [
+                { label: 'Kill', primary: true, onClick: () => {
+                  // Strip the marker first so _killSeatDirect's own Dead
+                  // reminder doesn't duplicate. _killSeatDirect routes
+                  // through tryFool/trySailor automatically.
+                  stripPukkaDead(targetSeatNum);
+                  _killSeatDirect(targetSeatNum, 'pukka');
+                }},
+                { label: 'Skip — spare them', onClick: () => stripPukkaDead(targetSeatNum) },
+              ],
+            }), 0);
+          }
+        }
         // Sailor — runs unconditionally on 'submitted'. The target1+st-pick
         // action carries no per-target reminderLabel, so the inner !isInfo /
         // isInfo branches don't fire for it. Place the chosen 'Drunk' here
@@ -2581,10 +2630,22 @@ function App() {
       }));
       const seatsWithTL = applyTeaLadyProtection(seatsForNewNight);
       const seatsWithSailor = applySailorProtection(seatsWithTL);
+      // Pukka conversion — at end-of-day, every 'Pukka: Poisoned' marker
+      // becomes 'Pukka: Dead' so the next Pukka pick can resolve a kill
+      // on the previously-poisoned player.
+      const seatsWithPukka = seatsWithSailor.map(seat => ({
+        ...seat,
+        reminders: (seat.reminders || []).map(r => {
+          if (r && r.charId === 'pukka' && /^poisoned$/i.test(String(r.label || ''))) {
+            return { ...r, label: 'Dead' };
+          }
+          return r;
+        }),
+      }));
       return {
         grimoire: {
           ...g,
-          seats: seatsWithSailor,
+          seats: seatsWithPukka,
           travellers: travellersForNewNight,
           nightPrompts: {},
           days: [...(g.days || []), snapshot],
@@ -8680,7 +8741,7 @@ const NIGHT_ACTIONS = {
 
   // ===== Bad Moon Rising =====
   godfather:     { action: 'target1',     reminder: 'Dead',        instruction: 'An Outsider died today — choose a player to die tonight.', phase: 'other' },
-  pukka:         { action: 'target1self', reminder: 'Poisoned',    instruction: 'Choose a player. They are poisoned; the previously poisoned player dies.' },
+  pukka:         { action: 'target1self', reminder: 'Poisoned',    instruction: 'Choose a player. They are poisoned now. The player you chose LAST night dies tonight (a popup will prompt you).' },
   shabaloth:     { action: 'target2',     reminder: 'Dead',        instruction: 'Choose 2 players — they die. A dead player you chose last night might be regurgitated.', phase: 'other' },
   po:            { action: 'po-flex',     reminder: 'Dead',        instruction: 'Choose a player to kill, OR pick none. (Pick no one → next night you must pick 3.)', phase: 'other' },
   moonchild:     { action: 'target1',     reminder: 'Chose',       instruction: 'You just died — choose any alive player. If they are good, they die.', eligible: 'all', requiresDeath: true },
@@ -8813,6 +8874,11 @@ function isReminderPermanent(reminder) {
   if (reminder.charId === 'po' && /hungry|3 to kill/i.test(reminder.label || '')) return true;
   // Moonchild 'Triggered' (just died) persists until ST resolves the pick.
   if (reminder.charId === 'moonchild' && /trigger/i.test(reminder.label || '')) return true;
+  // Pukka 'Poisoned' and 'Dead' markers — Poisoned persists through the
+  // day, gets converted to 'Dead' at Go-to-Night, and 'Dead' persists
+  // until the next Pukka pick resolves the kill (or the ST skips).
+  if (reminder.charId === 'pukka' && /^poisoned$/i.test(reminder.label || '')) return true;
+  if (reminder.charId === 'pukka' && /^dead$/i.test(reminder.label || '')) return true;
   // Moonchild 'Dead' marker (placed on the chosen target at capture)
   // persists across nights until the ST resolves at the natural slot.
   if (reminder.charId === 'moonchild' && /^dead$/i.test(reminder.label || '')) return true;
