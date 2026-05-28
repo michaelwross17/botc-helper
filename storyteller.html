@@ -2541,16 +2541,23 @@ function App() {
         seat.seatNum === seatNum ? { ...seat, isDead: true } : seat
       );
       const executed = seats0.find(seat => seat.seatNum === seatNum);
-      // Moonchild execution: place 'Triggered' on the Moonchild and queue
-      // the popup so the ST picks her target. The popup fires after this
-      // update commits via the effect listener.
+      // Moonchild execution: place 'Triggered' AND 'Dead' on the Moonchild,
+      // then queue the popup so the ST picks her target. 'Dead' is required
+      // by the requiresDeath activation path so the night-step row lights up
+      // (executed seats normally have isDead=true but no Dead reminder).
       if (executed && executed.actualRoleId === 'moonchild') {
         seats0.forEach((seat, i) => {
           if (seat.seatNum !== seatNum) return;
-          const hasTrigger = (seat.reminders || []).some(r =>
+          const existing = seat.reminders || [];
+          const hasTrigger = existing.some(r =>
             r && r.charId === 'moonchild' && /trigger/i.test(String(r.label || '')));
-          if (!hasTrigger) {
-            seats0[i] = { ...seat, reminders: [...(seat.reminders || []), { charId: 'moonchild', label: 'Triggered', fromPrompt: true }] };
+          const hasDead = existing.some(r =>
+            r && r.label === 'Dead');
+          const additions = [];
+          if (!hasTrigger) additions.push({ charId: 'moonchild', label: 'Triggered', fromPrompt: true });
+          if (!hasDead)    additions.push({ charId: 'moonchild', label: 'Dead',      fromPrompt: true });
+          if (additions.length > 0) {
+            seats0[i] = { ...seat, reminders: [...existing, ...additions] };
           }
         });
         // Fire popup outside the updater on next tick.
@@ -8206,7 +8213,7 @@ const NIGHT_ACTIONS = {
   pukka:         { action: 'target1self', reminder: 'Poisoned',    instruction: 'Choose a player. They are poisoned; the previously poisoned player dies.' },
   shabaloth:     { action: 'target2',     reminder: 'Dead',        instruction: 'Choose 2 players — they die. A dead player you chose last night might be regurgitated.', phase: 'other' },
   po:            { action: 'po-flex',     reminder: 'Dead',        instruction: 'Choose a player to kill, OR pick none. (Pick no one → next night you must pick 3.)', phase: 'other' },
-  moonchild:     { action: 'target1',     reminder: 'Chose',       instruction: 'You just died — choose any alive player. If they are good, they die.', eligible: 'all' },
+  moonchild:     { action: 'target1',     reminder: 'Chose',       instruction: 'You just died — choose any alive player. If they are good, they die.', eligible: 'all', requiresDeath: true },
   zombuul:       { action: 'target1',     reminder: 'Dead',        instruction: 'If no one died today, choose a player to die tonight.', phase: 'other' },
   innkeeper:     { action: 'target2+st-pick', reminder: 'Safe',     instruction: 'Choose 2 players — they are safe from the Demon tonight, but one becomes drunk.', phase: 'other' },
   gambler:       { action: 'target1+guess', reminder: 'Gambled',    instruction: 'Choose a player and guess their character. If wrong, you die.', phase: 'other' },
@@ -11327,11 +11334,23 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
         effectiveAction = 'target3';
       }
     }
-    // Moonchild: skip her natural night-order slot entirely. When triggered,
-    // a synthetic step is injected right after the Dawn ceremony (see the
-    // post-loop block below) so the ST handles her pick while announcing
-    // morning deaths.
-    if (id === 'moonchild') continue;
+    // Moonchild: keep her natural night-order slot. requiresDeath: true
+    // means the row is dim while she's alive (and dim if she's dead without
+    // a 'Dead' reminder, e.g. revived). It activates once she's dead AND
+    // carrying a 'Dead' reminder — which both the demon kill path (demon's
+    // own target1 places 'Dead') and the execution hook (_executePlayer
+    // places it for moonchild) ensure. Once the 'Chose' marker is on her,
+    // the kill has been resolved; flip back to passive so the row stops
+    // soliciting a pick.
+    if (id === 'moonchild') {
+      const mcSeat = matched[0];
+      const resolved = !!(mcSeat?.reminders || []).some(r =>
+        r && r.charId === 'moonchild' && /^chose$/i.test(String(r.label || '')));
+      if (resolved) {
+        def = { ...def, action: 'passive', instruction: 'Moonchild has already chosen her target this game.' };
+        effectiveAction = 'passive';
+      }
+    }
     // Demon dim when exorcised: any demon seat carrying an 'Exorcised'
     // reminder (placed by Exorcist) does not wake tonight.
     if (CHAR_BY_ID[id]?.team === 'demon') {
@@ -11410,7 +11429,8 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
   {
     const triggeredMc = (seats || []).find(s =>
       s.actualRoleId === 'moonchild' &&
-      (s.reminders || []).some(r => r && r.charId === 'moonchild' && /trigger/i.test(String(r.label || '')))
+      (s.reminders || []).some(r => r && r.charId === 'moonchild' && /trigger/i.test(String(r.label || ''))) &&
+      !(s.reminders || []).some(r => r && r.charId === 'moonchild' && /^chose$/i.test(String(r.label || '')))
     );
     if (triggeredMc) {
       const mcChar = CHAR_BY_ID['moonchild'] || { id: 'moonchild', name: 'Moonchild', team: 'outsider' };
@@ -11425,7 +11445,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
         action: 'target1',
         instruction: 'The Moonchild just died — they publicly choose 1 alive player. If that player is good, they die.',
         reminderLabel: 'Chose',
-        requiresDeath: false,
+        requiresDeath: true,
         oncePerGame: false,
         canSkip: false,
         infoType: undefined,
