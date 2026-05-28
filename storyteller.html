@@ -1607,14 +1607,39 @@ function App() {
     });
     return true;
   };
+  // Corner-popup-driven death confirm. Shows protection reasons +
+  // drunk/poisoned warning + Confirm/Cancel. Replaces the old
+  // DeathConfirmModal path. The actual death routine lives in
+  // doConfirmDeathTriggers below.
   const queueDeathConfirm = (seatNum, causeCharId) => {
     if (tryFoolProtection(seatNum, causeCharId)) return;
     if (trySailorProtection(seatNum, causeCharId)) return;
-    setDeathConfirmInfo({ seatNum, causeCharId: causeCharId || null });
+    const seat = (state.grimoire.seats || []).find(s => s.seatNum === seatNum);
+    if (!seat || seat.isDead) return;
+    const protectionInfo = checkDeathProtection(seat, state.grimoire.seats || [], causeCharId);
+    const seatLabel = seat.playerName ? seat.playerName + ' (seat #' + seat.seatNum + ')' : 'seat #' + seat.seatNum;
+    const causeName = causeCharId ? ((CHAR_BY_ID[causeCharId] || {}).name || causeCharId) : 'unknown source';
+    const reasonsBlock = protectionInfo.reasons.length > 0
+      ? '\n\nProtection:\n• ' + protectionInfo.reasons.join('\n• ')
+      : '';
+    const afflictedBlock = protectionInfo.afflicted
+      ? '\n\n⚠ Target is drunk/poisoned — their own abilities malfunction.'
+      : '';
+    addCornerPrompt({
+      kind: 'warn',
+      title: 'Confirm kill',
+      body: causeName + ' would kill ' + seatLabel + '.' + reasonsBlock + afflictedBlock,
+      actions: [
+        { label: 'Confirm kill', primary: true, onClick: () => doConfirmDeathTriggers(seatNum, causeCharId) },
+        { label: 'Cancel' },
+      ],
+    });
   };
-  const confirmDeath = () => {
-    if (!deathConfirmInfo) return;
-    const { seatNum: dyingSeatNum, causeCharId } = deathConfirmInfo;
+  // The actual death routine: sets isDead on the chosen seat, runs the
+  // Tea Lady strip, Moonchild trigger, and Grandmother trigger. Called from
+  // the corner-popup Confirm action above (and from the legacy confirmDeath
+  // stub below in case anything still references it).
+  const doConfirmDeathTriggers = (dyingSeatNum, causeCharId) => {
     update(s => {
       let seats = (s.grimoire.seats || []).map(s0 =>
         s0.seatNum === dyingSeatNum ? { ...s0, isDead: true } : s0
@@ -1629,7 +1654,6 @@ function App() {
     const seats = (state.grimoire.seats || []).map(s0 =>
       s0.seatNum === dyingSeatNum ? { ...s0, isDead: true } : s0
     );
-    setDeathConfirmInfo(null);
     // Grandmother trigger — if the seat that just died has the Grandmother's
     // Grandchild reminder AND the killer is a Demon, ask the ST to also kill
     // the Grandmother (corner popup, dismissable).
@@ -1671,6 +1695,14 @@ function App() {
         ],
       });
     } catch (_) { /* never let the trigger break the kill */ }
+  };
+  // Legacy stub: any caller that still invokes confirmDeath() with no args
+  // (e.g. from a stray DeathConfirmModal) routes through the new flow.
+  const confirmDeath = () => {
+    if (!deathConfirmInfo) return;
+    const { seatNum, causeCharId } = deathConfirmInfo;
+    setDeathConfirmInfo(null);
+    doConfirmDeathTriggers(seatNum, causeCharId);
   };
   const dismissDeathConfirm = () => setDeathConfirmInfo(null);
   const dismissResponsePopup = (seatNum) => {
@@ -3282,6 +3314,31 @@ function App() {
   // un-dims for tonight.
   const _executePlayer = (seatNum) => {
     update(s => {
+      // Zombuul evasion check: pre-execute. If the seat is Zombuul AND
+      // sober AND has no 'Executed once' marker, skip the kill, place
+      // the marker, and fire an info popup. Subsequent executions kill
+      // normally.
+      const liveSeats0 = s.grimoire.seats || [];
+      const targetSeat = liveSeats0.find(seat => seat.seatNum === seatNum);
+      if (targetSeat && targetSeat.actualRoleId === 'zombuul' && !isDrunkOrPoisoned(targetSeat)) {
+        const hasEvasion = (targetSeat.reminders || []).some(r =>
+          r && r.charId === 'zombuul' && /^executed once$/i.test(String(r.label || '')));
+        if (!hasEvasion) {
+          const seatsZ = liveSeats0.map(seat =>
+            seat.seatNum === seatNum
+              ? { ...seat, reminders: [...(seat.reminders || []), { charId: 'zombuul', label: 'Executed once', fromPrompt: true }] }
+              : seat
+          );
+          const zLabel = targetSeat.playerName ? targetSeat.playerName + ' (seat #' + seatNum + ')' : 'seat #' + seatNum;
+          setTimeout(() => addCornerPrompt({
+            kind: 'success',
+            title: 'Zombuul lives',
+            body: zLabel + ' (Zombuul) was executed but survives — they register as dead but live. The next execution kills them.',
+            actions: [{ label: 'OK', primary: true }],
+          }), 0);
+          return { grimoire: { ...s.grimoire, seats: seatsZ } };
+        }
+      }
       const seats0 = (s.grimoire.seats || []).map(seat =>
         seat.seatNum === seatNum ? { ...seat, isDead: true } : seat
       );
@@ -3848,15 +3905,10 @@ function App() {
         />
       )}
 
-      {deathConfirmInfo != null && localOverlayStep == null && localGrimoireSeat == null && (
-        <DeathConfirmModal
-          seat={(state.grimoire.seats || []).find(s => s.seatNum === deathConfirmInfo.seatNum)}
-          seats={state.grimoire.seats || []}
-          causeCharId={deathConfirmInfo.causeCharId}
-          onConfirm={confirmDeath}
-          onDismiss={dismissDeathConfirm}
-        />
-      )}
+      {/* DeathConfirmModal is replaced by corner-popup-based confirm. The
+          component and state remain in case any external code still calls
+          confirmDeath() directly, but queueDeathConfirm() now fires a
+          corner popup instead of opening the modal. */}
       {moonchildPickSeat != null && (
         <MoonchildPickModal
           mcSeat={(state.grimoire.seats || []).find(s => s.seatNum === moonchildPickSeat)}
@@ -9100,6 +9152,9 @@ function isReminderPermanent(reminder) {
   if (reminder.charId === 'po' && /hungry|3 to kill/i.test(reminder.label || '')) return true;
   // Moonchild 'Triggered' (just died) persists until ST resolves the pick.
   if (reminder.charId === 'moonchild' && /trigger/i.test(reminder.label || '')) return true;
+  // Zombuul 'Executed once' marker persists for the whole game — it
+  // tracks the one-time death-evasion trigger.
+  if (reminder.charId === 'zombuul' && /^executed once$/i.test(reminder.label || '')) return true;
   // Pukka 'Poisoned' and 'Dead' markers — Poisoned persists through the
   // day, gets converted to 'Dead' at Go-to-Night, and 'Dead' persists
   // until the next Pukka pick resolves the kill (or the ST skips).
