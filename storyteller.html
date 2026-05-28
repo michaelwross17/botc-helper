@@ -1640,6 +1640,7 @@ function App() {
   // the corner-popup Confirm action above (and from the legacy confirmDeath
   // stub below in case anything still references it).
   const doConfirmDeathTriggers = (dyingSeatNum, causeCharId) => {
+    if (tryLleechImmunity(dyingSeatNum, causeCharId)) return;
     update(s => {
       let seats = (s.grimoire.seats || []).map(s0 =>
         s0.seatNum === dyingSeatNum ? { ...s0, isDead: true } : s0
@@ -1654,6 +1655,11 @@ function App() {
     const seats = (state.grimoire.seats || []).map(s0 =>
       s0.seatNum === dyingSeatNum ? { ...s0, isDead: true } : s0
     );
+    // Passive on-death triggers — Sweetheart (any), Farmer (night-only),
+    // Banshee (demon-only). isDayDeath=false because this path fires for
+    // night kills via queueDeathConfirm.
+    const dyingForPassive = seats.find(s => s.seatNum === dyingSeatNum);
+    firePassiveDeathTriggers(dyingForPassive, causeCharId, false);
     // Grandmother trigger — if the seat that just died has the Grandmother's
     // Grandchild reminder AND the killer is a Demon, ask the ST to also kill
     // the Grandmother (corner popup, dismissable).
@@ -2090,6 +2096,16 @@ function App() {
               return { ...s0, reminders };
             });
             next.__seatsCopy = seatsCopy;
+          } else if (info.type === 'seat' || info.type === 'seats') {
+            // Knight/Noble/Steward/High Priestess: place the role's
+            // standard 'Saw' marker on the asking seat to mark the
+            // step as resolved. The actual revealed seat(s) live in
+            // info.askSeat / info.askSeats — visible on the player's phone.
+            placeOn(seatNum, p.reminderLabel || 'Saw');
+          } else if (info.type === 'direction') {
+            // Shugenja — record the shown direction on the asking seat.
+            const label = info.direction === 'cw' ? 'Saw CW' : 'Saw CCW';
+            placeOn(seatNum, label);
           } else if (info.type === 'seat+role') {
             // Grandmother — the 'Saw: <role>' marker goes on the SHOWN seat
             // (info.askSeat), which may differ from the true Grandchild if
@@ -2814,10 +2830,80 @@ function App() {
     return result;
   };
 
+  // applyNoDashiiPoison — each night (and at Begin Game), the No Dashii's
+  // 2 Townsfolk neighbours (nearest clockwise + counter-clockwise — DOES NOT
+  // skip dead seats, DOES skip non-Townsfolk) get a 'Poisoned' marker.
+  // Markers are scrubbed and replaced so a shifted neighbour layout (e.g.
+  // No Dashii dies / role changes) is automatically refreshed.
+  const applyNoDashiiPoison = (seats) => {
+    let result = (seats || []).map(s => ({
+      ...s,
+      reminders: (s.reminders || []).filter(r =>
+        !(r && r.charId === 'nodashii' && /^poisoned$/i.test(String(r.label || '')))),
+    }));
+    const noDashii = result.find(s => s.actualRoleId === 'nodashii' && !s.isDead);
+    if (!noDashii) return result;
+    if (isDrunkOrPoisoned(noDashii)) return result;
+    const n = result.length;
+    if (n < 2) return result;
+    const isTownsfolk = (s) => {
+      const c = CHAR_BY_ID[s.actualRoleId];
+      return c && c.team === 'townsfolk';
+    };
+    const sortedByNum = [...result].sort((a, b) => a.seatNum - b.seatNum);
+    const ndIdx = sortedByNum.findIndex(s => s.seatNum === noDashii.seatNum);
+    if (ndIdx === -1) return result;
+    const findTF = (step) => {
+      for (let i = 1; i < n; i++) {
+        const idx = ((ndIdx + step * i) % n + n) % n;
+        if (idx === ndIdx) return null;
+        if (isTownsfolk(sortedByNum[idx])) return sortedByNum[idx];
+      }
+      return null;
+    };
+    const cw  = findTF(+1);
+    const ccw = findTF(-1);
+    const poisonSeatNums = new Set();
+    if (cw)  poisonSeatNums.add(cw.seatNum);
+    if (ccw) poisonSeatNums.add(ccw.seatNum);
+    result = result.map(s =>
+      poisonSeatNums.has(s.seatNum)
+        ? { ...s, reminders: [...(s.reminders || []), { charId: 'nodashii', label: 'Poisoned', fromPrompt: true }] }
+        : s
+    );
+    return result;
+  };
+
+  // tryLleechImmunity — Lleech cannot die while their Host (marked with a
+  // 'lleech' 'Host' reminder placed on the first night) is alive. Returns
+  // true if the kill was blocked (with a corner popup fired).
+  const tryLleechImmunity = (seatNum, causeCharId) => {
+    if (!state.features?.automation) return false;
+    const seats = state.grimoire.seats || [];
+    const dying = seats.find(s => s.seatNum === seatNum);
+    if (!dying || dying.actualRoleId !== 'lleech') return false;
+    if (dying.isDead) return false;
+    if (isDrunkOrPoisoned(dying)) return false;
+    const host = seats.find(s => (s.reminders || []).some(r =>
+      r && r.charId === 'lleech' && /^host$/i.test(String(r.label || ''))));
+    if (!host || host.isDead) return false;
+    const lLabel = dying.playerName ? dying.playerName + ' (seat #' + seatNum + ')' : 'seat #' + seatNum;
+    const hLabel = host.playerName ? host.playerName + ' (seat #' + host.seatNum + ')' : 'seat #' + host.seatNum;
+    const causeName = causeCharId ? ((CHAR_BY_ID[causeCharId] || {}).name || causeCharId) : 'unknown source';
+    setTimeout(() => addCornerPrompt({
+      kind: 'success',
+      title: 'Lleech immune',
+      body: lLabel + ' (Lleech) cannot die — their Host (' + hLabel + ') is still alive. ' + causeName + ' tried to kill them but failed.',
+      actions: [{ label: 'OK', primary: true }],
+    }), 0);
+    return true;
+  };
+
   const beginGame = () => {
     update(s => {
       let protectedSeats = applyTeaLadyProtection(s.grimoire.seats || []);
       protectedSeats = applySailorProtection(protectedSeats);
+      protectedSeats = applyNoDashiiPoison(protectedSeats);
       return { grimoire: { ...s.grimoire, gameStarted: true, days: [], viewingDayIndex: 0, seats: protectedSeats } };
     });
   };
@@ -2879,11 +2965,12 @@ function App() {
       }));
       const seatsWithTL = applyTeaLadyProtection(seatsForNewNight);
       const seatsWithSailor = applySailorProtection(seatsWithTL);
+      const seatsWithND = applyNoDashiiPoison(seatsWithSailor);
       // Pukka conversion — at end-of-day, every 'Pukka: Poisoned' marker
       // becomes 'Pukka: Poison Dead' so it both (a) signals the next Pukka
       // pick to resolve the kill on that seat and (b) continues to count
       // as a poison marker (isDrunkOrPoisoned matches 'poison').
-      const seatsWithPukka = seatsWithSailor.map(seat => ({
+      const seatsWithPukka = seatsWithND.map(seat => ({
         ...seat,
         reminders: (seat.reminders || []).map(r => {
           if (r && r.charId === 'pukka' && /^poisoned$/i.test(String(r.label || ''))) {
@@ -3124,6 +3211,33 @@ function App() {
     if (state.features?.automation) {
       tryFireVirgin(nominatorSeat, nomineeSeat, dayIdx);
     }
+    // Witch curse — if the nominator carries a 'Cursed' Witch marker and the
+    // Witch is sober, prompt the ST to kill them. They die from the curse.
+    if (state.features?.automation) {
+      const nominator = (state.grimoire.seats || []).find(s => s.seatNum === nominatorSeat);
+      if (nominator && !nominator.isDead) {
+        const hasCurse = (nominator.reminders || []).some(r =>
+          r && r.charId === 'witch' && /^cursed$/i.test(String(r.label || '')));
+        if (hasCurse) {
+          const witchSeat = (state.grimoire.seats || []).find(s => s.actualRoleId === 'witch');
+          const witchAfflicted = witchSeat ? isDrunkOrPoisoned(witchSeat) : false;
+          if (!witchAfflicted) {
+            const nLabel = nominator.playerName
+              ? nominator.playerName + ' (seat #' + nominatorSeat + ')'
+              : 'seat #' + nominatorSeat;
+            setTimeout(() => addCornerPrompt({
+              kind: 'warn',
+              title: 'Witch curse fires',
+              body: nLabel + ' is Cursed by the Witch and just nominated — they die.',
+              actions: [
+                { label: 'Kill', primary: true, onClick: () => _killSeatDirect(nominatorSeat, 'witch', 'Dead', true) },
+                { label: 'Skip' },
+              ],
+            }), 0);
+          }
+        }
+      }
+    }
   };
   const updateNomination = (dayIdx, id, patch) => {
     const day = dayEntry(dayIdx);
@@ -3292,6 +3406,120 @@ function App() {
     });
   };
 
+  // firePassiveDeathTriggers — when a seat dies, fire corner popups for any
+  // role with an on-death passive ability (Sweetheart, Barber, Farmer,
+  // Banshee). Called from _executePlayer (isDayDeath=true), _killSeatDirect
+  // (isDayDeath=isDayKill), and doConfirmDeathTriggers (assumed night).
+  // Drunk/poisoned seats don't fire (their ability malfunctions).
+  const firePassiveDeathTriggers = (dyingSeat, causeCharId, isDayDeath) => {
+    if (!dyingSeat) return;
+    const seatLabel = dyingSeat.playerName
+      ? dyingSeat.playerName + ' (seat #' + dyingSeat.seatNum + ')'
+      : 'seat #' + dyingSeat.seatNum;
+    const afflicted = isDrunkOrPoisoned(dyingSeat);
+    // Sweetheart — any death triggers a permanent Drunk on a chosen player.
+    if (dyingSeat.actualRoleId === 'sweetheart' && !afflicted) {
+      setTimeout(() => addCornerPrompt({
+        kind: 'warn',
+        title: 'Sweetheart died',
+        body: seatLabel + ' (Sweetheart) died. Pick any player and place a "Sweetheart: Drunk" reminder on them — they are drunk for the rest of the game (the reminder is permanent).',
+        actions: [{ label: 'OK', primary: true }],
+      }), 0);
+    }
+    // Barber — day death only. Tonight the Demon must swap 2 player roles.
+    if (dyingSeat.actualRoleId === 'barber' && isDayDeath && !afflicted) {
+      setTimeout(() => addCornerPrompt({
+        kind: 'warn',
+        title: 'Barber died (day)',
+        body: seatLabel + ' (Barber) died during the day. TONIGHT the Demon must swap 2 player roles instead of killing. Handle the role swap via the "Change role" buttons on the chosen seats.',
+        actions: [{ label: 'OK', primary: true }],
+      }), 0);
+    }
+    // Farmer — night death only. ST picks 1 alive good player to also become Farmer.
+    if (dyingSeat.actualRoleId === 'farmer' && !isDayDeath && !afflicted) {
+      setTimeout(() => addCornerPrompt({
+        kind: 'warn',
+        title: 'Farmer died (night)',
+        body: seatLabel + ' (Farmer) died at night. Pick 1 alive good player and use "Change role" on their seat to make them a Farmer too.',
+        actions: [{ label: 'OK', primary: true }],
+      }), 0);
+    }
+    // Vigormortis — killed a Minion: Minion keeps ability + 1 of their
+    // Townsfolk neighbours is poisoned. Place 'Keeps ability' marker on the
+    // dying Minion + popup for ST to pick a TF neighbour to poison.
+    if (causeCharId === 'vigormortis' && !isDayDeath) {
+      const cDef = CHAR_BY_ID[dyingSeat.actualRoleId];
+      if (cDef && cDef.team === 'minion') {
+        setTimeout(() => {
+          update(s => {
+            const newSeats = (s.grimoire.seats || []).map(seat => {
+              if (seat.seatNum !== dyingSeat.seatNum) return seat;
+              const has = (seat.reminders || []).some(r =>
+                r && r.charId === 'vigormortis' && /keeps ability/i.test(String(r.label || '')));
+              if (has) return seat;
+              return { ...seat, reminders: [...(seat.reminders || []), { charId: 'vigormortis', label: 'Keeps ability', fromPrompt: true }] };
+            });
+            return { grimoire: { ...s.grimoire, seats: newSeats } };
+          });
+          addCornerPrompt({
+            kind: 'warn',
+            title: 'Vigormortis hit a Minion',
+            body: seatLabel + ' was killed by the Vigormortis. They KEEP their ability (marker placed). Pick one of their Townsfolk neighbours and place a "Vigormortis: Poisoned" reminder on them.',
+            actions: [{ label: 'OK', primary: true }],
+          });
+        }, 0);
+      }
+    }
+    // Fang Gu — killed an Outsider for the first time: that Outsider should
+    // become the evil Fang Gu and the original Fang Gu dies. Place a
+    // 'fanggu' 'Swapped' marker on the original Fang Gu so the second kill
+    // skips this branch.
+    if (causeCharId === 'fanggu' && !isDayDeath) {
+      const cDef = CHAR_BY_ID[dyingSeat.actualRoleId];
+      if (cDef && cDef.team === 'outsider') {
+        setTimeout(() => {
+          const seats = state.grimoire.seats || [];
+          const fanggu = seats.find(s => s.actualRoleId === 'fanggu');
+          const alreadySwapped = fanggu && (fanggu.reminders || []).some(r =>
+            r && r.charId === 'fanggu' && /^swapped$/i.test(String(r.label || '')));
+          if (alreadySwapped) return;
+          addCornerPrompt({
+            kind: 'warn',
+            title: 'Fang Gu hit an Outsider',
+            body: seatLabel + ' is an Outsider (the first one killed by Fang Gu). They should become the evil Fang Gu instead, and the original Fang Gu dies. Use "Change role" to swap the dying seat to Fang Gu + mark evil, then kill the original Fang Gu. Place a "Fang Gu: Swapped" reminder on the new Fang Gu to record the swap.',
+            actions: [{ label: 'OK', primary: true }],
+          });
+        }, 0);
+      }
+    }
+    // Banshee — killed by the Demon. ST announces + Banshee gains new ability.
+    if (dyingSeat.actualRoleId === 'banshee' && !afflicted) {
+      const causeTeam = causeCharId ? (CHAR_BY_ID[causeCharId] || {}).team : null;
+      if (causeTeam === 'demon') {
+        setTimeout(() => {
+          // Place a Banshee 'Triggered' marker (permanent via the
+          // PERMANENT_REMINDER_CHARS allow-list for 'banshee').
+          update(s => {
+            const newSeats = (s.grimoire.seats || []).map(seat => {
+              if (seat.seatNum !== dyingSeat.seatNum) return seat;
+              const has = (seat.reminders || []).some(r =>
+                r && r.charId === 'banshee' && /trigger/i.test(String(r.label || '')));
+              if (has) return seat;
+              return { ...seat, reminders: [...(seat.reminders || []), { charId: 'banshee', label: 'Triggered', fromPrompt: true }] };
+            });
+            return { grimoire: { ...s.grimoire, seats: newSeats } };
+          });
+          addCornerPrompt({
+            kind: 'warn',
+            title: 'Banshee triggered',
+            body: seatLabel + ' (Banshee) was killed by the Demon. Announce loudly to all players. From tomorrow on, the Banshee may nominate twice each day.',
+            actions: [{ label: 'OK', primary: true }],
+          });
+        }, 0);
+      }
+    }
+  };
+
   // _killSeatDirect — places a Dead reminder AND marks seat.isDead in one
   // atomic update, BYPASSING the death-confirm modal. Used by automation flows
   // (Slayer, Virgin, etc.) where the ST has already approved the kill via the
@@ -3303,6 +3531,7 @@ function App() {
   // Virgin, Psychopath etc.) pass true; night callers (Shabaloth, Pukka,
   // Grandmother trigger) leave it false.
   const _killSeatDirect = (seatNum, causeCharId, label = 'Dead', isDayKill = false) => {
+    if (tryLleechImmunity(seatNum, causeCharId)) return;
     if (tryFoolProtection(seatNum, causeCharId)) return;
     if (trySailorProtection(seatNum, causeCharId)) return;
     update(s => {
@@ -3323,6 +3552,9 @@ function App() {
       }
       return { grimoire: { ...s.grimoire, seats } };
     });
+    // Passive on-death triggers (Sweetheart, Barber, Farmer, Banshee).
+    const dyingSeat = (state.grimoire.seats || []).find(s => s.seatNum === seatNum);
+    firePassiveDeathTriggers(dyingSeat, causeCharId, !!isDayKill);
   };
 
   // _executePlayer — marks a seat dead WITHOUT placing a reminder (regular
@@ -3331,6 +3563,7 @@ function App() {
   // is alive, place a "Died Today" reminder on the Godfather so their row
   // un-dims for tonight.
   const _executePlayer = (seatNum) => {
+    if (tryLleechImmunity(seatNum, null)) return;
     update(s => {
       // Zombuul + day-death tracking. Three Zombuul cases:
       //   first-evade  → sober + no 'Executed once' yet: die (isDead=true)
@@ -3430,6 +3663,9 @@ function App() {
       }
       return { grimoire: { ...s.grimoire, seats } };
     });
+    // Passive on-death triggers (Sweetheart any-death, Barber day-death etc.)
+    const dyingExecuted = (state.grimoire.seats || []).find(s => s.seatNum === seatNum);
+    firePassiveDeathTriggers(dyingExecuted, null, true);
   };
 
   // Slayer / Psychopath: claim + target. If real + sober → target dies +
@@ -9100,13 +9336,60 @@ const NIGHT_ACTIONS = {
   seamstress:    { action: 'target2',     reminder: 'Chose',       instruction: 'Once per game at night, choose 2 players (not yourself) — you learn if they are the same alignment.', eligible: 'others' },
   mathematician: { action: 'info-st',     reminder: 'Math #',      instruction: 'You learn how many players\' abilities malfunctioned last day or night.', phase: 'other',
                    infoType: 'number',     infoConfig: { min: 0, max: 10, label: 'malfunctions', display: 'You learn that' } },
-  snakecharmer:  { action: 'target1',     reminder: 'Chose',       instruction: 'Choose a player. If they are the Demon, you swap roles and they become poisoned.' },
-  cerenovus:     { action: 'target1',     reminder: 'Mad',         instruction: 'Choose a player and a good character — they are mad about being that character.' },
-  fanggu:        { action: 'target1',     reminder: 'Dead',        instruction: 'Choose a player to kill. The first Outsider killed becomes an evil Fang Gu instead.' },
-  vigormortis:   { action: 'target1',     reminder: 'Dead',        instruction: 'Choose a player to die. Killed Minions keep their ability and poison a neighbour.' },
-  nodashii:      { action: 'target1',     reminder: 'Dead',        instruction: 'Choose a player to kill. Your 2 living Townsfolk neighbours are poisoned.' },
+  snakecharmer:  { action: 'target1',     reminder: 'Chose',       instruction: 'Choose a player. If they are the Demon, you swap roles and they become poisoned (ST will fire a popup).', eligible: 'others' },
+  cerenovus:     { action: 'target1',     reminder: 'Mad',         instruction: 'Choose a player. They are mad about being a good character (ST chooses which to whisper).' },
+  fanggu:        { action: 'target1',     reminder: 'Dead',        instruction: 'Choose a player to kill. The first Outsider killed becomes an evil Fang Gu instead (a ST popup will prompt).', eligible: 'others' },
+  vigormortis:   { action: 'target1',     reminder: 'Dead',        instruction: 'Choose a player to die. Killed Minions keep their ability and 1 of their Townsfolk neighbours is poisoned (a ST popup will prompt).', eligible: 'others' },
+  nodashii:      { action: 'target1',     reminder: 'Dead',        instruction: 'Choose a player to kill. Your 2 Townsfolk neighbours (nearest CW + CCW) are poisoned each night — auto-applied.', eligible: 'others' },
   vortox:        { action: 'target1',     reminder: 'Dead',        instruction: 'Choose a player to kill. All Townsfolk get false info today.' },
-  witch:         { action: 'target1',     reminder: 'Cursed',      instruction: 'Choose a player. If they nominate tomorrow, they die.' },
+  witch:         { action: 'target1',     reminder: 'Cursed',      instruction: 'Choose a player. If they nominate tomorrow, the ST is prompted to kill them.' },
+  pithag:        { action: 'target1',     reminder: 'Was',         instruction: 'Choose a player. Tell the ST a character — that player becomes that character (ST handles role swap).' },
+  clockmaker:    { action: 'info-st',     reminder: 'Saw',         instruction: 'On the first night, you learn how many steps clockwise from the Demon to the nearest Minion.', phase: 'first',
+                   infoType: 'number',    infoConfig: { min: 1, max: 10, label: 'steps', display: 'Demon → nearest Minion (clockwise):' } },
+  sage:          { action: 'info-st',     reminder: 'Shown',       instruction: 'If killed by the Demon, learn 2 players — one is the Demon.', phase: 'other',
+                   requiresDeath: true, oncePerGame: true,
+                   infoType: 'seats+role', infoConfig: { numSeats: 2, roleTeam: 'demon', allowNone: false, prefix: 'One of these players is the' } },
+  seamstress:    { action: 'target2+yesno', reminder: 'Chose',     instruction: 'Once per game at night, choose 2 players (not yourself) — you learn if they are the same alignment.', eligible: 'others',
+                   oncePerGame: true, canSkip: true,
+                   responseConfig: { yesLabel: 'YES — same alignment', noLabel: 'NO — different alignments' } },
+  philosopher:   { action: 'target1any',  reminder: 'Used',        instruction: 'Once per game, choose a Townsfolk or Outsider ability to gain. If that role is in play, that player becomes drunk. (ST handles the role/ability change.)',
+                   oncePerGame: true, canSkip: true },
+
+  // ===== Sects & Violets — passive on death =====
+  barber:        { action: 'passive',     instruction: 'Passive — if Barber dies during the day, tonight the Demon must swap 2 player roles (ST popup fires on Barber\'s day death).' },
+  sweetheart:    { action: 'passive',     instruction: 'Passive — when Sweetheart dies, 1 player is drunk from now on (ST popup picks).' },
+
+  // ===== Experimental — Townsfolk (info / target) =====
+  highpriestess: { action: 'info-st',     reminder: 'Saw',         instruction: 'You learn which player the Storyteller thinks you should talk to most.',
+                   infoType: 'seat',      infoConfig: { numSeats: 1, display: 'The Storyteller suggests you talk to:' } },
+  knight:        { action: 'info-st',     reminder: 'Saw',         instruction: 'On the first night, you learn 2 players that are NOT the Demon.', phase: 'first',
+                   infoType: 'seats',     infoConfig: { numSeats: 2, display: 'These 2 players are NOT the Demon:' } },
+  noble:         { action: 'info-st',     reminder: 'Saw',         instruction: 'On the first night, you learn 3 players — exactly 1 is evil.', phase: 'first',
+                   infoType: 'seats',     infoConfig: { numSeats: 3, display: 'These 3 players — exactly 1 is evil:' } },
+  steward:       { action: 'info-st',     reminder: 'Saw',         instruction: 'On the first night, you learn 1 good player.', phase: 'first',
+                   infoType: 'seat',      infoConfig: { numSeats: 1, display: 'This player is good:' } },
+  shugenja:      { action: 'info-st',     reminder: 'Saw',         instruction: 'On the first night, you learn whether the nearest evil player is clockwise or counterclockwise from you.', phase: 'first',
+                   infoType: 'direction', infoConfig: { display: 'The nearest evil player is:' } },
+  preacher:      { action: 'target1',     reminder: 'Saw',         instruction: 'Choose a player. If they are a Minion, you learn their character and they can\'t use their ability tonight.', eligible: 'others' },
+  villageidiot:  { action: 'target1any',  reminder: 'Chose',       instruction: 'Each night, choose a player. You learn their alignment. (1 Village Idiot is drunk — ST handles alignment reveal in person for now.)' },
+  alchemist:     { action: 'manual',      instruction: 'Alchemist has a not-in-play Minion ability (picked at bag-setup). Their night step uses that Minion\'s timing — handle manually.' },
+
+  // ===== Experimental — Townsfolk (passive) =====
+  banshee:       { action: 'passive',     instruction: 'Passive — if killed by the Demon, all players know and the Banshee can nominate twice each day starting tomorrow (ST popup fires).' },
+  farmer:        { action: 'passive',     instruction: 'Passive — when Farmer dies at night, 1 alive good player becomes a Farmer (ST popup picks).' },
+
+  // ===== Experimental — Minions =====
+  harpy:         { action: 'target2',     reminder: 'Mad',         instruction: 'Choose 2 players. Tomorrow, the 1st is mad about the 2nd being evil — if they aren\'t, the Harpy may die.', eligible: 'others',
+                   reminderPerTarget: ['Mad about', 'Is evil'] },
+  widow:         { action: 'manual',      instruction: 'On the first night, the Widow sees the grimoire, picks a player to poison, and 1 good player learns a Widow is in play. Handle manually for now.', phase: 'first' },
+
+  // ===== Experimental — Outsiders =====
+  ogre:          { action: 'target1',     reminder: 'Chose',       instruction: 'On the first night, choose a player (not yourself). You become their alignment (ST handles the alignment flip).', phase: 'first', eligible: 'others' },
+
+  // ===== Experimental — Demons =====
+  alhadikhia:    { action: 'target2',     reminder: 'Dead',        instruction: 'Choose 3 players (engine takes 2 here; ST handles the 3rd + the live/die polls manually for now).', phase: 'other' },
+  lleech:        { action: 'target1',     reminder: 'Dead',        instruction: 'On the first night, pick your Host (you cannot die until the Host dies). Each other night, pick a player to die.', phase: 'other', eligible: 'others' },
+  ojo:           { action: 'target1any',  reminder: 'Dead',        instruction: 'Choose a player (Ojo actually picks a character — ST converts via popup). If the character is in play they die; else ST picks any player.', phase: 'other' },
 };
 
 // Look up the action descriptor for a role. Returns a normalized descriptor with
@@ -9152,6 +9435,18 @@ const PERMANENT_REMINDER_CHARS = new Set([
   'snitch',
   // Mezepheles (mad word — permanent ability loss)
   'mezepheles',
+  // Sweetheart: 'Drunk' marker placed on the chosen player when Sweetheart dies — permanent.
+  'sweetheart',
+  // Banshee: 'Triggered' marker placed when killed by Demon — permanent ability gain.
+  'banshee',
+  // Pit-Hag: 'Was X' marker tracks the previous role for converted players.
+  'pithag',
+  // Lleech: 'Host' marker on the chosen player (first night) — permanent immunity gate.
+  'lleech',
+  // Vigormortis: 'Keeps ability' marker on killed Minions + 'Poisoned' marker on a TF neighbour.
+  'vigormortis',
+  // Fang Gu: 'Swapped' marker tracks that the first-Outsider-kill swap happened.
+  'fanggu',
 ]);
 const PERMANENT_REMINDER_LABELS = new Set(['No ability', 'Used']);
 // Compute today's chopping-block state from a day's nominations + alive count.
@@ -9595,7 +9890,11 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
       </div>
     );
   }
-  if (seat.isDead && action !== 'manual' && action !== 'moonchild-resolve' && !requiresDeath && (!step.char || step.char.id !== 'zombuul')) return (
+  // Vigormortis "Keeps ability" — if a Minion was killed by Vigor and has
+  // this marker, their ability is still active despite being dead.
+  const vigorKeepsAbility = (seat?.reminders || []).some(r =>
+    r && r.charId === 'vigormortis' && /keeps ability/i.test(String(r.label || '')));
+  if (seat.isDead && action !== 'manual' && action !== 'moonchild-resolve' && !requiresDeath && (!step.char || step.char.id !== 'zombuul') && !vigorKeepsAbility) return (
     <div className="mt-1.5 text-[11px] text-stone-500 italic">Seat is dead — skip.</div>
   );
   if (action === 'moonchild-resolve') {
@@ -10886,6 +11185,7 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
   const [pickedNone, setPickedNone]   = useState(false);   // librarian "no outsiders"
   const [pickedNum, setPickedNum]     = useState(cfg.min ?? 0);
   const [pickedYes, setPickedYes]     = useState(null);    // null = unset, true/false = chosen
+  const [pickedDirection, setPickedDirection] = useState(''); // '' | 'cw' | 'ccw' (Shugenja)
 
   const c = CHAR_BY_ID[step.char.id];
   const targetSeat = step.seat;
@@ -10949,6 +11249,12 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
     canSend = (pickedRole || '').split(',').filter(Boolean).length > 0;
   } else if (infoType === 'alignment') {
     canSend = !!(cfg.presetAlignment);
+  } else if (infoType === 'seat') {
+    canSend = pickedSeats.length === 1;
+  } else if (infoType === 'seats') {
+    canSend = pickedSeats.length === (cfg.numSeats || 2);
+  } else if (infoType === 'direction') {
+    canSend = pickedDirection === 'cw' || pickedDirection === 'ccw';
   }
 
   const buildPayload = () => {
@@ -10983,6 +11289,15 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
         alignment: cfg.presetAlignment,
         displayLabel: cfg.displayLabel || null,
       };
+    }
+    if (infoType === 'seat') {
+      return { type: 'seat', askSeat: pickedSeats[0], display: cfg.display || null };
+    }
+    if (infoType === 'seats') {
+      return { type: 'seats', askSeats: [...pickedSeats], display: cfg.display || null };
+    }
+    if (infoType === 'direction') {
+      return { type: 'direction', direction: pickedDirection, display: cfg.display || null };
     }
     return null;
   };
@@ -11599,6 +11914,65 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
           </>
         )}
 
+        {/* New simple-pick info types: seat (single), seats (N), direction. */}
+        {(infoType === 'seat' || infoType === 'seats') && (
+          <div>
+            <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">
+              {cfg.display || (infoType === 'seat' ? 'Pick 1 player' : `Pick ${cfg.numSeats || 2} players`)}
+              <span className="text-stone-500 normal-case"> ({pickedSeats.length}/{cfg.numSeats || (infoType === 'seat' ? 1 : 2)})</span>
+            </div>
+            <ul className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-72 overflow-y-auto">
+              {(seats || []).map(s => {
+                const picked = pickedSeats.includes(s.seatNum);
+                const rc = CHAR_BY_ID[s.actualRoleId];
+                return (
+                  <li key={s.seatNum}>
+                    <button onClick={() => toggleSeat(s.seatNum)}
+                      className={`w-full card rounded px-2 py-1.5 flex items-center gap-2 text-left text-sm
+                        ${picked ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}
+                        ${s.isDead ? 'opacity-60' : ''}`}>
+                      <span className="text-amber-200/80 text-xs w-6 text-center flex-shrink-0">#{s.seatNum}</span>
+                      {iconUrl(s.actualRoleId) ? (
+                        <img src={iconUrl(s.actualRoleId)} alt=""
+                          className="w-8 h-8 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                      ) : (
+                        <span className="w-8 h-8 flex-shrink-0"></span>
+                      )}
+                      <div className="flex-1 min-w-0 leading-tight">
+                        <div className="truncate">{s.playerName || <span className="text-stone-500 italic">—</span>}</div>
+                        <div className={`text-[10px] uppercase tracking-wider truncate ${rc ? `team-${rc.team}` : 'text-stone-500'}`}>
+                          {rc?.name || '(no role)'}
+                        </div>
+                      </div>
+                      {picked && <span className="text-amber-300 text-base">✓</span>}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
+
+        {infoType === 'direction' && (
+          <div>
+            <div className="text-xs uppercase tracking-wider text-amber-300 mb-2">
+              {cfg.display || 'Pick the direction'}
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <button onClick={() => setPickedDirection('cw')}
+                className={`py-5 rounded-lg text-base font-bold transition
+                  ${pickedDirection === 'cw' ? 'bg-amber-600 text-stone-950 shadow-lg shadow-amber-900/40' : 'pill hover:border-amber-500 text-amber-300'}`}>
+                ↻ Clockwise
+              </button>
+              <button onClick={() => setPickedDirection('ccw')}
+                className={`py-5 rounded-lg text-base font-bold transition
+                  ${pickedDirection === 'ccw' ? 'bg-amber-600 text-stone-950 shadow-lg shadow-amber-900/40' : 'pill hover:border-amber-500 text-amber-300'}`}>
+                ↺ Counter-clockwise
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Footer */}
         <div className="flex items-center gap-2 pt-3 border-t border-stone-800">
           <button onClick={onClose}
@@ -12008,6 +12382,52 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
               <div className={`text-2xl font-bold team-${role.team}`}>{role.name}</div>
             </div>
           ) : <div className="text-stone-400 italic text-center">(no role)</div>}
+        </div>
+      );
+    } else if (info.type === 'seat') {
+      const askSeat = seatBy[info.askSeat];
+      const top = info.display || 'The Storyteller shows you:';
+      infoBody = (
+        <div className="space-y-4">
+          <div className="text-center text-sm text-stone-300">{top}</div>
+          {askSeat ? (
+            <div className="card rounded p-3 text-center mx-auto max-w-xs">
+              <div className="text-amber-200/80 text-xs">seat #{askSeat.seatNum}</div>
+              <div className="text-lg text-amber-100 font-semibold truncate">
+                {askSeat.playerName || <span className="text-stone-500 italic">—</span>}
+              </div>
+            </div>
+          ) : <div className="text-stone-500 italic text-center">(unknown seat)</div>}
+        </div>
+      );
+    } else if (info.type === 'seats') {
+      const pickedSeats = (info.askSeats || []).map(n => seatBy[n]).filter(Boolean);
+      const top = info.display || 'The Storyteller shows you:';
+      infoBody = (
+        <div className="space-y-3">
+          <div className="text-center text-sm text-stone-300">{top}</div>
+          <ul className="grid grid-cols-2 gap-2">
+            {pickedSeats.map(s => (
+              <li key={s.seatNum} className="card rounded p-3 text-center">
+                <div className="text-amber-200/80 text-xs">seat #{s.seatNum}</div>
+                <div className="text-base text-amber-100 font-semibold truncate">
+                  {s.playerName || <span className="text-stone-500 italic">—</span>}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    } else if (info.type === 'direction') {
+      const dir = info.direction || 'cw';
+      const top = info.display || 'The nearest evil player is:';
+      infoBody = (
+        <div className="space-y-3 text-center">
+          <div className="text-sm text-stone-300">{top}</div>
+          <div className="p-6 rounded-lg border-2 bg-amber-900/30 text-amber-200 border-amber-700/70">
+            <div className="text-7xl mb-1 leading-none">{dir === 'cw' ? '↻' : '↺'}</div>
+            <div className="text-3xl font-extrabold tracking-wide">{dir === 'cw' ? 'CLOCKWISE' : 'COUNTER-CLOCKWISE'}</div>
+          </div>
         </div>
       );
     }
@@ -12639,13 +13059,17 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                 const zombuulHasExecOnce = (s.seat?.reminders || []).some(r =>
                   r && r.charId === 'zombuul' && /^executed once$/i.test(String(r.label || '')));
                 const zombuulTrulyDead = !!s.seat?.isDead && !zombuulHasExecOnce;
+                const vigorKeepsAbility = (s.seat?.reminders || []).some(r =>
+                  r && r.charId === 'vigormortis' && /keeps ability/i.test(String(r.label || '')));
                 const dim = s.action === 'passive'
                   ? true
                   : s.requiresDeath
                     ? (!s.seat?.isDead || noAbility)
                     : (s.char && s.char.id === 'zombuul')
                       ? (zombuulTrulyDead || !!s.zombuulDayDeath)
-                      : !!s.seat?.isDead;
+                      : (vigorKeepsAbility
+                        ? false
+                        : !!s.seat?.isDead);
                 return (
                 <li key={i} className={`card rounded p-2 flex items-start gap-2 ${dim ? 'opacity-50' : ''} ${automation && s.prompt?.status === 'awaiting' ? 'border-amber-500 ring-1 ring-amber-700/40' : ''} ${automation && s.prompt?.status === 'question' ? 'border-red-500 ring-1 ring-red-700/40' : ''}`}>
                   <span className="text-stone-500 text-xs tabular-nums w-6 text-center pt-0.5">{s.stepNum}</span>
