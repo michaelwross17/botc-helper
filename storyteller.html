@@ -2047,24 +2047,36 @@ function App() {
             next.__seatsCopy = seatsCopy;
           }
           // Sailor: place 'Drunk' on the chosen seat (Sailor or target).
-          // If Sailor herself was chosen, also strip her 'Protected' marker.
+          // If the chosen seat IS the Sailor, also strip her 'Protected'
+          // marker so she can die tonight. The strip is a separate pass
+          // so it's unambiguous regardless of map() ordering.
           if (p.action === 'target1+st-pick' && p.infoPayload) {
             const ipl = p.infoPayload || {};
             const drunkSeatNum = (typeof ipl.drunkSeat === 'number') ? ipl.drunkSeat : null;
             if (drunkSeatNum != null) {
               const baseSeats = next.__seatsCopy || state.grimoire.seats;
-              const seatsCopy = baseSeats.map(s => {
+              // Pass 1 — place Drunk on the chosen seat.
+              let seatsCopy = baseSeats.map(s => {
                 if (s.seatNum !== drunkSeatNum) return s;
-                let reminders = (s.reminders || []).slice();
-                const hasDrunk = reminders.some(r =>
+                const hasDrunk = (s.reminders || []).some(r =>
                   r && r.charId === 'sailor' && /^drunk$/i.test(String(r.label || '')));
-                if (!hasDrunk) reminders.push({ charId: 'sailor', label: 'Drunk', fromPrompt: true });
-                if (s.actualRoleId === 'sailor') {
-                  reminders = reminders.filter(r =>
-                    !(r && r.charId === 'sailor' && /^protected$/i.test(String(r.label || ''))));
-                }
-                return { ...s, reminders };
+                if (hasDrunk) return s;
+                return { ...s, reminders: [...(s.reminders || []), { charId: 'sailor', label: 'Drunk', fromPrompt: true }] };
               });
+              // Pass 2 — if the chosen seat is the Sailor herself, strip
+              // her 'Protected' marker from her seat. We also strip from
+              // ANY seat carrying 'Sailor: Protected' (defensive — in
+              // practice only the Sailor's own seat ever has it, but
+              // belt-and-braces in case of stale state).
+              const chosenSeat = seatsCopy.find(s => s.seatNum === drunkSeatNum);
+              if (chosenSeat && chosenSeat.actualRoleId === 'sailor') {
+                seatsCopy = seatsCopy.map(s => {
+                  const reminders = (s.reminders || []).filter(r =>
+                    !(r && r.charId === 'sailor' && /^protected$/i.test(String(r.label || ''))));
+                  if (reminders.length === (s.reminders || []).length) return s;
+                  return { ...s, reminders };
+                });
+              }
               next.__seatsCopy = seatsCopy;
             }
           }
@@ -2126,6 +2138,29 @@ function App() {
               return { ...s, reminders };
             });
             next.__seatsCopy = seatsCopy;
+          }
+        }
+        // oncePerGame fallback — runs unconditionally on 'submitted' for
+        // any role whose registry entry is oncePerGame, regardless of
+        // whether p.reminderLabel is set (which is the gate the inner
+        // !isInfo / isInfo branches use). This catches roles like the
+        // Professor whose own action carries no per-target reminder.
+        // Idempotent: skips when 'No ability' is already on the seat.
+        {
+          const defOPG = NIGHT_ACTIONS[p.roleId];
+          if (defOPG && defOPG.oncePerGame) {
+            const baseSeats = next.__seatsCopy || state.grimoire.seats;
+            const ownSeat = baseSeats.find(s => s.seatNum === seatNum);
+            const alreadyNoAbility = (ownSeat?.reminders || []).some(r =>
+              r && /no ability/i.test(String(r.label || '')));
+            if (ownSeat && !alreadyNoAbility) {
+              const seatsCopy = baseSeats.map(s =>
+                s.seatNum === seatNum
+                  ? { ...s, reminders: [...(s.reminders || []), { charId: p.roleId, label: 'No ability', fromPrompt: true }] }
+                  : s
+              );
+              next.__seatsCopy = seatsCopy;
+            }
           }
         }
         // Goon — runs unconditionally on 'submitted'. If the prompt's
@@ -2195,9 +2230,18 @@ function App() {
           const profAfflicted = profSeat ? isDrunkOrPoisoned(profSeat) : false;
           const tgtLabel = tgtSeat ? (tgtSeat.playerName ? tgtSeat.playerName + ' (seat #' + tgtSeat.seatNum + ')' : 'seat #' + tgtSeat.seatNum) : 'target';
           if (tgtSeat && tgtSeat.isDead && tgtIsTownsfolk && !profAfflicted) {
+            // Resurrect: clear isDead, strip Dead reminders, AND strip
+            // once-per-game trackers ('No ability', 'Used') so the
+            // resurrected player regains their ability.
             const seatsCopy = baseSeats.map(s =>
               s.seatNum === tgtSeat.seatNum
-                ? { ...s, isDead: false, reminders: (s.reminders || []).filter(r => !(r && r.label === 'Dead')) }
+                ? { ...s, isDead: false, reminders: (s.reminders || []).filter(r => {
+                    if (!r) return false;
+                    if (r.label === 'Dead') return false;
+                    if (/^no ability$/i.test(String(r.label || ''))) return false;
+                    if (/^used$/i.test(String(r.label || ''))) return false;
+                    return true;
+                  }) }
                 : s
             );
             next.__seatsCopy = seatsCopy;
