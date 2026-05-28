@@ -2860,9 +2860,18 @@ function App() {
         if (n >= 2) return null;     // remove at the next Go-to-Night
         return { ...r, label: `Drunk ${n + 1}` };
       }).filter(Boolean);
+      // Zombuul 'Died today' markers: keep only those tagged with the
+      // day being snapshotted now (dayIdx === idx). Older markers are
+      // stale (from previous active periods) and get stripped.
+      const stripStaleDiedToday = (rs) => (rs || []).filter(r => {
+        if (r && r.charId === 'zombuul' && /^died today$/i.test(String(r.label || ''))) {
+          return r.dayIdx === idx;
+        }
+        return true;
+      });
       const seatsForNewNight = (g.seats || []).map(seat => ({
         ...seat,
-        reminders: bumpMinstrel(bumpCourtier(filterReminders(seat.reminders))),
+        reminders: stripStaleDiedToday(bumpMinstrel(bumpCourtier(filterReminders(seat.reminders)))),
       }));
       const travellersForNewNight = (g.travellers || []).map(t => ({
         ...t,
@@ -3288,15 +3297,24 @@ function App() {
   // (Slayer, Virgin, etc.) where the ST has already approved the kill via the
   // upstream corner popup — re-confirming via the generic death modal would be
   // redundant.
-  const _killSeatDirect = (seatNum, causeCharId, label = 'Dead') => {
+  // isDayKill (4th param) — when true, also place a 'Died today' marker
+  // (charId='zombuul') tagged with the current day index so Zombuul's
+  // night step can check whether anyone died today. Day callers (Slayer,
+  // Virgin, Psychopath etc.) pass true; night callers (Shabaloth, Pukka,
+  // Grandmother trigger) leave it false.
+  const _killSeatDirect = (seatNum, causeCharId, label = 'Dead', isDayKill = false) => {
     if (tryFoolProtection(seatNum, causeCharId)) return;
     if (trySailorProtection(seatNum, causeCharId)) return;
     update(s => {
-      let seats = (s.grimoire.seats || []).map(seat =>
-        seat.seatNum === seatNum
-          ? { ...seat, isDead: true, reminders: [...(seat.reminders || []), { charId: causeCharId, label }] }
-          : seat
-      );
+      const idx = (s.grimoire.days || []).length;
+      let seats = (s.grimoire.seats || []).map(seat => {
+        if (seat.seatNum !== seatNum) return seat;
+        const additions = [{ charId: causeCharId, label }];
+        if (isDayKill) {
+          additions.push({ charId: 'zombuul', label: 'Died today', dayIdx: idx, fromPrompt: true });
+        }
+        return { ...seat, isDead: true, reminders: [...(seat.reminders || []), ...additions] };
+      });
       // Tea Lady death: strip her stale Protected markers immediately so
       // any subsequent kill in the same tick sees the updated state.
       const killed = seats.find(s0 => s0.seatNum === seatNum);
@@ -3314,34 +3332,66 @@ function App() {
   // un-dims for tonight.
   const _executePlayer = (seatNum) => {
     update(s => {
-      // Zombuul evasion check: pre-execute. If the seat is Zombuul AND
-      // sober AND has no 'Executed once' marker, skip the kill, place
-      // the marker, and fire an info popup. Subsequent executions kill
-      // normally.
+      // Zombuul + day-death tracking. Three Zombuul cases:
+      //   first-evade  → sober + no 'Executed once' yet: die (isDead=true)
+      //                  AND place 'Executed once' AND skip 'Died today'
+      //                  (gameplay-wise no death — they evaded via ability).
+      //   truly-dead   → sober + has 'Executed once': die, strip the marker
+      //                  (ability is gone), place 'Died today'.
+      //   drunk-died   → drunk/poisoned: die for real, no marker mutations,
+      //                  place 'Died today'.
+      // Non-Zombuul executions: just die + place 'Died today'.
+      const idxForDeath = (s.grimoire.days || []).length;
       const liveSeats0 = s.grimoire.seats || [];
       const targetSeat = liveSeats0.find(seat => seat.seatNum === seatNum);
-      if (targetSeat && targetSeat.actualRoleId === 'zombuul' && !isDrunkOrPoisoned(targetSeat)) {
-        const hasEvasion = (targetSeat.reminders || []).some(r =>
+      let zombuulCase = null;
+      if (targetSeat && targetSeat.actualRoleId === 'zombuul') {
+        const hasExecOnce = (targetSeat.reminders || []).some(r =>
           r && r.charId === 'zombuul' && /^executed once$/i.test(String(r.label || '')));
-        if (!hasEvasion) {
-          const seatsZ = liveSeats0.map(seat =>
-            seat.seatNum === seatNum
-              ? { ...seat, reminders: [...(seat.reminders || []), { charId: 'zombuul', label: 'Executed once', fromPrompt: true }] }
-              : seat
-          );
-          const zLabel = targetSeat.playerName ? targetSeat.playerName + ' (seat #' + seatNum + ')' : 'seat #' + seatNum;
+        if (isDrunkOrPoisoned(targetSeat))      zombuulCase = 'drunk-died';
+        else if (!hasExecOnce)                  zombuulCase = 'first-evade';
+        else                                    zombuulCase = 'truly-dead';
+      }
+      const seats0 = liveSeats0.map(seat => {
+        if (seat.seatNum !== seatNum) return seat;
+        let reminders = seat.reminders || [];
+        if (zombuulCase === 'first-evade') {
+          reminders = [...reminders, { charId: 'zombuul', label: 'Executed once', fromPrompt: true }];
+        } else if (zombuulCase === 'truly-dead') {
+          reminders = reminders.filter(r =>
+            !(r && r.charId === 'zombuul' && /^executed once$/i.test(String(r.label || ''))));
+        }
+        if (zombuulCase !== 'first-evade') {
+          reminders = [...reminders, { charId: 'zombuul', label: 'Died today', dayIdx: idxForDeath, fromPrompt: true }];
+        }
+        return { ...seat, isDead: true, reminders };
+      });
+      // Zombuul info popups (outside the updater).
+      if (zombuulCase) {
+        const zLabel = targetSeat.playerName ? targetSeat.playerName + ' (seat #' + seatNum + ')' : 'seat #' + seatNum;
+        if (zombuulCase === 'first-evade') {
           setTimeout(() => addCornerPrompt({
             kind: 'success',
-            title: 'Zombuul lives',
-            body: zLabel + ' (Zombuul) was executed but survives — they register as dead but live. The next execution kills them.',
+            title: 'Zombuul registers as dead',
+            body: zLabel + ' (Zombuul) is marked dead so Tea Lady etc. treat them as dead, but their ability is still active. A second execution kills them for real.',
             actions: [{ label: 'OK', primary: true }],
           }), 0);
-          return { grimoire: { ...s.grimoire, seats: seatsZ } };
+        } else if (zombuulCase === 'truly-dead') {
+          setTimeout(() => addCornerPrompt({
+            kind: 'warn',
+            title: 'Zombuul truly dies',
+            body: zLabel + ' (Zombuul) was executed a second time — their ability is gone.',
+            actions: [{ label: 'OK', primary: true }],
+          }), 0);
+        } else if (zombuulCase === 'drunk-died') {
+          setTimeout(() => addCornerPrompt({
+            kind: 'warn',
+            title: 'Zombuul died for real',
+            body: zLabel + ' (Zombuul) was drunk/poisoned during execution — the evasion ability fizzled and they truly die.',
+            actions: [{ label: 'OK', primary: true }],
+          }), 0);
         }
       }
-      const seats0 = (s.grimoire.seats || []).map(seat =>
-        seat.seatNum === seatNum ? { ...seat, isDead: true } : seat
-      );
       const executed = seats0.find(seat => seat.seatNum === seatNum);
       // Moonchild execution: place 'Triggered' AND 'Dead' on the Moonchild,
       // then queue the popup so the ST picks her target. 'Dead' is required
@@ -3436,7 +3486,7 @@ function App() {
     if (requiresDemonTarget) {
       if (targetIsDemon) {
         // Real Slayer hits the Demon → kill immediately (no death-confirm).
-        _killSeatDirect(targetSeatNum, roleId);
+        _killSeatDirect(targetSeatNum, roleId, 'Dead', true);
         logAudit('killed-demon');
         addCornerPrompt({
           kind: 'success',
@@ -3452,7 +3502,7 @@ function App() {
           body: `${claimantLabel} (real ${roleName}) targeted ${targetLabel} who is the Recluse. Recluse may register as the Demon — fire and kill?`,
           actions: [
             { label: 'Yes, kill', primary: true, onClick: () => {
-              _killSeatDirect(targetSeatNum, roleId);
+              _killSeatDirect(targetSeatNum, roleId, 'Dead', true);
               logAudit('killed-recluse');
             }},
             { label: 'No', onClick: () => logAudit('recluse-spared') },
@@ -3464,7 +3514,7 @@ function App() {
       }
     } else {
       // Psychopath-style: kills any target. Direct kill (no death-confirm).
-      _killSeatDirect(targetSeatNum, roleId);
+      _killSeatDirect(targetSeatNum, roleId, 'Dead', true);
       logAudit('killed');
       addCornerPrompt({
         kind: 'success',
@@ -3528,7 +3578,7 @@ function App() {
     const fire = () => {
       // Execute the nominator directly (no death-confirm modal — ST already
       // approved via the popup that called this fire()).
-      _killSeatDirect(nominatorSeatNum, 'virgin');
+      _killSeatDirect(nominatorSeatNum, 'virgin', 'Dead', true);
       // Audit: log a special entry only on actual execution.
       appendDayEntry(dayIdx, {
         kind: 'special',
@@ -9023,7 +9073,7 @@ const NIGHT_ACTIONS = {
   shabaloth:     { action: 'target2',     reminder: '',            instruction: 'Choose 2 players — both die tonight (per-target prompts will fire). Also: you may regurgitate one player you chose last night.', phase: 'other' },
   po:            { action: 'po-flex',     reminder: 'Dead',        instruction: 'Choose a player to kill, OR pick none. (Pick no one → next night you must pick 3.)', phase: 'other' },
   moonchild:     { action: 'target1',     reminder: 'Chose',       instruction: 'You just died — choose any alive player. If they are good, they die.', eligible: 'all', requiresDeath: true },
-  zombuul:       { action: 'target1',     reminder: 'Dead',        instruction: 'If no one died today, choose a player to die tonight.', phase: 'other' },
+  zombuul:       { action: 'target1',     reminder: 'Dead',        instruction: 'If no one died today, choose a player to die tonight.', eligible: 'others', phase: 'other' },
   innkeeper:     { action: 'target2+st-pick', reminder: 'Safe',     instruction: 'Choose 2 players — they are safe from the Demon tonight, but one becomes drunk.', phase: 'other' },
   gambler:       { action: 'target1+guess', reminder: 'Gambled',    instruction: 'Choose a player and guess their character. If wrong, you die.', phase: 'other' },
   exorcist:      { action: 'target1',     reminder: 'Chose',       instruction: 'Choose a player (not the same as last night) — the Demon does not wake tonight.', eligible: 'others', phase: 'other' },
@@ -9155,6 +9205,10 @@ function isReminderPermanent(reminder) {
   // Zombuul 'Executed once' marker persists for the whole game — it
   // tracks the one-time death-evasion trigger.
   if (reminder.charId === 'zombuul' && /^executed once$/i.test(reminder.label || '')) return true;
+  // Zombuul 'Died today' marker survives the Go-to-Night transient sweep
+  // so Zombuul's night step can check it. Stale markers (from older days)
+  // are stripped by stripStaleDiedToday in advanceToNight via dayIdx tag.
+  if (reminder.charId === 'zombuul' && /^died today$/i.test(reminder.label || '')) return true;
   // Pukka 'Poisoned' and 'Dead' markers — Poisoned persists through the
   // day, gets converted to 'Dead' at Go-to-Night, and 'Dead' persists
   // until the next Pukka pick resolves the kill (or the ST skips).
@@ -9512,6 +9566,28 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
       </div>
     );
   }
+  // Zombuul gating — runs BEFORE the generic isDead skip so a Zombuul
+  // with the 'Executed once' marker (registers as dead but ability is
+  // still active) still gets a working step. Also dims the step when
+  // someone died today (zombuulDayDeath is set in the step builder).
+  if (step.char && step.char.id === 'zombuul') {
+    const hasExecOnce = (seat?.reminders || []).some(r =>
+      r && r.charId === 'zombuul' && /^executed once$/i.test(String(r.label || '')));
+    const functionallyAlive = !seat?.isDead || hasExecOnce;
+    if (!functionallyAlive) {
+      return (
+        <div className="mt-1.5 text-[11px] text-stone-500 italic">Zombuul is truly dead — no ability.</div>
+      );
+    }
+    if (step.zombuulDayDeath) {
+      return (
+        <div className="mt-1.5 text-[11px] text-stone-500 italic">Someone died today — Zombuul has no ability tonight.</div>
+      );
+    }
+    // Otherwise fall through to the normal target1 flow below. The
+    // generic isDead skip is suppressed for Zombuul via the explicit
+    // exclusion in the next check.
+  }
   if (requiresDeath && action !== 'moonchild-resolve' && !(seat.isDead && hasDeadReminder)) {
     return (
       <div className="mt-1.5 text-[11px] text-stone-500 italic">
@@ -9519,7 +9595,7 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
       </div>
     );
   }
-  if (seat.isDead && action !== 'manual' && action !== 'moonchild-resolve' && !requiresDeath) return (
+  if (seat.isDead && action !== 'manual' && action !== 'moonchild-resolve' && !requiresDeath && (!step.char || step.char.id !== 'zombuul')) return (
     <div className="mt-1.5 text-[11px] text-stone-500 italic">Seat is dead — skip.</div>
   );
   if (action === 'moonchild-resolve') {
@@ -12176,6 +12252,14 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
   const nightNum = viewingDayIndex || 0;
   const isFirstNight = nightNum === 0;
   const orderList = isFirstNight ? nightOrder.firstNight : nightOrder.otherNight;
+  // Did anyone die today (during the day that just ended)? Used to dim
+  // Zombuul's night step. Markers are tagged with dayIdx at placement;
+  // we look for ones from (viewingDayIndex - 1) which represents the
+  // day BEFORE the night being rendered.
+  const anyDeathToday = (seats || []).some(s =>
+    (s.reminders || []).some(r =>
+      r && r.charId === 'zombuul' && /^died today$/i.test(String(r.label || '')) &&
+      r.dayIdx === (viewingDayIndex - 1)));
   // Wake-order lookup is keyed by PERCEIVED role, not actual role, so that
   // Drunk-as-FT (actualRoleId='drunk', perceivedRoleId='fortuneteller') wakes
   // as the Fortune Teller — the player thinks they have FT's ability and would
@@ -12346,6 +12430,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                      moonchildTargetSeatNum: def.__moonchildTargetSeatNum,
                      moonchildTargetIsGood:  def.__moonchildTargetIsGood,
                      moonchildAfflicted:     def.__moonchildAfflicted,
+                     zombuulDayDeath: id === 'zombuul' ? anyDeathToday : false,
                      prompt });
       }
     }
