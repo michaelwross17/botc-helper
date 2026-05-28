@@ -2046,40 +2046,6 @@ function App() {
             });
             next.__seatsCopy = seatsCopy;
           }
-          // Sailor: place 'Drunk' on the chosen seat (Sailor or target).
-          // If the chosen seat IS the Sailor, also strip her 'Protected'
-          // marker so she can die tonight. The strip is a separate pass
-          // so it's unambiguous regardless of map() ordering.
-          if (p.action === 'target1+st-pick' && p.infoPayload) {
-            const ipl = p.infoPayload || {};
-            const drunkSeatNum = (typeof ipl.drunkSeat === 'number') ? ipl.drunkSeat : null;
-            if (drunkSeatNum != null) {
-              const baseSeats = next.__seatsCopy || state.grimoire.seats;
-              // Pass 1 — place Drunk on the chosen seat.
-              let seatsCopy = baseSeats.map(s => {
-                if (s.seatNum !== drunkSeatNum) return s;
-                const hasDrunk = (s.reminders || []).some(r =>
-                  r && r.charId === 'sailor' && /^drunk$/i.test(String(r.label || '')));
-                if (hasDrunk) return s;
-                return { ...s, reminders: [...(s.reminders || []), { charId: 'sailor', label: 'Drunk', fromPrompt: true }] };
-              });
-              // Pass 2 — if the chosen seat is the Sailor herself, strip
-              // her 'Protected' marker from her seat. We also strip from
-              // ANY seat carrying 'Sailor: Protected' (defensive — in
-              // practice only the Sailor's own seat ever has it, but
-              // belt-and-braces in case of stale state).
-              const chosenSeat = seatsCopy.find(s => s.seatNum === drunkSeatNum);
-              if (chosenSeat && chosenSeat.actualRoleId === 'sailor') {
-                seatsCopy = seatsCopy.map(s => {
-                  const reminders = (s.reminders || []).filter(r =>
-                    !(r && r.charId === 'sailor' && /^protected$/i.test(String(r.label || ''))));
-                  if (reminders.length === (s.reminders || []).length) return s;
-                  return { ...s, reminders };
-                });
-              }
-              next.__seatsCopy = seatsCopy;
-            }
-          }
           // Gambler: if the ST verdict says the gambler dies, kill the gambler
           // via the direct-kill path (places 'Dead' on the gambler's own seat
           // with charId='gambler' so the marker icon is the Gambler).
@@ -2163,7 +2129,38 @@ function App() {
             }
           }
         }
-        // Goon — runs unconditionally on 'submitted'. If the prompt's
+        // Sailor — runs unconditionally on 'submitted'. The target1+st-pick
+        // action carries no per-target reminderLabel, so the inner !isInfo /
+        // isInfo branches don't fire for it. Place the chosen 'Drunk' here
+        // and (if Sailor herself was chosen) strip her 'Protected' marker.
+        if (p.action === 'target1+st-pick' && p.infoPayload) {
+          const ipl = p.infoPayload || {};
+          const drunkSeatNum = (typeof ipl.drunkSeat === 'number') ? ipl.drunkSeat : null;
+          if (drunkSeatNum != null) {
+            const baseSeats = next.__seatsCopy || state.grimoire.seats;
+            // Pass 1 — place 'Sailor: Drunk' on the chosen seat (idempotent).
+            let seatsCopy = baseSeats.map(s => {
+              if (s.seatNum !== drunkSeatNum) return s;
+              const hasDrunk = (s.reminders || []).some(r =>
+                r && r.charId === 'sailor' && /^drunk$/i.test(String(r.label || '')));
+              if (hasDrunk) return s;
+              return { ...s, reminders: [...(s.reminders || []), { charId: 'sailor', label: 'Drunk', fromPrompt: true }] };
+            });
+            // Pass 2 — if the chosen seat is the Sailor herself, strip any
+            // 'Sailor: Protected' markers from every seat.
+            const chosenSeat = seatsCopy.find(s => s.seatNum === drunkSeatNum);
+            if (chosenSeat && chosenSeat.actualRoleId === 'sailor') {
+              seatsCopy = seatsCopy.map(s => {
+                const reminders = (s.reminders || []).filter(r =>
+                  !(r && r.charId === 'sailor' && /^protected$/i.test(String(r.label || ''))));
+                if (reminders.length === (s.reminders || []).length) return s;
+                return { ...s, reminders };
+              });
+            }
+            next.__seatsCopy = seatsCopy;
+          }
+        }
+                // Goon — runs unconditionally on 'submitted'. If the prompt's
         // picked seats include the Goon AND the Goon's 'First' marker
         // isn't on her yet (i.e., this is the first chooser this night),
         // drop 'Drunk' on the chooser, 'First' on the Goon, and (if the
