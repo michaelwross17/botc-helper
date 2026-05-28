@@ -1482,6 +1482,10 @@ function App() {
   // seat picker. On Apply, if target is good and Moonchild isn't afflicted
   // the target dies via _killSeatDirect(target, 'moonchild', 'Dead').
   const [moonchildPickSeat, setMoonchildPickSeat] = useState(null);
+  // Shabaloth sequential pipeline: { items, idx } drives a queue of
+  // popups so pick 1 must be resolved before pick 2 fires (Tea Lady chain).
+  const [shabPending, setShabPending] = useState(null);
+  const shabLastIdxRef = React.useRef(-1);
   const cancelMoonchildPick = () => setMoonchildPickSeat(null);
   const applyMoonchildPick = (targetSeatNum) => {
     const mcSeat = (state.grimoire.seats || []).find(s => s.seatNum === moonchildPickSeat);
@@ -1611,10 +1615,20 @@ function App() {
   const confirmDeath = () => {
     if (!deathConfirmInfo) return;
     const { seatNum: dyingSeatNum, causeCharId } = deathConfirmInfo;
-    const seats = state.grimoire.seats.map(s =>
-      s.seatNum === dyingSeatNum ? { ...s, isDead: true } : s
+    update(s => {
+      let seats = (s.grimoire.seats || []).map(s0 =>
+        s0.seatNum === dyingSeatNum ? { ...s0, isDead: true } : s0
+      );
+      const killed = seats.find(s0 => s0.seatNum === dyingSeatNum);
+      if (killed && killed.actualRoleId === 'tealady') {
+        seats = applyTeaLadyProtection(seats);
+      }
+      return { grimoire: { ...s.grimoire, seats } };
+    });
+    // Re-snapshot locally so the Grandmother trigger below sees the death.
+    const seats = (state.grimoire.seats || []).map(s0 =>
+      s0.seatNum === dyingSeatNum ? { ...s0, isDead: true } : s0
     );
-    update({ grimoire: { ...state.grimoire, seats } });
     setDeathConfirmInfo(null);
     // Grandmother trigger — if the seat that just died has the Grandmother's
     // Grandchild reminder AND the killer is a Demon, ask the ST to also kill
@@ -1709,6 +1723,102 @@ function App() {
       return changed ? next : prev;
     });
   }, [JSON.stringify(state.grimoire.nightPrompts || {})]);
+
+  // Effect: Shabaloth queue processor — fires popups one at a time so
+  // pick 1 is fully resolved before pick 2 is built. Each fire reads
+  // fresh state via the effect closure (re-runs when seats change).
+  useEffect(() => {
+    if (!loaded || isSpectator) return;
+    if (!shabPending) {
+      shabLastIdxRef.current = -1;
+      return;
+    }
+    const { items, idx } = shabPending;
+    if (idx >= items.length) {
+      setShabPending(null);
+      return;
+    }
+    if (shabLastIdxRef.current === idx) return;
+    shabLastIdxRef.current = idx;
+    const advance = () => setShabPending({ items, idx: idx + 1 });
+    const item = items[idx];
+    if (item.type === 'kill') {
+      const seat = (state.grimoire.seats || []).find(s => s.seatNum === item.seatNum);
+      if (!seat || seat.isDead) { advance(); return; }
+      const protectionInfo = checkDeathProtection(seat, state.grimoire.seats || [], 'shabaloth');
+      const seatLabel = seat.playerName ? seat.playerName + ' (seat #' + seat.seatNum + ')' : 'seat #' + seat.seatNum;
+      const reasonsBlock = protectionInfo.reasons.length > 0
+        ? '\n\nProtection:\n• ' + protectionInfo.reasons.join('\n• ')
+        : '';
+      const pickOrder = (idx + 1);
+      const ordinal = pickOrder === 1 ? '1st' : (pickOrder === 2 ? '2nd' : pickOrder + 'th');
+      addCornerPrompt({
+        kind: 'warn',
+        title: 'Shabaloth kill — pick ' + pickOrder,
+        body: 'Shabaloth chose ' + seatLabel + ' (' + ordinal + ' pick) — they die tonight.' + reasonsBlock,
+        actions: [
+          { label: 'Kill', primary: true, onClick: () => {
+            _killSeatDirect(item.seatNum, 'shabaloth');
+            advance();
+          }},
+          { label: 'Skip — spare them', onClick: advance },
+        ],
+      });
+    } else if (item.type === 'regurg') {
+      const currentSeats = state.grimoire.seats || [];
+      const eatenSeats = currentSeats.filter(s =>
+        item.eatenSeatNums.includes(s.seatNum) && s.isDead &&
+        (s.reminders || []).some(r => r && r.charId === 'shabaloth' && /^eaten$/i.test(String(r.label || ''))));
+      if (eatenSeats.length === 0) { advance(); return; }
+      const stripEatenFrom = (seatNumsList) => {
+        update(s => {
+          const seats = (s.grimoire.seats || []).map(s0 => {
+            if (!seatNumsList.includes(s0.seatNum)) return s0;
+            const reminders = (s0.reminders || []).filter(r =>
+              !(r && r.charId === 'shabaloth' && /^eaten$/i.test(String(r.label || ''))));
+            return { ...s0, reminders };
+          });
+          return { grimoire: { ...s.grimoire, seats } };
+        });
+      };
+      const regurgitate = (seatNum) => {
+        update(s => {
+          const seats = (s.grimoire.seats || []).map(s0 => {
+            if (s0.seatNum === seatNum) {
+              const reminders = (s0.reminders || []).filter(r => {
+                if (!r) return false;
+                if (r.label === 'Dead') return false;
+                if (/^eaten$/i.test(String(r.label || ''))) return false;
+                if (/^no ability$/i.test(String(r.label || ''))) return false;
+                if (/^used$/i.test(String(r.label || ''))) return false;
+                return true;
+              });
+              return { ...s0, isDead: false, reminders };
+            }
+            if (!item.eatenSeatNums.includes(s0.seatNum)) return s0;
+            const reminders = (s0.reminders || []).filter(r =>
+              !(r && r.charId === 'shabaloth' && /^eaten$/i.test(String(r.label || ''))));
+            return { ...s0, reminders };
+          });
+          return { grimoire: { ...s.grimoire, seats } };
+        });
+      };
+      const labelFor = (s) => s.playerName ? s.playerName + ' (seat #' + s.seatNum + ')' : 'seat #' + s.seatNum;
+      const actions = eatenSeats.map(es => ({
+        label: 'Regurgitate ' + labelFor(es),
+        onClick: () => { regurgitate(es.seatNum); advance(); },
+      }));
+      actions.push({ label: 'Skip — no regurgitation', onClick: () => { stripEatenFrom(item.eatenSeatNums); advance(); } });
+      addCornerPrompt({
+        kind: 'warn',
+        title: 'Shabaloth regurgitation',
+        body: 'Shabaloth may regurgitate one player from last night. Pick which, or skip. Regurgitation clears Dead + once-per-game trackers (No ability / Used).',
+        actions,
+      });
+    } else {
+      advance();
+    }
+  }, [shabPending, JSON.stringify(state.grimoire.seats || [])]);
 
   // Effect: Po reconcile — runs independently of the main submitted-prompts
   // effect. For every Po prompt in 'submitted' or 'done', ensures the seat's
@@ -2130,13 +2240,23 @@ function App() {
             }
           }
         }
-        // Shabaloth — fires a kill popup per chosen target (with
-        // protection reasons), and ALSO fires a regurgitation popup
-        // when any previously-Eaten players exist. Reminder is empty
-        // in the registry so no auto per-target Dead placement
-        // happens — the kill popups use _killSeatDirect which routes
-        // through Fool/Sailor auto-protection chains.
+        // Shabaloth — enqueue items into shabPending so a dedicated
+        // effect processes them one at a time (pick 1 fully resolved
+        // before pick 2 fires; matters for Tea Lady chain reactions).
         if (p.roleId === 'shabaloth' && targets.length > 0) {
+          const items = [];
+          for (const tnum of targets) items.push({ type: 'kill', seatNum: tnum });
+          const eatenSeatNums = (state.grimoire.seats || []).filter(s =>
+            s.isDead && (s.reminders || []).some(r =>
+              r && r.charId === 'shabaloth' && /^eaten$/i.test(String(r.label || '')))).map(s => s.seatNum);
+          if (eatenSeatNums.length > 0) items.push({ type: 'regurg', eatenSeatNums });
+          if (items.length > 0) {
+            shabLastIdxRef.current = -1;
+            setShabPending({ items, idx: 0 });
+          }
+        }
+        // Old parallel logic below is gated off (kept for diff hygiene).
+        if (false && p.roleId === 'shabaloth' && targets.length > 0) {
           // Kill popups for tonight's picks.
           for (const tnum of targets) {
             const seat = (state.grimoire.seats || []).find(s => s.seatNum === tnum);
@@ -3137,17 +3257,20 @@ function App() {
   // upstream corner popup — re-confirming via the generic death modal would be
   // redundant.
   const _killSeatDirect = (seatNum, causeCharId, label = 'Dead') => {
-    // Fool first-death is checked here too — Slayer, Virgin, Moonchild,
-    // Grandmother (etc.) all kill via this path; per the rules her
-    // ability prevents any of those first deaths.
     if (tryFoolProtection(seatNum, causeCharId)) return;
     if (trySailorProtection(seatNum, causeCharId)) return;
     update(s => {
-      const seats = (s.grimoire.seats || []).map(seat =>
+      let seats = (s.grimoire.seats || []).map(seat =>
         seat.seatNum === seatNum
           ? { ...seat, isDead: true, reminders: [...(seat.reminders || []), { charId: causeCharId, label }] }
           : seat
       );
+      // Tea Lady death: strip her stale Protected markers immediately so
+      // any subsequent kill in the same tick sees the updated state.
+      const killed = seats.find(s0 => s0.seatNum === seatNum);
+      if (killed && killed.actualRoleId === 'tealady') {
+        seats = applyTeaLadyProtection(seats);
+      }
       return { grimoire: { ...s.grimoire, seats } };
     });
   };
@@ -3194,6 +3317,9 @@ function App() {
           if (has) return seat;
           return { ...seat, reminders: [...(seat.reminders || []), { charId: 'godfather', label: 'Died Today' }] };
         });
+      }
+      if (executed && executed.actualRoleId === 'tealady') {
+        seats = applyTeaLadyProtection(seats);
       }
       return { grimoire: { ...s.grimoire, seats } };
     });
@@ -11878,7 +12004,8 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
             <ul className="grid grid-cols-2 gap-1.5">
               {eligibleSeats.map(s => {
                 const isMe = s.seatNum === mySeat.seatNum;
-                const isPicked = picked.includes(s.seatNum);
+                const pickIdx = picked.indexOf(s.seatNum);
+                const isPicked = pickIdx >= 0;
                 return (
                   <li key={s.seatNum}>
                     <button onClick={() => togglePick(s.seatNum)}
@@ -11890,7 +12017,11 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
                         {s.playerName || <span className="text-stone-500 italic">(no name)</span>}
                         {isMe && <span className="ml-1 text-[10px] text-amber-300/80">· you</span>}
                       </span>
-                      {isPicked && <span className="text-amber-300 text-sm leading-none">✓</span>}
+                      {isPicked && (
+                        need > 1
+                          ? <span className="text-amber-200 text-xs font-bold bg-amber-900/70 rounded-full w-5 h-5 flex items-center justify-center">{pickIdx + 1}</span>
+                          : <span className="text-amber-300 text-sm leading-none">✓</span>
+                      )}
                     </button>
                   </li>
                 );
