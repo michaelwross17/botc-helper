@@ -1536,7 +1536,47 @@ function App() {
       return { grimoire: { ...s.grimoire, seats } };
     });
   };
+  // Fool — automated first-death protection. Returns true when the kill
+  // attempt should be silently absorbed (the Fool's ability fires); false
+  // when the kill should proceed normally. When firing, this also strips
+  // any pending 'Dead' reminder on the Fool's seat (placed moments earlier
+  // by the kill path) and drops the once-per-game 'No ability' marker.
+  // Bypasses: cause === 'assassin', Fool drunk/poisoned, already used.
+  const tryFoolProtection = (seatNum, causeCharId) => {
+    const seat = (state.grimoire.seats || []).find(s => s.seatNum === seatNum);
+    if (!seat) return false;
+    if (seat.actualRoleId !== 'fool') return false;
+    const used = (seat.reminders || []).some(r =>
+      r && r.charId === 'fool' && /no ability/i.test(String(r.label || '')));
+    if (used) return false;
+    if (causeCharId === 'assassin') return false;
+    if (isDrunkOrPoisoned(seat)) return false;
+    // Fire!  Strip any 'Dead' reminders + add 'No ability'.
+    update(s => {
+      const seats = (s.grimoire.seats || []).map(s0 => {
+        if (s0.seatNum !== seatNum) return s0;
+        const reminders = (s0.reminders || []).filter(r =>
+          !(r && r.label === 'Dead'));
+        const hasNo = reminders.some(r =>
+          r && r.charId === 'fool' && /no ability/i.test(String(r.label || '')));
+        return {
+          ...s0,
+          reminders: hasNo ? reminders : [...reminders, { charId: 'fool', label: 'No ability', fromPrompt: true }],
+        };
+      });
+      return { grimoire: { ...s.grimoire, seats } };
+    });
+    const causeName = (CHAR_BY_ID[causeCharId] || {}).name || causeCharId || 'unknown source';
+    addCornerPrompt({
+      kind: 'success',
+      title: 'Fool ability fired',
+      body: `${seat.playerName || 'Seat #' + seatNum} (Fool) was about to die (from ${causeName}) but survives — first-death prevented. Their ability is now used.`,
+      actions: [{ label: 'OK', primary: true }],
+    });
+    return true;
+  };
   const queueDeathConfirm = (seatNum, causeCharId) => {
+    if (tryFoolProtection(seatNum, causeCharId)) return;
     setDeathConfirmInfo({ seatNum, causeCharId: causeCharId || null });
   };
   const confirmDeath = () => {
@@ -2548,6 +2588,10 @@ function App() {
   // upstream corner popup — re-confirming via the generic death modal would be
   // redundant.
   const _killSeatDirect = (seatNum, causeCharId, label = 'Dead') => {
+    // Fool first-death is checked here too — Slayer, Virgin, Moonchild,
+    // Grandmother (etc.) all kill via this path; per the rules her
+    // ability prevents any of those first deaths.
+    if (tryFoolProtection(seatNum, causeCharId)) return;
     update(s => {
       const seats = (s.grimoire.seats || []).map(seat =>
         seat.seatNum === seatNum
@@ -8239,6 +8283,8 @@ const NIGHT_ACTIONS = {
                    infoType: 'seat+role',  infoConfig: { suggestion: 'grandchild' } },
   undertaker:    { action: 'info-st',     reminder: 'Saw',         instruction: 'You learn which character was executed today.', phase: 'other',
                    infoType: 'role',       infoConfig: { display: 'The executed player was the' } },
+
+  goon:          { action: 'manual',                                       instruction: "If any player chose the Goon with their ability tonight, mark the Goon drunk and change the Goon's alignment to match the chooser's. (Only the first chooser counts.)" },
 
   // ===== Bad Moon Rising =====
   godfather:     { action: 'target1',     reminder: 'Dead',        instruction: 'An Outsider died today — choose a player to die tonight.', phase: 'other' },
