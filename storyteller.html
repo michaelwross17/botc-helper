@@ -12632,13 +12632,20 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
               ) : (() => {
                 // For requiresDeath roles (Ravenkeeper), dim when ALIVE or when
                 // a 'No ability' reminder is already present (ability used).
-                // Otherwise dim when dead (the usual case).
+                // Zombuul is "functionally alive" if alive OR has an
+                // 'Executed once' marker — and dims if a day-death today
+                // gates the ability. Otherwise dim when dead (the usual case).
                 const noAbility = (s.seat?.reminders || []).some(r => r && /no ability/i.test(String(r.label || '')));
+                const zombuulHasExecOnce = (s.seat?.reminders || []).some(r =>
+                  r && r.charId === 'zombuul' && /^executed once$/i.test(String(r.label || '')));
+                const zombuulTrulyDead = !!s.seat?.isDead && !zombuulHasExecOnce;
                 const dim = s.action === 'passive'
                   ? true
                   : s.requiresDeath
                     ? (!s.seat?.isDead || noAbility)
-                    : !!s.seat?.isDead;
+                    : (s.char && s.char.id === 'zombuul')
+                      ? (zombuulTrulyDead || !!s.zombuulDayDeath)
+                      : !!s.seat?.isDead;
                 return (
                 <li key={i} className={`card rounded p-2 flex items-start gap-2 ${dim ? 'opacity-50' : ''} ${automation && s.prompt?.status === 'awaiting' ? 'border-amber-500 ring-1 ring-amber-700/40' : ''} ${automation && s.prompt?.status === 'question' ? 'border-red-500 ring-1 ring-red-700/40' : ''}`}>
                   <span className="text-stone-500 text-xs tabular-nums w-6 text-center pt-0.5">{s.stepNum}</span>
