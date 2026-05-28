@@ -1905,6 +1905,20 @@ function App() {
             placeOn(seatNum, String(info.number));
           } else if (info.type === 'yesno') {
             placeOn(seatNum, info.yes ? 'YES' : 'NO');
+          } else if (info.type === 'alignment') {
+            // Synthetic Goon step resolved — strip the 'Show alignment'
+            // marker from the Goon so the step doesn't re-emit. No new
+            // reminder is placed; the alignment override on the Goon's
+            // seat (set at trigger time) remains.
+            const baseSeats = next.__seatsCopy || state.grimoire.seats;
+            const seatsCopy = baseSeats.map(s0 => {
+              if (s0.actualRoleId !== 'goon') return s0;
+              const reminders = (s0.reminders || []).filter(r =>
+                !(r && r.charId === 'goon' && /^show alignment$/i.test(String(r.label || ''))));
+              if (reminders.length === (s0.reminders || []).length) return s0;
+              return { ...s0, reminders };
+            });
+            next.__seatsCopy = seatsCopy;
           } else if (info.type === 'seat+role') {
             // Grandmother — the 'Saw: <role>' marker goes on the SHOWN seat
             // (info.askSeat), which may differ from the true Grandchild if
@@ -2062,6 +2076,61 @@ function App() {
               return { ...s, reminders };
             });
             next.__seatsCopy = seatsCopy;
+          }
+        }
+        // Goon — runs unconditionally on 'submitted'. If the prompt's
+        // picked seats include the Goon AND the Goon's 'First' marker
+        // isn't on her yet (i.e., this is the first chooser this night),
+        // drop 'Drunk' on the chooser, 'First' on the Goon, and (if the
+        // chooser's alignment differs) flip the Goon's alignment +
+        // queue a 'Show alignment' marker that drives the synthetic
+        // reveal step in the night processor.
+        if (seatNum) {
+          const baseSeats0 = next.__seatsCopy || state.grimoire.seats;
+          const goonSeat = (baseSeats0 || []).find(s => s.actualRoleId === 'goon');
+          if (goonSeat && goonSeat.seatNum !== seatNum) {
+            // Collect every seat that this prompt picked: per-target seats +
+            // info.seats / info.askSeat when applicable.
+            const picked = new Set();
+            for (const tn of targets) picked.add(tn);
+            if (p.infoPayload) {
+              const ipl = p.infoPayload || {};
+              if (Array.isArray(ipl.seats)) ipl.seats.forEach(n => picked.add(n));
+              if (typeof ipl.askSeat === 'number') picked.add(ipl.askSeat);
+            }
+            if (picked.has(goonSeat.seatNum)) {
+              const goonHasFirst = (goonSeat.reminders || []).some(r =>
+                r && r.charId === 'goon' && /^first$/i.test(String(r.label || '')));
+              if (!goonHasFirst) {
+                const actorSeat = (baseSeats0 || []).find(s => s.seatNum === seatNum);
+                if (actorSeat) {
+                  const actorAlign = actorSeat.alignment || naturalAlignment(actorSeat.actualRoleId);
+                  const goonAlign  = goonSeat.alignment  || naturalAlignment(goonSeat.actualRoleId);
+                  const flipping   = actorAlign !== goonAlign;
+                  const seatsCopy  = (baseSeats0 || []).map(s => {
+                    if (s.seatNum === actorSeat.seatNum) {
+                      // Drunk on chooser (idempotent).
+                      const hasDrunk = (s.reminders || []).some(r =>
+                        r && r.charId === 'goon' && /^drunk$/i.test(String(r.label || '')));
+                      return hasDrunk
+                        ? s
+                        : { ...s, reminders: [...(s.reminders || []), { charId: 'goon', label: 'Drunk', fromPrompt: true }] };
+                    }
+                    if (s.seatNum === goonSeat.seatNum) {
+                      let reminders = [...(s.reminders || [])];
+                      reminders.push({ charId: 'goon', label: 'First', fromPrompt: true });
+                      if (flipping) {
+                        reminders.push({ charId: 'goon', label: 'Show alignment', fromPrompt: true, triggeredBy: actorSeat.seatNum, newAlignment: actorAlign });
+                        return { ...s, alignment: actorAlign, reminders };
+                      }
+                      return { ...s, reminders };
+                    }
+                    return s;
+                  });
+                  next.__seatsCopy = seatsCopy;
+                }
+              }
+            }
           }
         }
         // Moonchild: same — runs unconditionally on 'submitted'.
@@ -3151,11 +3220,14 @@ function App() {
         />
       )}
 
-      {/* Death-confirm modal — deferred while a LocalNightPromptOverlay is
-          open so the local player (holding the ST phone) doesn't see who died
-          or any attached role/protection info. The modal appears as soon as
-          the ST taps "Return to storyteller" and the local overlay closes. */}
-      {cornerPrompts.length > 0 && (
+      {/* Corner popups — deferred while a LocalNightPromptOverlay (or
+          local grimoire / Moonchild pick modal) is open so the local
+          player holding the ST phone never sees popup info that leaks
+          game state about their own ability resolution (e.g. "Fool
+          ability fired" leaking that they just targeted the Fool).
+          The popups reappear the moment the ST taps "Return to
+          storyteller" and the overlay closes. */}
+      {cornerPrompts.length > 0 && localOverlayStep == null && localGrimoireSeat == null && moonchildPickSeat == null && (
         <STCornerPrompts
           prompts={cornerPrompts}
           onAction={(promptId, actionIdx) => {
@@ -8284,7 +8356,7 @@ const NIGHT_ACTIONS = {
   undertaker:    { action: 'info-st',     reminder: 'Saw',         instruction: 'You learn which character was executed today.', phase: 'other',
                    infoType: 'role',       infoConfig: { display: 'The executed player was the' } },
 
-  goon:          { action: 'manual',                                       instruction: "If any player chose the Goon with their ability tonight, mark the Goon drunk and change the Goon's alignment to match the chooser's. (Only the first chooser counts.)" },
+  goon:          { action: 'passive',                                      instruction: 'Goon is passive — fires automatically when the first player to choose her this night resolves. The chooser becomes drunk and the Goon flips alignment to match.' },
 
   // ===== Bad Moon Rising =====
   godfather:     { action: 'target1',     reminder: 'Dead',        instruction: 'An Outsider died today — choose a player to die tonight.', phase: 'other' },
@@ -10092,6 +10164,8 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
     canSend = pickedSeats.length === 1 && !!pickedRole;
   } else if (infoType === 'role-list') {
     canSend = (pickedRole || '').split(',').filter(Boolean).length > 0;
+  } else if (infoType === 'alignment') {
+    canSend = !!(cfg.presetAlignment);
   }
 
   const buildPayload = () => {
@@ -10119,6 +10193,13 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
     }
     if (infoType === 'role-list') {
       return { type: 'role-list', roleIds: (pickedRole || '').split(',').filter(Boolean) };
+    }
+    if (infoType === 'alignment') {
+      return {
+        type: 'alignment',
+        alignment: cfg.presetAlignment,
+        displayLabel: cfg.displayLabel || null,
+      };
     }
     return null;
   };
@@ -10151,6 +10232,29 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
         <div className="text-xs text-stone-300/90 border-l-2 border-amber-700/50 pl-3">
           {step.instruction || c?.ability}
         </div>
+
+        {/* Goon trigger warning — if a picked seat is the Goon and the
+            Goon hasn't fired tonight yet, the asker will become drunk on
+            Send. ST can choose to give false info accordingly. */}
+        {(() => {
+          const goonSeat = (seats || []).find(s => s.actualRoleId === 'goon');
+          if (!goonSeat) return null;
+          const goonHasFirst = (goonSeat.reminders || []).some(r =>
+            r && r.charId === 'goon' && /^first$/i.test(String(r.label || '')));
+          if (goonHasFirst) return null;
+          const picksGoon = pickedSeats.includes(goonSeat.seatNum);
+          if (!picksGoon) return null;
+          const roleName = (CHAR_BY_ID[step.char.id] || {}).name || step.char.id;
+          return (
+            <div className="rounded-md p-2.5 border-2 border-purple-600/70 bg-purple-950/40 text-purple-100 text-xs flex items-start gap-2">
+              <span className="text-base leading-none mt-0.5">⚠</span>
+              <div className="leading-snug">
+                <span className="font-semibold">Picking the Goon will make the {roleName} drunk.</span>
+                {' '}This will be the first chooser tonight — Goon's ability fires on Send. Consider giving false info.
+              </div>
+            </div>
+          );
+        })()}
 
         {/* Drunk / poisoned warning for the RECEIVING player */}
         {isDrunkOrPoisoned(targetSeat) && (
@@ -10409,6 +10513,23 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
               </ul>
               <div className="mt-2 text-[10px] text-stone-500">
                 Selected: {selected.length === 0 ? '(none)' : selected.map(id => CHAR_BY_ID[id]?.name || id).join(', ')}
+              </div>
+            </div>
+          );
+        })()}
+
+        {infoType === 'alignment' && (() => {
+          const align = cfg.presetAlignment || 'good';
+          return (
+            <div className="space-y-2">
+              <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">
+                Reveal alignment to the Goon
+              </div>
+              <div className={`text-center p-5 rounded-lg border-2 ${align === 'good'
+                ? 'bg-emerald-900/40 text-emerald-200 border-emerald-700/70'
+                : 'bg-red-900/40 text-red-200 border-red-700/70'}`}>
+                <div className="text-6xl mb-1 leading-none">{align === 'good' ? '👍' : '👎'}</div>
+                <div className="text-3xl font-extrabold">{align === 'good' ? 'GOOD' : 'EVIL'}</div>
               </div>
             </div>
           );
@@ -11064,6 +11185,20 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
           )}
         </div>
       );
+    } else if (info.type === 'alignment') {
+      const align = info.alignment || 'good';
+      const top = info.displayLabel || 'Your new alignment is:';
+      infoBody = (
+        <div className="space-y-3 text-center">
+          <div className="text-sm text-stone-300">{top}</div>
+          <div className={`p-5 rounded-lg border-2 ${align === 'good'
+            ? 'bg-emerald-900/40 text-emerald-200 border-emerald-700/70'
+            : 'bg-red-900/40 text-red-200 border-red-700/70'}`}>
+            <div className="text-7xl mb-1 leading-none">{align === 'good' ? '👍' : '👎'}</div>
+            <div className="text-4xl font-extrabold">{align === 'good' ? 'GOOD' : 'EVIL'}</div>
+          </div>
+        </div>
+      );
     } else if (info.type === 'seat+role') {
       const askSeat = seatBy[info.askSeat];
       const role = info.roleId ? CHAR_BY_ID[info.roleId] : null;
@@ -11540,6 +11675,51 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
           },
           prompt,
         });
+      }
+    }
+  }
+  // Goon synthetic 'show alignment' step. When the Goon carries a
+  // 'Show alignment' marker (placed by the trigger above when her
+  // alignment just flipped), splice a synthetic step right after the
+  // actor's step so the ST shows the Goon her new alignment in order.
+  {
+    const goonSeat = (seats || []).find(s => s.actualRoleId === 'goon');
+    const showRem = goonSeat ? (goonSeat.reminders || []).find(r =>
+      r && r.charId === 'goon' && /^show alignment$/i.test(String(r.label || ''))) : null;
+    if (goonSeat && showRem) {
+      const triggeredBy = showRem.triggeredBy;
+      const newAlignment = showRem.newAlignment || (goonSeat.alignment || 'good');
+      const goonChar = CHAR_BY_ID['goon'] || { id: 'goon', name: 'Goon', team: 'outsider' };
+      const prompt = nightPrompts[goonSeat.seatNum];
+      const goonStep = {
+        type: 'char',
+        char: goonChar,
+        seat: goonSeat,
+        reminder: '',
+        isExtra: false,
+        action: 'info-st',
+        instruction: `Show the Goon her new alignment (${newAlignment.toUpperCase()}). Wake her, give thumbs-${newAlignment === 'good' ? 'up' : 'down'}, then put her to sleep.`,
+        reminderLabel: '',
+        requiresDeath: false,
+        oncePerGame: false,
+        canSkip: false,
+        infoType: 'alignment',
+        infoConfig: { presetAlignment: newAlignment, displayLabel: 'Your new alignment is:' },
+        prompt,
+      };
+      // Find the actor's step and splice after it. Fallback: append.
+      let insertAt = steps.length;
+      for (let i = 0; i < steps.length; i++) {
+        if (steps[i].type === 'char' && steps[i].seat?.seatNum === triggeredBy) {
+          insertAt = i + 1;
+          break;
+        }
+      }
+      steps.splice(insertAt, 0, goonStep);
+      // Renumber char steps.
+      let n = 0;
+      for (const s of steps) {
+        if (s.type === 'char') { n += 1; s.stepNum = n; }
       }
     }
   }

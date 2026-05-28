@@ -1281,6 +1281,20 @@ function NightInfoScreen({ mySeat, seats, prompt, onAck, onQuestion }) {
         </ul>
       </div>
     );
+  } else if (info.type === 'alignment') {
+    const align = info.alignment || 'good';
+    const top = info.displayLabel || 'Your new alignment is:';
+    body = (
+      <div className="space-y-3 text-center">
+        <div className="text-sm text-stone-300">{top}</div>
+        <div className={`p-5 rounded-lg border-2 ${align === 'good'
+          ? 'bg-emerald-900/40 text-emerald-200 border-emerald-700/70'
+          : 'bg-red-900/40 text-red-200 border-red-700/70'}`}>
+          <div className="text-7xl mb-1 leading-none">{align === 'good' ? '👍' : '👎'}</div>
+          <div className="text-4xl font-extrabold">{align === 'good' ? 'GOOD' : 'EVIL'}</div>
+        </div>
+      </div>
+    );
   } else if (info.type === 'seat+role') {
     const askSeat = seatBy[info.askSeat];
     const role = info.roleId ? CHAR_BY_ID[info.roleId] : null;
