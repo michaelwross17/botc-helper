@@ -1581,6 +1581,7 @@ function App() {
     if (!seat) return false;
     if (seat.actualRoleId !== 'sailor') return false;
     if (causeCharId === 'assassin') return false;
+    if (isDrunkOrPoisoned(seat)) return false;
     const hasProtect = (seat.reminders || []).some(r =>
       r && r.charId === 'sailor' && /^protected$/i.test(String(r.label || '')));
     if (!hasProtect) return false;
@@ -2142,14 +2143,14 @@ function App() {
           const baseSeats = next.__seatsCopy || state.grimoire.seats;
           const marked = baseSeats.filter(s =>
             !s.isDead && (s.reminders || []).some(r =>
-              r && r.charId === 'pukka' && /^dead$/i.test(String(r.label || ''))));
+              r && r.charId === 'pukka' && /^(poison\s+)?dead$/i.test(String(r.label || ''))));
           for (const ms of marked) {
             const stripPukkaDead = (sn) => {
               update(s => {
                 const seats = (s.grimoire.seats || []).map(s0 => {
                   if (s0.seatNum !== sn) return s0;
                   const reminders = (s0.reminders || []).filter(r =>
-                    !(r && r.charId === 'pukka' && /^dead$/i.test(String(r.label || ''))));
+                    !(r && r.charId === 'pukka' && /^(poison\s+)?dead$/i.test(String(r.label || ''))));
                   return { ...s0, reminders };
                 });
                 return { grimoire: { ...s.grimoire, seats } };
@@ -2631,13 +2632,14 @@ function App() {
       const seatsWithTL = applyTeaLadyProtection(seatsForNewNight);
       const seatsWithSailor = applySailorProtection(seatsWithTL);
       // Pukka conversion — at end-of-day, every 'Pukka: Poisoned' marker
-      // becomes 'Pukka: Dead' so the next Pukka pick can resolve a kill
-      // on the previously-poisoned player.
+      // becomes 'Pukka: Poison Dead' so it both (a) signals the next Pukka
+      // pick to resolve the kill on that seat and (b) continues to count
+      // as a poison marker (isDrunkOrPoisoned matches 'poison').
       const seatsWithPukka = seatsWithSailor.map(seat => ({
         ...seat,
         reminders: (seat.reminders || []).map(r => {
           if (r && r.charId === 'pukka' && /^poisoned$/i.test(String(r.label || ''))) {
-            return { ...r, label: 'Dead' };
+            return { ...r, label: 'Poison Dead' };
           }
           return r;
         }),
@@ -8878,7 +8880,7 @@ function isReminderPermanent(reminder) {
   // day, gets converted to 'Dead' at Go-to-Night, and 'Dead' persists
   // until the next Pukka pick resolves the kill (or the ST skips).
   if (reminder.charId === 'pukka' && /^poisoned$/i.test(reminder.label || '')) return true;
-  if (reminder.charId === 'pukka' && /^dead$/i.test(reminder.label || '')) return true;
+  if (reminder.charId === 'pukka' && /^(poison\s+)?dead$/i.test(reminder.label || '')) return true;
   // Moonchild 'Dead' marker (placed on the chosen target at capture)
   // persists across nights until the ST resolves at the natural slot.
   if (reminder.charId === 'moonchild' && /^dead$/i.test(reminder.label || '')) return true;
@@ -8928,7 +8930,10 @@ function isDrunkOrPoisoned(seat) {
   if (seat.actualRoleId === 'drunk' || seat.actualRoleId === 'marionette') return true;
   return (seat.reminders || []).some(r => {
     const label = String(r?.label || '').toLowerCase();
-    return label.includes('drunk') || label.includes('poisoned');
+    if (label.includes('drunk')) return true;
+    // Match 'poison' as a word so 'Poisoned' and 'Poison Dead' both
+    // count, but 'Poisoner' (unlikely as a label) doesn't.
+    return /\bpoison(ed)?\b/.test(label);
   });
 }
 
@@ -8970,23 +8975,25 @@ function checkDeathProtection(seat, allSeats, causeCharId) {
     if (r.charId === 'innkeeper' && /safe/i.test(label)) reasons.push("Innkeeper \u2018Safe\u2019 reminder \u2014 protected from Demon kills");
     if (r.charId === 'angel' && /protect|safe/i.test(label)) reasons.push("Angel \u2018Protect\u2019 reminder");
   }
-  // Role-based:
+  // Role-based self-protections — only fire when the protected player is
+  // sober. Pukka poison (or any other drunk/poisoned marker) disables
+  // these abilities, so the protection list correctly omits them.
   const role = seat.actualRoleId;
-  if (isDemonCause && role === 'soldier') reasons.push("Soldier role \u2014 cannot die at night to the Demon");
-  // Sailor — marker-based check (placed at Begin Game / Go-to-Night).
-  // Assassin bypasses. When the Drunk marker is on the Sailor (her own
-  // ability is drunk), the Protected marker has already been stripped
-  // by the ST response, so this check implicitly skips.
-  if (role === 'sailor' && causeCharId !== 'assassin') {
-    const hasSailorProtect = (seat.reminders || []).some(r =>
-      r && r.charId === 'sailor' && /^protected$/i.test(String(r.label || '')));
-    if (hasSailorProtect) reasons.push("Sailor protection \u2014 cannot die (Assassin bypasses)");
-  }
-  if (isDemonCause && role === 'mayor') reasons.push("Mayor role \u2014 night death may be redirected to another player (ST choice)");
-  if (role === 'fool') {
-    // Fool's first save is the absence of a 'No ability' tracker reminder.
-    const used = (seat.reminders || []).some(r => r && r.charId === 'fool' && /no ability/i.test(String(r.label || '')));
-    if (!used) reasons.push("Fool role \u2014 first death is prevented (no \u2018No ability\u2019 reminder yet)");
+  const afflictedForSelf = isDrunkOrPoisoned(seat);
+  if (!afflictedForSelf) {
+    if (isDemonCause && role === 'soldier') reasons.push("Soldier role \u2014 cannot die at night to the Demon");
+    // Sailor — marker-based check (Begin Game / Go-to-Night places it,
+    // ST stripping it when choosing Sailor as drunk). Assassin bypasses.
+    if (role === 'sailor' && causeCharId !== 'assassin') {
+      const hasSailorProtect = (seat.reminders || []).some(r =>
+        r && r.charId === 'sailor' && /^protected$/i.test(String(r.label || '')));
+      if (hasSailorProtect) reasons.push("Sailor protection \u2014 cannot die (Assassin bypasses)");
+    }
+    if (isDemonCause && role === 'mayor') reasons.push("Mayor role \u2014 night death may be redirected to another player (ST choice)");
+    if (role === 'fool') {
+      const used = (seat.reminders || []).some(r => r && r.charId === 'fool' && /no ability/i.test(String(r.label || '')));
+      if (!used) reasons.push("Fool role \u2014 first death is prevented (no \u2018No ability\u2019 reminder yet)");
+    }
   }
   // Tea Lady — definitive check from the 'Tea Lady: Protected' marker
   // placed by applyTeaLadyProtection at Begin Game / Go-to-Night.
