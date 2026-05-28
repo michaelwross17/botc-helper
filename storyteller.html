@@ -8369,6 +8369,13 @@ function isReminderPermanent(reminder) {
   if (reminder.charId === 'po' && /hungry|3 to kill/i.test(reminder.label || '')) return true;
   // Moonchild 'Triggered' (just died) persists until ST resolves the pick.
   if (reminder.charId === 'moonchild' && /trigger/i.test(reminder.label || '')) return true;
+  // Moonchild 'Dead' marker (placed on the chosen target at capture)
+  // persists across nights until the ST resolves at the natural slot.
+  if (reminder.charId === 'moonchild' && /^dead$/i.test(reminder.label || '')) return true;
+  // Moonchild 'Chose' audit marker — she only fires once per game; the
+  // marker stays so post-resolution the natural-slot row reads "already
+  // resolved" instead of "has not died yet".
+  if (reminder.charId === 'moonchild' && /^chose$/i.test(reminder.label || '')) return true;
   // Demon 'Exorcised' persists for the night so the demon's wake step
   // remains dim. Cleared at Go-to-Night (transient by default — see below).
   // Note: this is intentionally NOT made permanent here; the standard
@@ -8710,7 +8717,7 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
       </div>
     );
   }
-  if (requiresDeath && !(seat.isDead && hasDeadReminder)) {
+  if (requiresDeath && action !== 'moonchild-resolve' && !(seat.isDead && hasDeadReminder)) {
     return (
       <div className="mt-1.5 text-[11px] text-stone-500 italic">
         Wakes only when this seat dies at night (needs both seat-dead and a "Dead" reminder).
@@ -11403,7 +11410,15 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
         def.__moonchildTargetIsGood = tgtIsGood;
         def.__moonchildAfflicted = mcAfflicted;
       } else {
-        def = { ...def, action: 'passive', instruction: 'Moonchild has not died yet — does not wake.' };
+        const resolved = !!(mcSeat?.reminders || []).some(r =>
+          r && r.charId === 'moonchild' && /^chose$/i.test(String(r.label || '')));
+        def = {
+          ...def,
+          action: 'passive',
+          instruction: resolved
+            ? "Moonchild's ability already resolved this game."
+            : 'Moonchild has not died yet — does not wake.',
+        };
         effectiveAction = 'passive';
       }
     }
