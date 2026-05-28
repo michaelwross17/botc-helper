@@ -385,7 +385,7 @@ function App() {
             // 'awaiting-st-response' so the ST can pick the info to return.
             // For info acks (Got it on an info display) the prompt already has
             // an infoPayload — those go straight to 'submitted'.
-            const isTwoStep = (curr.action === 'target2+yesno' || curr.action === 'target1+role' || curr.action === 'target2+number' || curr.action === 'target2+st-pick' || curr.action === 'target1+guess') && !curr.infoPayload;
+            const isTwoStep = (curr.action === 'target2+yesno' || curr.action === 'target1+role' || curr.action === 'target2+number' || curr.action === 'target2+st-pick' || curr.action === 'target1+st-pick' || curr.action === 'target1+guess') && !curr.infoPayload;
             const newStatus = isTwoStep ? 'awaiting-st-response' : 'submitted';
             // Preserve existing targets when info-acking with an empty array,
             // so the ST effect can still place the per-target reminders.
@@ -1456,8 +1456,9 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
     const isSelf = s.seatNum === mySeat.seatNum;
     if (prompt.eligible === 'others' && isSelf) return false;
     if (prompt.eligible === 'self' && !isSelf) return false;
-    // target1any allows dead seats; everything else requires alive.
-    if (prompt.action !== 'target1any' && s.isDead) return false;
+    if (prompt.eligible === 'dead' && !s.isDead) return false;
+    // target1any (or eligible='dead') allows dead seats; everything else requires alive.
+    if (prompt.action !== 'target1any' && prompt.eligible !== 'dead' && s.isDead) return false;
     // Exorcist cannot pick the same player two nights in a row.
     if (prompt.roleId === 'exorcist' &&
         (s.reminders || []).some(r => r && r.charId === 'exorcist' && r.exChose)) {

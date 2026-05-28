@@ -1306,7 +1306,7 @@ function App() {
   // response IS the resolution and the player doesn't see anything new
   // (Innkeeper picks who's drunk, Gambler verdict) we jump straight to
   // 'submitted' so the effect runs immediately.
-  const NO_PLAYER_ACK_ACTIONS = new Set(['target2+st-pick', 'target1+guess']);
+  const NO_PLAYER_ACK_ACTIONS = new Set(['target2+st-pick', 'target1+st-pick', 'target1+guess']);
   const respondToNightPrompt = (seatNum, infoPayload) => {
     if (!seatNum) return;
     const np = { ...(state.grimoire.nightPrompts || {}) };
@@ -1368,7 +1368,7 @@ function App() {
     // the prompt as 'awaiting-st-response' so the ST sees the response popup.
     // Subsequent submission (info ack with infoPayload set) transitions to
     // 'submitted' so the existing effect places the 'Chose' reminders.
-    const isPickerSubmitForTwoStep = (step.action === 'target2+yesno' || step.action === 'target1+role' || step.action === 'target2+number' || step.action === 'target2+st-pick' || step.action === 'target1+guess') && !infoPayload;
+    const isPickerSubmitForTwoStep = (step.action === 'target2+yesno' || step.action === 'target1+role' || step.action === 'target2+number' || step.action === 'target2+st-pick' || step.action === 'target1+st-pick' || step.action === 'target1+guess') && !infoPayload;
     // `skipped` is passed by the local overlay when the player chose Skip on a
     // use/skip prompt. Sets status='declined' so the existing effect emits the
     // "saved for later" toast and the No ability marker is NOT placed.
@@ -1575,8 +1575,36 @@ function App() {
     });
     return true;
   };
+  // Sailor automated protection (parallel to tryFoolProtection).
+  const trySailorProtection = (seatNum, causeCharId) => {
+    const seat = (state.grimoire.seats || []).find(s => s.seatNum === seatNum);
+    if (!seat) return false;
+    if (seat.actualRoleId !== 'sailor') return false;
+    if (causeCharId === 'assassin') return false;
+    const hasProtect = (seat.reminders || []).some(r =>
+      r && r.charId === 'sailor' && /^protected$/i.test(String(r.label || '')));
+    if (!hasProtect) return false;
+    update(s => {
+      const seats = (s.grimoire.seats || []).map(s0 => {
+        if (s0.seatNum !== seatNum) return s0;
+        const reminders = (s0.reminders || []).filter(r =>
+          !(r && r.label === 'Dead'));
+        return { ...s0, reminders };
+      });
+      return { grimoire: { ...s.grimoire, seats } };
+    });
+    const causeName = (CHAR_BY_ID[causeCharId] || {}).name || causeCharId || 'unknown source';
+    addCornerPrompt({
+      kind: 'success',
+      title: 'Sailor cannot die',
+      body: (seat.playerName || ('Seat #' + seatNum)) + ' (Sailor) was targeted by ' + causeName + ' but is protected.',
+      actions: [{ label: 'OK', primary: true }],
+    });
+    return true;
+  };
   const queueDeathConfirm = (seatNum, causeCharId) => {
     if (tryFoolProtection(seatNum, causeCharId)) return;
+    if (trySailorProtection(seatNum, causeCharId)) return;
     setDeathConfirmInfo({ seatNum, causeCharId: causeCharId || null });
   };
   const confirmDeath = () => {
@@ -2018,6 +2046,28 @@ function App() {
             });
             next.__seatsCopy = seatsCopy;
           }
+          // Sailor: place 'Drunk' on the chosen seat (Sailor or target).
+          // If Sailor herself was chosen, also strip her 'Protected' marker.
+          if (p.action === 'target1+st-pick' && p.infoPayload) {
+            const ipl = p.infoPayload || {};
+            const drunkSeatNum = (typeof ipl.drunkSeat === 'number') ? ipl.drunkSeat : null;
+            if (drunkSeatNum != null) {
+              const baseSeats = next.__seatsCopy || state.grimoire.seats;
+              const seatsCopy = baseSeats.map(s => {
+                if (s.seatNum !== drunkSeatNum) return s;
+                let reminders = (s.reminders || []).slice();
+                const hasDrunk = reminders.some(r =>
+                  r && r.charId === 'sailor' && /^drunk$/i.test(String(r.label || '')));
+                if (!hasDrunk) reminders.push({ charId: 'sailor', label: 'Drunk', fromPrompt: true });
+                if (s.actualRoleId === 'sailor') {
+                  reminders = reminders.filter(r =>
+                    !(r && r.charId === 'sailor' && /^protected$/i.test(String(r.label || ''))));
+                }
+                return { ...s, reminders };
+              });
+              next.__seatsCopy = seatsCopy;
+            }
+          }
           // Gambler: if the ST verdict says the gambler dies, kill the gambler
           // via the direct-kill path (places 'Dead' on the gambler's own seat
           // with charId='gambler' so the marker icon is the Gambler).
@@ -2131,6 +2181,44 @@ function App() {
                 }
               }
             }
+          }
+        }
+        // Professor — resurrect a dead Townsfolk if Professor is sober.
+        // Fires a corner popup with the outcome. 'No ability' marker on
+        // the Professor is handled by the existing oncePerGame block.
+        if (p.roleId === 'professor' && targets.length === 1) {
+          const baseSeats = next.__seatsCopy || state.grimoire.seats;
+          const tgtSeat = baseSeats.find(s => s.seatNum === targets[0]);
+          const profSeat = baseSeats.find(s => s.seatNum === seatNum);
+          const tgtRole = CHAR_BY_ID[tgtSeat?.actualRoleId];
+          const tgtIsTownsfolk = tgtRole?.team === 'townsfolk';
+          const profAfflicted = profSeat ? isDrunkOrPoisoned(profSeat) : false;
+          const tgtLabel = tgtSeat ? (tgtSeat.playerName ? tgtSeat.playerName + ' (seat #' + tgtSeat.seatNum + ')' : 'seat #' + tgtSeat.seatNum) : 'target';
+          if (tgtSeat && tgtSeat.isDead && tgtIsTownsfolk && !profAfflicted) {
+            const seatsCopy = baseSeats.map(s =>
+              s.seatNum === tgtSeat.seatNum
+                ? { ...s, isDead: false, reminders: (s.reminders || []).filter(r => !(r && r.label === 'Dead')) }
+                : s
+            );
+            next.__seatsCopy = seatsCopy;
+            addCornerPrompt({
+              kind: 'success',
+              title: 'Professor resurrected',
+              body: tgtLabel + ' is a Townsfolk and the Professor is sober — they are now alive again.',
+              actions: [{ label: 'OK', primary: true }],
+            });
+          } else if (tgtSeat) {
+            const reason = profAfflicted
+              ? 'the Professor is drunk/poisoned, so the ability malfunctioned'
+              : !tgtSeat.isDead
+                ? 'the chosen player is alive, so the ability has no effect'
+                : tgtLabel + ' is not a Townsfolk, so they stay dead';
+            addCornerPrompt({
+              kind: 'warn',
+              title: 'Professor — no resurrection',
+              body: "Professor's ability is used but " + reason + '.',
+              actions: [{ label: 'OK', primary: true }],
+            });
           }
         }
         // Moonchild: same — runs unconditionally on 'submitted'.
@@ -2347,6 +2435,20 @@ function App() {
   // neighbours (wrap-around, skipping dead). If BOTH are good, drop
   // 'Tea Lady: Protected' on each. Stale markers from prior state are
   // stripped first so the placement is always fresh.
+  const applySailorProtection = (seats) => {
+    let result = (seats || []).map(s => ({
+      ...s,
+      reminders: (s.reminders || []).filter(r =>
+        !(r && r.charId === 'sailor' && /^protected$/i.test(String(r.label || '')))),
+    }));
+    result = result.map(s =>
+      s.actualRoleId === 'sailor' && !s.isDead
+        ? { ...s, reminders: [...(s.reminders || []), { charId: 'sailor', label: 'Protected', fromPrompt: true }] }
+        : s
+    );
+    return result;
+  };
+
   const applyTeaLadyProtection = (seats) => {
     let result = (seats || []).map(s => ({
       ...s,
@@ -2384,7 +2486,8 @@ function App() {
 
   const beginGame = () => {
     update(s => {
-      const protectedSeats = applyTeaLadyProtection(s.grimoire.seats || []);
+      let protectedSeats = applyTeaLadyProtection(s.grimoire.seats || []);
+      protectedSeats = applySailorProtection(protectedSeats);
       return { grimoire: { ...s.grimoire, gameStarted: true, days: [], viewingDayIndex: 0, seats: protectedSeats } };
     });
   };
@@ -2436,10 +2539,11 @@ function App() {
         reminders: filterReminders(t.reminders),
       }));
       const seatsWithTL = applyTeaLadyProtection(seatsForNewNight);
+      const seatsWithSailor = applySailorProtection(seatsWithTL);
       return {
         grimoire: {
           ...g,
-          seats: seatsWithTL,
+          seats: seatsWithSailor,
           travellers: travellersForNewNight,
           nightPrompts: {},
           days: [...(g.days || []), snapshot],
@@ -2497,6 +2601,12 @@ function App() {
     // "they can't die" this also blocks executions.
     const teaLadyProtects = (blockSeat.reminders || []).some(r =>
       r && r.charId === 'tealady' && /^protected$/i.test(String(r.label || '')));
+    const sailorOnBlockProtects = blockSeat.actualRoleId === 'sailor' &&
+      (blockSeat.reminders || []).some(r =>
+        r && r.charId === 'sailor' && /^protected$/i.test(String(r.label || '')));
+    if (sailorOnBlockProtects) {
+      warnings.push("Sailor protection \u2014 Sailor cannot die (Assassin would bypass, but execution does not)");
+    }
     if (teaLadyProtects) {
       warnings.push("Tea Lady protection — both alive neighbours are good, the rule \u201Cthey can't die\u201D applies to executions too");
     }
@@ -2508,6 +2618,7 @@ function App() {
     else if (daProtection) title = 'Execute (DA-protected)?';
     else if (pacifistApplies) title = 'Execute (Pacifist concern)?';
     else if (teaLadyProtects) title = 'Execute (Tea Lady-protected)?';
+    else if (sailorOnBlockProtects) title = 'Execute (Sailor-protected)?';
     const executeLabel = warnings.length > 0 ? 'Execute anyway' : 'Execute & advance';
     const skipLabel = teaLadyProtects && warnings.length === 1 ? 'Skip — Tea Lady protects'
                     : pacifistApplies && warnings.length === 1 ? 'Skip — Pacifist saves'
@@ -2828,6 +2939,7 @@ function App() {
     // Grandmother (etc.) all kill via this path; per the rules her
     // ability prevents any of those first deaths.
     if (tryFoolProtection(seatNum, causeCharId)) return;
+    if (trySailorProtection(seatNum, causeCharId)) return;
     update(s => {
       const seats = (s.grimoire.seats || []).map(seat =>
         seat.seatNum === seatNum
@@ -8541,7 +8653,10 @@ const NIGHT_ACTIONS = {
                    eligible: 'others' },
   assassin:      { action: 'target1any',  reminder: 'Dead',        instruction: 'Once per game, at night, choose a player: they die, even if for some reason they could not.', phase: 'other',
                    oncePerGame: true, canSkip: true },
-  professor:     { action: 'target1',     reminder: 'Used',        instruction: 'Once per game at night, choose a dead player — if they are a Townsfolk, they are resurrected.', phase: 'other' },
+  professor:     { action: 'target1any',  reminder: '',            instruction: 'Once per game at night, choose a DEAD player. If they are a Townsfolk, they are resurrected.',
+                   eligible: 'dead', oncePerGame: true, canSkip: true, phase: 'other' },
+  sailor:        { action: 'target1+st-pick', reminder: '',         instruction: 'Choose an alive player. Either you or they are drunk until dusk. You cannot die.',
+                   eligible: 'others' },
 
   // ===== Sects & Violets =====
   dreamer:       { action: 'info-st',     reminder: 'Showed',      instruction: 'Choose a player (not yourself). You learn 1 good and 1 evil character — 1 of them is correct.',
@@ -8751,7 +8866,15 @@ function checkDeathProtection(seat, allSeats, causeCharId) {
   // Role-based:
   const role = seat.actualRoleId;
   if (isDemonCause && role === 'soldier') reasons.push("Soldier role \u2014 cannot die at night to the Demon");
-  if (role === 'sailor')    reasons.push("Sailor role \u2014 cannot die");
+  // Sailor — marker-based check (placed at Begin Game / Go-to-Night).
+  // Assassin bypasses. When the Drunk marker is on the Sailor (her own
+  // ability is drunk), the Protected marker has already been stripped
+  // by the ST response, so this check implicitly skips.
+  if (role === 'sailor' && causeCharId !== 'assassin') {
+    const hasSailorProtect = (seat.reminders || []).some(r =>
+      r && r.charId === 'sailor' && /^protected$/i.test(String(r.label || '')));
+    if (hasSailorProtect) reasons.push("Sailor protection \u2014 cannot die (Assassin bypasses)");
+  }
   if (isDemonCause && role === 'mayor') reasons.push("Mayor role \u2014 night death may be redirected to another player (ST choice)");
   if (role === 'fool') {
     // Fool's first save is the absence of a 'No ability' tracker reminder.
@@ -9311,6 +9434,7 @@ function STResponseCard({ seatNum, prompt, seats, scriptCharIds = [], onSend }) 
   const isRolePick = prompt.action === 'target1+role';
   const isNumberPick = prompt.action === 'target2+number';
   const isInnkeeperPick = prompt.action === 'target2+st-pick';
+  const isSailorPick = prompt.action === 'target1+st-pick';
   const isGambler = prompt.action === 'target1+guess';
   // Auto-suggested role for target1+role = the chosen seat's actualRoleId.
   const suggestedRoleId = isRolePick && targetSeats[0] ? targetSeats[0].actualRoleId : null;
@@ -9415,8 +9539,37 @@ function STResponseCard({ seatNum, prompt, seats, scriptCharIds = [], onSend }) 
         </ul>
       </div>
 
-      {/* Branch on response shape: yes/no buttons for FT, role grid for RK-style, number buttons for Chambermaid, Innkeeper/Gambler get their own forms */}
-      {isInnkeeperPick ? (
+      {/* Branch on response shape: yes/no buttons for FT, role grid for RK-style, number buttons for Chambermaid, Innkeeper/Gambler get their own forms, Sailor 2-option picker */}
+      {isSailorPick ? (
+        <div>
+          <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">
+            Choose who is drunk until dusk
+          </div>
+          <div className="text-[11px] text-stone-400 mb-2">
+            (Choosing the Sailor strips her Protected marker — she can die tonight.)
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            {(() => {
+              const tgtSeat = targetSeats[0];
+              const tgtLabel = tgtSeat ? ((tgtSeat.playerName || ('seat #' + tgtSeat.seatNum))) : 'Target';
+              const meLabel  = (mySeat?.playerName || ('seat #' + (mySeat?.seatNum || seatNum)));
+              return (
+                <>
+                  <button onClick={() => onSend({ type: 'sailor-pick', drunkSeat: seatNum })}
+                    className="py-3 rounded-lg text-sm font-semibold bg-amber-700 hover:bg-amber-600 text-stone-50">
+                    Sailor drunk<div className="text-[10px] font-normal opacity-80">{meLabel}</div>
+                  </button>
+                  <button onClick={() => onSend({ type: 'sailor-pick', drunkSeat: tgtSeat?.seatNum })}
+                    disabled={!tgtSeat}
+                    className={`py-3 rounded-lg text-sm font-semibold ${tgtSeat ? 'bg-amber-700 hover:bg-amber-600 text-stone-50' : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+                    Target drunk<div className="text-[10px] font-normal opacity-80">{tgtLabel}</div>
+                  </button>
+                </>
+              );
+            })()}
+          </div>
+        </div>
+      ) : isInnkeeperPick ? (
         <div>
           {askerAfflicted && (
             <div className="text-[11px] text-amber-200/90 mb-2">
@@ -11175,7 +11328,8 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
     const isSelf = s.seatNum === mySeat.seatNum;
     if (eligible === 'others' && isSelf) return false;
     if (eligible === 'self' && !isSelf) return false;
-    if (step.action !== 'target1any' && s.isDead) return false;
+    if (eligible === 'dead' && !s.isDead) return false;
+    if (step.action !== 'target1any' && eligible !== 'dead' && s.isDead) return false;
     // Exorcist cannot pick the same player two nights in a row.
     if (step.char.id === 'exorcist' &&
         (s.reminders || []).some(r => r && r.charId === 'exorcist' && r.exChose)) {
