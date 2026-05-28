@@ -2342,8 +2342,51 @@ function App() {
   };
 
   // --- Day phases ---
+  // Tea Lady — at game start and at every Go-to-Night, recompute her
+  // 'Protected' markers. Walks each alive Tea Lady's two nearest alive
+  // neighbours (wrap-around, skipping dead). If BOTH are good, drop
+  // 'Tea Lady: Protected' on each. Stale markers from prior state are
+  // stripped first so the placement is always fresh.
+  const applyTeaLadyProtection = (seats) => {
+    let result = (seats || []).map(s => ({
+      ...s,
+      reminders: (s.reminders || []).filter(r =>
+        !(r && r.charId === 'tealady' && /^protected$/i.test(String(r.label || '')))),
+    }));
+    const teaLadies = result.filter(s => s.actualRoleId === 'tealady' && !s.isDead);
+    const n = result.length;
+    for (const tl of teaLadies) {
+      const idx = result.findIndex(s => s.seatNum === tl.seatNum);
+      if (idx < 0) continue;
+      const findAlive = (step) => {
+        for (let i = 1; i < n; i++) {
+          const cand = result[((idx + step * i) % n + n) % n];
+          if (cand.seatNum === tl.seatNum) return null;
+          if (!cand.isDead && cand.actualRoleId) return cand;
+        }
+        return null;
+      };
+      const left = findAlive(-1);
+      const right = findAlive(+1);
+      if (!left || !right) continue;
+      const leftAlign  = left.alignment  || naturalAlignment(left.actualRoleId);
+      const rightAlign = right.alignment || naturalAlignment(right.actualRoleId);
+      if (leftAlign !== 'good' || rightAlign !== 'good') continue;
+      const protectedSeats = new Set([left.seatNum, right.seatNum]);
+      result = result.map(s =>
+        protectedSeats.has(s.seatNum)
+          ? { ...s, reminders: [...(s.reminders || []), { charId: 'tealady', label: 'Protected', fromPrompt: true }] }
+          : s
+      );
+    }
+    return result;
+  };
+
   const beginGame = () => {
-    update({ grimoire: { ...state.grimoire, gameStarted: true, days: [], viewingDayIndex: 0 } });
+    update(s => {
+      const protectedSeats = applyTeaLadyProtection(s.grimoire.seats || []);
+      return { grimoire: { ...s.grimoire, gameStarted: true, days: [], viewingDayIndex: 0, seats: protectedSeats } };
+    });
   };
   // Snapshot the current state as a finished day and start the next.
   // Top note persists across days; bottom note clears.
@@ -2381,10 +2424,11 @@ function App() {
         ...t,
         reminders: filterReminders(t.reminders),
       }));
+      const seatsWithTL = applyTeaLadyProtection(seatsForNewNight);
       return {
         grimoire: {
           ...g,
-          seats: seatsForNewNight,
+          seats: seatsWithTL,
           travellers: travellersForNewNight,
           nightPrompts: {},
           days: [...(g.days || []), snapshot],
@@ -2421,21 +2465,45 @@ function App() {
     const daProtection = (blockSeat.reminders || []).some(r => r && r.charId === 'devilsadvocate' && /safe from execution/i.test(String(r.label || '')));
     const daSeat = (g.seats || []).find(s => s.actualRoleId === 'devilsadvocate');
     const daAfflicted = daSeat ? isDrunkOrPoisoned(daSeat) : false;
+    // Pacifist check: target on the block is good AND a Pacifist is alive
+    // AND not drunk/poisoned.
+    const blockAlignment = blockSeat.alignment || naturalAlignment(blockSeat.actualRoleId);
+    const targetIsGood = blockAlignment === 'good';
+    const pacifistSeat = (g.seats || []).find(s => s.actualRoleId === 'pacifist' && !s.isDead);
+    const pacifistAfflicted = pacifistSeat ? isDrunkOrPoisoned(pacifistSeat) : false;
+    const pacifistApplies = !!pacifistSeat && !pacifistAfflicted && targetIsGood;
+
     const blockLabel = blockSeat.playerName ? blockSeat.playerName + ' (seat #' + blockSeat.seatNum + ')' : 'Seat #' + blockSeat.seatNum;
-    const body = daProtection
-      ? `${blockLabel} is on the chopping block with ${onBlock.votes} votes — BUT they are protected from execution by the Devil's Advocate${daSeat ? ' (' + (daSeat.playerName || 'seat #' + daSeat.seatNum) + ')' : ''}.${daAfflicted ? ' Note: DA is drunk/poisoned — ability may not apply.' : ''} Execute anyway?`
+    const warnings = [];
+    if (daProtection) {
+      warnings.push(`Devil's Advocate${daSeat ? ' (' + (daSeat.playerName || 'seat #' + daSeat.seatNum) + ')' : ''} protection${daAfflicted ? ' — DA is drunk/poisoned, may not apply' : ''}`);
+    }
+    if (pacifistApplies) {
+      warnings.push(`Pacifist (${pacifistSeat.playerName || 'seat #' + pacifistSeat.seatNum}) is alive & sober and the target is good — Pacifist may save them`);
+    }
+    const body = warnings.length > 0
+      ? `${blockLabel} is on the chopping block with ${onBlock.votes} votes — BUT:\n• ${warnings.join('\n• ')}\n\nExecute anyway?`
       : `${blockLabel} is on the chopping block with ${onBlock.votes} votes. Execute them and advance?`;
+    let title = 'Execute before night?';
+    if (daProtection && pacifistApplies) title = 'Execute (DA + Pacifist concerns)?';
+    else if (daProtection) title = 'Execute (DA-protected)?';
+    else if (pacifistApplies) title = 'Execute (Pacifist concern)?';
+    const executeLabel = warnings.length > 0 ? 'Execute anyway' : 'Execute & advance';
+    const skipLabel = pacifistApplies && !daProtection ? 'Skip — Pacifist saves'
+                    : daProtection && !pacifistApplies ? 'Skip — DA protects'
+                    : warnings.length > 0 ? 'Skip — let them live'
+                    : 'Skip execution';
     addCornerPrompt({
       kind: 'warn',
-      title: daProtection ? 'Execute (DA-protected)?' : 'Execute before night?',
+      title,
       body,
       actions: [
-        { label: daProtection ? 'Execute anyway' : 'Execute & advance', primary: true, onClick: () => {
+        { label: executeLabel, primary: true, onClick: () => {
           _executePlayer(onBlock.nomineeSeat);
           update(s => ({ grimoire: { ...s.grimoire, lastExecution: { seatNum: onBlock.nomineeSeat, dayIdx } } }));
           advanceToNight();
         }},
-        { label: daProtection ? 'Skip — DA protects' : 'Skip execution', onClick: () => advanceToNight() },
+        { label: skipLabel, onClick: () => advanceToNight() },
       ],
     });
   };
@@ -8588,26 +8656,12 @@ function checkDeathProtection(seat, allSeats, causeCharId) {
     const used = (seat.reminders || []).some(r => r && r.charId === 'fool' && /no ability/i.test(String(r.label || '')));
     if (!used) reasons.push("Fool role \u2014 first death is prevented (no \u2018No ability\u2019 reminder yet)");
   }
-  // Conditional: Tea Lady — if both of her alive neighbours are good, neither can die.
-  if (Array.isArray(allSeats) && allSeats.length > 0) {
-    const idx = allSeats.findIndex(s => s.seatNum === seat.seatNum);
-    if (idx >= 0) {
-      const n = allSeats.length;
-      const findAlive = (step) => {
-        for (let i = 1; i < n; i++) {
-          const cand = allSeats[((idx + step * i) % n + n) % n];
-          if (cand.seatNum === seat.seatNum) return null;
-          if (!cand.isDead && cand.actualRoleId) return cand;
-        }
-        return null;
-      };
-      const left = findAlive(-1);
-      const right = findAlive(+1);
-      const isAliveTealady = (s) => s && s.actualRoleId === 'tealady' && !s.isDead;
-      if (isAliveTealady(left) || isAliveTealady(right)) {
-        reasons.push("Tea Lady is an alive neighbour \u2014 if BOTH her alive neighbours are good, neither can die");
-      }
-    }
+  // Tea Lady — definitive check from the 'Tea Lady: Protected' marker
+  // placed by applyTeaLadyProtection at Begin Game / Go-to-Night.
+  const hasTLProtect = (seat.reminders || []).some(r =>
+    r && r.charId === 'tealady' && /^protected$/i.test(String(r.label || '')));
+  if (hasTLProtect) {
+    reasons.push("Tea Lady protection \u2014 both alive neighbours are good, so this player cannot die");
   }
   const afflicted = isDrunkOrPoisoned(seat);
   return { reasons, afflicted };
