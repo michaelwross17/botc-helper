@@ -2492,16 +2492,26 @@ function App() {
     if (pacifistApplies) {
       warnings.push(`Pacifist (${pacifistSeat.playerName || 'seat #' + pacifistSeat.seatNum}) is alive & sober and the target is good — Pacifist may save them`);
     }
+    // Tea Lady protection — the chopping-block player has the 'Tea Lady:
+    // Protected' marker (both alive neighbours are good). Per the rule
+    // "they can't die" this also blocks executions.
+    const teaLadyProtects = (blockSeat.reminders || []).some(r =>
+      r && r.charId === 'tealady' && /^protected$/i.test(String(r.label || '')));
+    if (teaLadyProtects) {
+      warnings.push("Tea Lady protection — both alive neighbours are good, the rule \u201Cthey can't die\u201D applies to executions too");
+    }
     const body = warnings.length > 0
       ? `${blockLabel} is on the chopping block with ${onBlock.votes} votes — BUT:\n• ${warnings.join('\n• ')}\n\nExecute anyway?`
       : `${blockLabel} is on the chopping block with ${onBlock.votes} votes. Execute them and advance?`;
     let title = 'Execute before night?';
-    if (daProtection && pacifistApplies) title = 'Execute (DA + Pacifist concerns)?';
+    if (warnings.length >= 2) title = 'Execute (multiple concerns)?';
     else if (daProtection) title = 'Execute (DA-protected)?';
     else if (pacifistApplies) title = 'Execute (Pacifist concern)?';
+    else if (teaLadyProtects) title = 'Execute (Tea Lady-protected)?';
     const executeLabel = warnings.length > 0 ? 'Execute anyway' : 'Execute & advance';
-    const skipLabel = pacifistApplies && !daProtection ? 'Skip — Pacifist saves'
-                    : daProtection && !pacifistApplies ? 'Skip — DA protects'
+    const skipLabel = teaLadyProtects && warnings.length === 1 ? 'Skip — Tea Lady protects'
+                    : pacifistApplies && warnings.length === 1 ? 'Skip — Pacifist saves'
+                    : daProtection && warnings.length === 1 ? 'Skip — DA protects'
                     : warnings.length > 0 ? 'Skip — let them live'
                     : 'Skip execution';
     addCornerPrompt({
