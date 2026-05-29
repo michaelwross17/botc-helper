@@ -10234,17 +10234,23 @@ function infoSuggestion(roleId, mySeat, seats, ctx) {
     case 'towncrier':     return computeTownCrierSuggestion(ctx);
     case 'undertaker':    return computeUndertakerSuggestion(ctx);
     case 'grandmother':   return computeGrandmotherSuggestion(seats);
-    case 'juggler':       return computeJugglerCorrectCount(mySeat);
+    case 'juggler':       return computeJugglerCorrectCount(seats);
     default:              return null;
   }
 }
 
-// Juggler night step — count 'Correct' reminders placed by the day-time
-// resolveJugglerClaim on the Juggler's own seat. Suggestion = N.
-function computeJugglerCorrectCount(mySeat) {
-  if (!mySeat) return null;
-  const correct = (mySeat.reminders || []).filter(r =>
-    r && r.charId === 'juggler' && /^correct$/i.test(String(r.label || ''))).length;
+// Juggler night step — count 'Correct' reminders across ALL seats. The
+// day-time resolveJugglerClaim places one 'Correct' / 'Wrong' marker on
+// each player the juggler guessed (so they live on the guessed players,
+// not on the juggler's own seat). Suggestion = total Correct count.
+function computeJugglerCorrectCount(seats) {
+  if (!seats) return null;
+  let correct = 0;
+  for (const s of seats) {
+    for (const r of (s.reminders || [])) {
+      if (r && r.charId === 'juggler' && /^correct$/i.test(String(r.label || ''))) correct += 1;
+    }
+  }
   return { value: correct, breakdown: { correctCount: correct } };
 }
 
