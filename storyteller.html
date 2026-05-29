@@ -1455,6 +1455,56 @@ function App() {
   const NO_PLAYER_ACK_ACTIONS = new Set(['target2+st-pick', 'target1+st-pick', 'target1+guess']);
   const respondToNightPrompt = (seatNum, infoPayload) => {
     if (!seatNum) return;
+    // Lunatic Send-to-Demon — push a 'lunatic-actions' info prompt to the
+    // real Demon's seat and mark the Lunatic's prompt as done. Intercepts
+    // before the normal flow.
+    if (infoPayload && infoPayload.type === 'lunatic-send-demon') {
+      update(s => {
+        const g = s.grimoire;
+        const np2 = { ...(g.nightPrompts || {}) };
+        const lunPrompt = np2[seatNum];
+        if (!lunPrompt) return { grimoire: g };
+        const lunSeat = (g.seats || []).find(x => x.seatNum === seatNum);
+        const demonSeat = (g.seats || []).find(x =>
+          (CHAR_BY_ID[x.actualRoleId] || {}).team === 'demon' && !x.isDead);
+        if (demonSeat) {
+          const rawTargets = lunPrompt.targets;
+          const tgts = Array.isArray(rawTargets)
+            ? rawTargets
+            : (rawTargets && typeof rawTargets === 'object'
+                ? Object.keys(rawTargets).sort((a, b) => Number(a) - Number(b)).map(k => rawTargets[k])
+                : []);
+          const picks = tgts
+            .map(tn => (g.seats || []).find(x => x.seatNum === tn))
+            .filter(Boolean)
+            .map(ts => ({ seatNum: ts.seatNum, playerName: ts.playerName || null }));
+          const perceived = CHAR_BY_ID[lunSeat?.perceivedRoleId];
+          const perceivedName = perceived?.name || lunSeat?.perceivedRoleId || 'their role';
+          np2[demonSeat.seatNum] = {
+            roleId: 'lunatic',
+            action: 'info-st',
+            instruction: 'The Lunatic just acted. They believe they are you. Their picks are shown below - wake and take your real action next.',
+            reminderLabel: '',
+            eligible: 'all',
+            status: 'awaiting',
+            targets: null,
+            infoPayload: {
+              type: 'lunatic-actions',
+              lunaticSeat: { seatNum: lunSeat?.seatNum, playerName: lunSeat?.playerName || null },
+              perceivedRoleId: lunSeat?.perceivedRoleId || null,
+              perceivedRoleName: perceivedName,
+              picks,
+            },
+            ceremony: 'lunatic-actions',
+            startedAt: Date.now(),
+            nightIdx: g.viewingDayIndex || 0,
+          };
+        }
+        np2[seatNum] = { ...lunPrompt, status: 'done', doneAt: Date.now() };
+        return { grimoire: { ...g, nightPrompts: np2 } };
+      });
+      return;
+    }
     const np = { ...(state.grimoire.nightPrompts || {}) };
     const p = np[seatNum];
     if (!p) return;
@@ -2309,42 +2359,11 @@ function App() {
               placeOn(info.askSeat, label);
             }
           }
-          // Lunatic acted — push a 'lunatic-actions' info prompt to the
-          // real Demon's seat so the Demon's phone (or the local overlay)
-          // shows the Lunatic icon + their picks. Replaces the prior corner
-          // popup — the ST doesn't need to relay this manually.
-          if (isLunaticActor && (targets.length > 0 || isInfo)) {
-            const perceived = CHAR_BY_ID[seat?.perceivedRoleId];
-            const perceivedName = perceived?.name || seat?.perceivedRoleId || 'their role';
-            const demonSeat = (state.grimoire.seats || []).find(x =>
-              (CHAR_BY_ID[x.actualRoleId] || {}).team === 'demon' && !x.isDead);
-            if (demonSeat) {
-              const targetSeats = targets
-                .map(tn => state.grimoire.seats.find(s => s.seatNum === tn))
-                .filter(Boolean)
-                .map(ts => ({ seatNum: ts.seatNum, playerName: ts.playerName || null }));
-              next[String(demonSeat.seatNum)] = {
-                roleId: 'lunatic',
-                action: 'info-st',
-                instruction: 'The Lunatic just acted. They believe they are you. Their picks are shown below — you can now wake and take your real action.',
-                reminderLabel: '',
-                eligible: 'all',
-                status: 'awaiting',
-                targets: null,
-                infoPayload: {
-                  type: 'lunatic-actions',
-                  lunaticSeat: { seatNum: seat.seatNum, playerName: seat.playerName || null },
-                  perceivedRoleId: seat?.perceivedRoleId || null,
-                  perceivedRoleName: perceivedName,
-                  picks: targetSeats,
-                },
-                ceremony: 'lunatic-actions',
-                startedAt: Date.now(),
-                nightIdx: state.grimoire.viewingDayIndex || 0,
-              };
-              dirty = true;
-            }
-          }
+          // Lunatic acted — DON'T push the demon prompt here. Instead the
+          // status flip below (gated on isLunaticActor) parks the prompt at
+          // 'awaiting-st-response' so STResponseCard renders a Send-to-Demon
+          // button. Pushing the demon prompt happens in respondToNightPrompt
+          // when the ST hits Send.
           // Two-step picker actions (target2+yesno, target2+number,
           // target1+role) only land on 'submitted' AFTER the ST has responded
           // and the player has acked the info — by then isInfo is true so the
@@ -2809,7 +2828,13 @@ function App() {
           });
           next.__seatsCopy = seatsCopy;
         }
-        next[seatStr] = { ...p, status: 'done', doneAt: Date.now() };
+        // Lunatic: park at 'awaiting-st-response' so STResponseCard renders
+        // with a Send-to-Demon button. All other roles flip straight to 'done'.
+        if (isLunaticActor) {
+          next[seatStr] = { ...p, status: 'awaiting-st-response', respondedAt: Date.now() };
+        } else {
+          next[seatStr] = { ...p, status: 'done', doneAt: Date.now() };
+        }
         dirty = true;
         const charName = (CHAR_BY_ID[p.roleId] || {}).name || p.roleId;
         const targetLabels = targets.map(t => {
@@ -10441,6 +10466,11 @@ function STResponseCard({ seatNum, prompt, seats, scriptCharIds = [], onSend }) 
   const isInnkeeperPick = prompt.action === 'target2+st-pick';
   const isSailorPick = prompt.action === 'target1+st-pick';
   const isGambler = prompt.action === 'target1+guess';
+  // Lunatic-as-X: the actor seat is actually the Lunatic; the card shows
+  // their picks and the ST hits 'Send to Demon' to push a lunatic-actions
+  // info prompt to the real Demon's seat (chambermaid-style two-step).
+  const isLunatic = mySeat?.actualRoleId === 'lunatic';
+  const lunaticPerceived = isLunatic ? CHAR_BY_ID[mySeat?.perceivedRoleId] : null;
   // Auto-suggested role for target1+role = the chosen seat's actualRoleId.
   const suggestedRoleId = isRolePick && targetSeats[0] ? targetSeats[0].actualRoleId : null;
   const [pickedRole, setPickedRole] = useState('');
@@ -10544,8 +10574,20 @@ function STResponseCard({ seatNum, prompt, seats, scriptCharIds = [], onSend }) 
         </ul>
       </div>
 
-      {/* Branch on response shape: yes/no buttons for FT, role grid for RK-style, number buttons for Chambermaid, Innkeeper/Gambler get their own forms, Sailor 2-option picker */}
-      {isSailorPick ? (
+      {/* Branch on response shape: yes/no buttons for FT, role grid for RK-style, number buttons for Chambermaid, Innkeeper/Gambler get their own forms, Sailor 2-option picker. Lunatic gets a simple Send-to-Demon button. */}
+      {isLunatic ? (
+        <div className="space-y-3">
+          <div className="rounded-md p-3 border-2 border-purple-700/70 bg-purple-950/40 text-purple-100 text-xs leading-snug">
+            <span className="font-semibold">⚠ Lunatic acted as {lunaticPerceived?.name || mySeat?.perceivedRoleId || 'their perceived role'}.</span>{' '}
+            Reminders with the Lunatic icon have been placed on their chosen players. Hit
+            <span className="font-semibold"> Send to Demon</span> to push a notification of the Lunatic's picks to the real Demon's phone.
+          </div>
+          <button onClick={() => onSend({ type: 'lunatic-send-demon' })}
+            className="w-full py-3 rounded-lg text-base font-bold bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40">
+            Send to Demon →
+          </button>
+        </div>
+      ) : isSailorPick ? (
         <div>
           <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">
             Choose who is drunk until dusk
