@@ -14130,15 +14130,22 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                 // perceived role).
                 const lunDisplay = (s.seat && s.seat.actualRoleId === 'lunatic')
                   ? (CHAR_BY_ID['lunatic'] || s.char) : s.char;
-                const dim = s.action === 'passive'
+                // Juggler only acts on the night following Day 1 (the night
+                // immediately after their daytime guesses). nightNum === 1
+                // is that night in the app's day-index model — any other
+                // value dims the row.
+                const jugglerWrongNight = (s.char && s.char.id === 'juggler' && nightNum !== 1);
+                const dim = jugglerWrongNight
                   ? true
-                  : s.requiresDeath
-                    ? (!s.seat?.isDead || noAbility)
-                    : (s.char && s.char.id === 'zombuul')
-                      ? (zombuulTrulyDead || !!s.zombuulDayDeath)
-                      : (vigorKeepsAbility
-                        ? false
-                        : !!s.seat?.isDead);
+                  : s.action === 'passive'
+                    ? true
+                    : s.requiresDeath
+                      ? (!s.seat?.isDead || noAbility)
+                      : (s.char && s.char.id === 'zombuul')
+                        ? (zombuulTrulyDead || !!s.zombuulDayDeath)
+                        : (vigorKeepsAbility
+                          ? false
+                          : !!s.seat?.isDead);
                 return (
                 <li key={i} className={`card rounded p-2 flex items-start gap-2 ${dim ? 'opacity-50' : ''} ${automation && s.prompt?.status === 'awaiting' ? 'border-amber-500 ring-1 ring-amber-700/40' : ''} ${automation && s.prompt?.status === 'question' ? 'border-red-500 ring-1 ring-red-700/40' : ''}`}>
                   <span className="text-stone-500 text-xs tabular-nums w-6 text-center pt-0.5">{s.stepNum}</span>
