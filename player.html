@@ -1663,11 +1663,20 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
     }
     return true;
   });
-  const [picked, setPicked] = useState([]);
+  const [picked, setPicked] = useState(() => {
+    // Philosopher: auto-pick self so the seat picker can be hidden.
+    if (prompt.action === 'target1+role-claim' && prompt.roleId === 'philosopher') {
+      return [mySeat.seatNum];
+    }
+    return [];
+  });
   // Gambler-only: a role guess in addition to the seat pick.
   const isGuess = prompt.action === 'target1+guess';
   const isRoleClaim = prompt.action === 'target1+role-claim';
   const wantsRolePick = isGuess || isRoleClaim;
+  // Philosopher: pick role only — the seat is the Philosopher's own seat,
+  // auto-selected so the player only sees the role picker.
+  const isRoleOnly = isRoleClaim && prompt.roleId === 'philosopher';
   const [pickedGuess, setPickedGuess] = useState('');
   // If status flipped to 'question' on this device (rare race), bail out.
   const togglePick = (seatNum) => {
@@ -1677,9 +1686,11 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
       return [...prev, seatNum];
     });
   };
-  const canSubmit = wantsRolePick
-    ? (picked.length === 1 && !!pickedGuess)
-    : (isPoFlex ? (picked.length <= 1) : (picked.length === need));
+  const canSubmit = isRoleOnly
+    ? !!pickedGuess
+    : wantsRolePick
+      ? (picked.length === 1 && !!pickedGuess)
+      : (isPoFlex ? (picked.length <= 1) : (picked.length === need));
   const c = CHAR_BY_ID[prompt.roleId];
   const isQuestion = prompt.status === 'question';
 
@@ -1723,6 +1734,7 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
       </section>
 
       <section className="parchment rounded-lg p-3 sm:p-4 space-y-2">
+        {!isRoleOnly && (
         <div className="flex items-baseline justify-between gap-2">
           <h3 className="text-amber-200 font-semibold text-sm">
             {isPoFlex
@@ -1733,6 +1745,8 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
             {picked.length} of {isPoFlex ? '0–1' : need} chosen
           </span>
         </div>
+        )}
+        {!isRoleOnly && (
         <ul className="grid grid-cols-2 gap-1.5">
           {eligibleSeats.map(s => {
             const isMe = s.seatNum === mySeat.seatNum;
@@ -1759,6 +1773,7 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
             );
           })}
         </ul>
+        )}
         {wantsRolePick && (
           <div className="mt-3 pt-3 border-t border-stone-800">
             <div className="flex items-baseline justify-between gap-2 mb-1.5">
@@ -1772,7 +1787,11 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
                 .map(id => CHAR_BY_ID[id])
                 .filter(rc => {
                   if (!rc || rc.team === 'traveller') return false;
-                  if (isRoleClaim) return rc.team === 'townsfolk' || rc.team === 'outsider';
+                  if (isRoleClaim) {
+                    // Per-prompt filter: 'all' allows any non-traveller; otherwise default 'good'.
+                    if (prompt.roleClaimFilter === 'all') return true;
+                    return rc.team === 'townsfolk' || rc.team === 'outsider';
+                  }
                   return true;
                 })
                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
