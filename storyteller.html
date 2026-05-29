@@ -2349,10 +2349,28 @@ function App() {
             const label = info.direction === 'cw' ? 'Saw CW' : 'Saw CCW';
             placeOn(seatNum, label);
           } else if (info.type === 'seat+role-pair') {
-            // Dreamer: place 'Showed' (or configured reminderLabel) on the
-            // asking seat to mark the step as resolved. Picked seat + roles
-            // are visible on the player's phone via the info display.
-            placeOn(seatNum, p.reminderLabel || 'Showed');
+            // Dreamer: place 2 'Shown: <Role>' reminders on the PICKED
+            // player (info.askSeat). The charId='dreamer' so the visual icon
+            // is the Dreamer's. The two roles are stored on the payload.
+            const askSeatNum = info.askSeat;
+            const roles = info.roles || [];
+            if (askSeatNum != null && roles.length > 0) {
+              const baseSeats = next.__seatsCopy || state.grimoire.seats;
+              const seatsCopy = baseSeats.map(seat => {
+                if (seat.seatNum !== askSeatNum) return seat;
+                const newReminders = (seat.reminders || []).slice();
+                for (const rid of roles) {
+                  const rName = (CHAR_BY_ID[rid] || {}).name || rid;
+                  const label = 'Shown: ' + rName;
+                  const already = newReminders.some(r =>
+                    r && r.charId === 'dreamer' && r.label === label && r.fromPrompt);
+                  if (already) continue;
+                  newReminders.push({ charId: 'dreamer', label, fromPrompt: true });
+                }
+                return { ...seat, reminders: newReminders };
+              });
+              next.__seatsCopy = seatsCopy;
+            }
           } else if (info.type === 'seat+role') {
             // Grandmother — the 'Saw: <role>' marker goes on the SHOWN seat
             // (info.askSeat), which may differ from the true Grandchild if
@@ -2527,6 +2545,15 @@ function App() {
               nightIdx: state.grimoire.viewingDayIndex || 0,
             };
             next[seatStr] = { ...next[seatStr], cerenovusPushed: true };
+            // Notify ST so they know to wake the target next.
+            const targetSeat = (next.__seatsCopy || state.grimoire.seats || []).find(x => x.seatNum === targetSeatNum);
+            const targetLabel = targetSeat ? ('seat #' + targetSeat.seatNum + (targetSeat.playerName ? ' · ' + targetSeat.playerName : '')) : ('seat #' + targetSeatNum);
+            setTimeout(() => addCornerPrompt({
+              kind: 'warn',
+              title: 'Cerenovus chose — wake the target',
+              body: 'Cerenovus picked ' + targetLabel + ' and chose ' + madRoleName + ' as the mad-claim character. Wake them now — their phone (or local overlay) will show the mad-claim card.',
+              actions: [{ label: 'OK', primary: true }],
+            }), 0);
           }
         }
         // Po: runs unconditionally on 'submitted' so 0-pick reliably places
@@ -10623,6 +10650,21 @@ function listSetupReminders(seats, doneMap) {
       autoDetected: auto,
     });
   }
+  const etSeat = (seats || []).find(s => s.actualRoleId === 'eviltwin');
+  if (etSeat) {
+    const auto = (seats || []).some(s => (s.reminders || []).some(r =>
+      r && r.charId === 'eviltwin' && /^twin$/i.test(r.label || '')
+    ));
+    const manual = !!doneMap['eviltwin-twin'];
+    items.push({
+      id: 'eviltwin-twin',
+      title: 'Place the Twin marker',
+      description: 'Pick 1 good player as the Evil Twin\'s Twin and place the "Twin" reminder on that seat. The Evil Twin and the Twin learn each other on the first night.',
+      icon: 'eviltwin',
+      done: auto || manual,
+      autoDetected: auto,
+    });
+  }
   const gmSeat = (seats || []).find(s => s.actualRoleId === 'grandmother');
   if (gmSeat) {
     const auto = (seats || []).some(s => (s.reminders || []).some(r =>
@@ -13005,16 +13047,19 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
   };
   // Gambler-only: in addition to picking 1 seat, the player picks 1 role guess.
   const isGuess = step.action === 'target1+guess';
+  // Cerenovus: player picks 1 seat AND 1 good-aligned character (no ST step).
+  const isRoleClaim = step.action === 'target1+role-claim';
+  const wantsRolePick = isGuess || isRoleClaim;
   const [pickedGuess, setPickedGuess] = useState('');
   const canSubmit = isInfo
     ? true
-    : (isGuess
+    : (wantsRolePick
         ? (picked.length === 1 && !!pickedGuess)
         : (isPoFlex ? (picked.length <= 1) : (picked.length === need)));
 
   const doSubmit = () => {
     const v = isInfo ? [] : picked;
-    const extras = isGuess ? { guess: pickedGuess } : undefined;
+    const extras = wantsRolePick ? { guess: pickedGuess } : undefined;
     onSubmit(v, extras);         // writes the prompt; overlay does NOT close here
     setSubmittedValue(isInfo ? 'info' : [...picked]);
     setPhase('confirmed');
@@ -13522,16 +13567,22 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
                 );
               })}
             </ul>
-            {isGuess && (
+            {wantsRolePick && (
               <div className="mt-3 pt-3 border-t border-stone-800">
                 <div className="flex items-baseline justify-between gap-2 mb-1.5">
-                  <h3 className="text-amber-200 font-semibold text-sm">Guess their character</h3>
+                  <h3 className="text-amber-200 font-semibold text-sm">
+                    {isRoleClaim ? 'Pick a good character' : 'Guess their character'}
+                  </h3>
                   <span className="text-xs text-stone-400">{pickedGuess ? '1' : '0'} of 1 chosen</span>
                 </div>
                 <ul className="grid grid-cols-2 gap-1.5 max-h-60 overflow-y-auto">
                   {(scriptCharIds || [])
                     .map(id => CHAR_BY_ID[id])
-                    .filter(rc => rc && rc.team !== 'traveller')
+                    .filter(rc => {
+                      if (!rc || rc.team === 'traveller') return false;
+                      if (isRoleClaim) return rc.team === 'townsfolk' || rc.team === 'outsider';
+                      return true;
+                    })
                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
                     .map(rc => {
                       const isPickedRole = pickedGuess === rc.id;
