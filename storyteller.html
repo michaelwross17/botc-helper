@@ -10441,6 +10441,15 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
     // generic isDead skip is suppressed for Zombuul via the explicit
     // exclusion in the next check.
   }
+  // Juggler only wakes on the night following Day 1 — suppress the Start/Skip
+  // buttons on every other night and surface a short explainer instead.
+  if (step.jugglerWrongNight) {
+    return (
+      <div className="mt-1.5 text-[11px] text-stone-500 italic">
+        Juggler only wakes the night after Day 1 — they learn how many of their guesses were correct. No action tonight.
+      </div>
+    );
+  }
   if (requiresDeath && action !== 'moonchild-resolve' && !(seat.isDead && hasDeadReminder)) {
     return (
       <div className="mt-1.5 text-[11px] text-stone-500 italic">
@@ -13870,6 +13879,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                      moonchildTargetIsGood:  def.__moonchildTargetIsGood,
                      moonchildAfflicted:     def.__moonchildAfflicted,
                      zombuulDayDeath: id === 'zombuul' ? anyDeathToday : false,
+                     jugglerWrongNight: id === 'juggler' && nightNum !== 1,
                      prompt });
       }
     }
