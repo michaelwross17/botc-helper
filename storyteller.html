@@ -2205,7 +2205,10 @@ function App() {
         // Lunatic-as-X detection. The Lunatic seat acts as a perceived demon
         // role (e.g. Pukka). Their picks should be recorded with the Lunatic
         // icon for ST clarity AND should NOT actually affect game state.
-        const isLunaticActor = !!(seat && seat.actualRoleId === 'lunatic');
+        // Exclude ceremony prompts (lunaticinfo, demoninfo, lunatic-actions
+        // etc.) — those are info pushed TO the Lunatic, not the Lunatic
+        // acting as their perceived role.
+        const isLunaticActor = !!(seat && seat.actualRoleId === 'lunatic') && !p.ceremony;
         const charIdForReminder = isLunaticActor ? 'lunatic' : p.roleId;
         let manualNotePlease = null;          // toast suffix if we couldn't auto-place
         if (!isInfo && p.reminderLabel) {
