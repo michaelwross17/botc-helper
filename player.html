@@ -1666,6 +1666,8 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
   const [picked, setPicked] = useState([]);
   // Gambler-only: a role guess in addition to the seat pick.
   const isGuess = prompt.action === 'target1+guess';
+  const isRoleClaim = prompt.action === 'target1+role-claim';
+  const wantsRolePick = isGuess || isRoleClaim;
   const [pickedGuess, setPickedGuess] = useState('');
   // If status flipped to 'question' on this device (rare race), bail out.
   const togglePick = (seatNum) => {
