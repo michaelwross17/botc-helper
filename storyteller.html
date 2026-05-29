@@ -4214,6 +4214,7 @@ function App() {
           onDismissResponsePopup={dismissResponsePopup}
           onPromoteScarletWoman={promoteScarletWoman}
           onStartShowGrimoire={startShowGrimoire}
+          onSendCeremonyInfo={sendCeremonyInfo}
           dayBanners={dayBanners}
           onDismissDayBanner={dismissDayBanner}
           forceReadOnly={isSpectator}
@@ -5483,7 +5484,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
                         nightToasts = [], onDismissNightToast,
                         onStartNightPrompt, onCancelNightPrompt, onMarkStepDone, onClearAllNightPrompts, onOpenMoonchildCapture, onResolveMoonchild, onOpenLocalPrompt,
                         onMarkSetupReminder, onSkipSetupReminders, onRespondToNightPrompt,
-                        dismissedResponses, onDismissResponsePopup, onPromoteScarletWoman, onStartShowGrimoire,
+                        dismissedResponses, onDismissResponsePopup, onPromoteScarletWoman, onStartShowGrimoire, onSendCeremonyInfo,
                         dayBanners = [], onDismissDayBanner,
                         onSeatTap, onCancelSwap, onPickupAssignment, onCancelAssignment,
                         onUndoAssignmentByCharId, onUnassignPending,
@@ -5835,7 +5836,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         nominationsByDay={grim.nominationsByDay || {}}
         onPromoteScarletWoman={onPromoteScarletWoman}
         onStartShowGrimoire={onStartShowGrimoire}
-        onSendCeremony={sendCeremonyInfo}
+        onSendCeremony={onSendCeremonyInfo}
         lastExecution={grim.lastExecution || null}
       />
 
