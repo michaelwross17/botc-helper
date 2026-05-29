@@ -3789,10 +3789,11 @@ function App() {
     if (trySailorProtection(seatNum, causeCharId)) return;
     update(s => {
       const idx = (s.grimoire.days || []).length;
+      const zombuulInPlay = (s.grimoire.seats || []).some(x => x.actualRoleId === 'zombuul');
       let seats = (s.grimoire.seats || []).map(seat => {
         if (seat.seatNum !== seatNum) return seat;
         const additions = [{ charId: causeCharId, label }];
-        if (isDayKill) {
+        if (isDayKill && zombuulInPlay) {
           additions.push({ charId: 'zombuul', label: 'Died today', dayIdx: idx, fromPrompt: true });
         }
         return { ...seat, isDead: true, reminders: [...(seat.reminders || []), ...additions] };
@@ -3847,7 +3848,8 @@ function App() {
           reminders = reminders.filter(r =>
             !(r && r.charId === 'zombuul' && /^executed once$/i.test(String(r.label || ''))));
         }
-        if (zombuulCase !== 'first-evade') {
+        const zombuulInPlayE = liveSeats0.some(x => x.actualRoleId === 'zombuul');
+        if (zombuulCase !== 'first-evade' && zombuulInPlayE) {
           reminders = [...reminders, { charId: 'zombuul', label: 'Died today', dayIdx: idxForDeath, fromPrompt: true }];
         }
         return { ...seat, isDead: true, reminders };
@@ -7808,7 +7810,7 @@ function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onS
   const grim = state.grimoire;
   const [activeAbility, setActiveAbility] = useState(null);
   const [pendingClaimant, setPendingClaimant] = useState(null);
-  const [jugglerModalOpen, setJugglerModalOpen] = useState(false);
+  const [jugglerClaimantSeat, setJugglerClaimantSeat] = useState(null);
   const resetAbility = () => { setActiveAbility(null); setPendingClaimant(null); };
   const handleAbilityTap = (seatNum) => {
     if (!activeAbility) return;
@@ -7819,6 +7821,9 @@ function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onS
       } else if (activeAbility.id === 'artist') {
         onResolveArtistClaim && onResolveArtistClaim({ claimantSeatNum: seatNum, dayIdx });
       }
+      resetAbility();
+    } else if (activeAbility.kind === 'claim-juggler') {
+      setJugglerClaimantSeat(seatNum);
       resetAbility();
     } else if (activeAbility.kind === 'claim-target') {
       if (pendingClaimant == null) setPendingClaimant(seatNum);
@@ -7876,29 +7881,21 @@ function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onS
         <DayAbilitiesBar
           scriptCharIds={state.characterIds || []}
           activeAbility={activeAbility}
-          onSelect={(ab) => {
-            if (ab.kind === 'claim-juggler') {
-              setJugglerModalOpen(true);
-              setActiveAbility(null);
-              setPendingClaimant(null);
-            } else {
-              setActiveAbility(ab);
-              setPendingClaimant(null);
-            }
-          }}
+          onSelect={(ab) => { setActiveAbility(ab); setPendingClaimant(null); }}
           onCancel={resetAbility}
         />
       )}
-      {jugglerModalOpen && (
-        <JugglerDayModal
+      {jugglerClaimantSeat != null && (
+        <JugglerPicksModal
           scriptCharIds={state.characterIds || []}
           seats={(state.grimoire?.seats || [])}
-          onSubmit={({ claimantSeatNum, picks }) => {
+          claimantSeatNum={jugglerClaimantSeat}
+          onSubmit={({ picks }) => {
             const dayIdx = (state.grimoire?.nominationsViewingDayIndex) || 0;
-            onResolveJugglerClaim && onResolveJugglerClaim({ claimantSeatNum, picks, dayIdx });
-            setJugglerModalOpen(false);
+            onResolveJugglerClaim && onResolveJugglerClaim({ claimantSeatNum: jugglerClaimantSeat, picks, dayIdx });
+            setJugglerClaimantSeat(null);
           }}
-          onClose={() => setJugglerModalOpen(false)}
+          onClose={() => setJugglerClaimantSeat(null)}
         />
       )}
 
@@ -11218,16 +11215,16 @@ function DayAbilitiesSection({ scriptCharIds, seats, onResolveClaimAndKill, onRe
   );
 }
 
-function JugglerDayModal({ scriptCharIds, seats, onSubmit, onClose }) {
-  const [claimantSeatNum, setClaimantSeatNum] = useState(null);
+function JugglerPicksModal({ scriptCharIds, seats, claimantSeatNum, onSubmit, onClose }) {
   const [picks, setPicks] = useState(() => Array.from({ length: 5 }, () => ({ seatNum: null, roleId: null })));
+  const claimant = (seats || []).find(s => s && s.seatNum === claimantSeatNum);
   const aliveSeats = (seats || []).filter(s => s && s.actualRoleId);
   const scriptRoles = (scriptCharIds || [])
     .map(id => CHAR_BY_ID[id])
     .filter(Boolean)
     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
   const filledPicks = picks.filter(p => p.seatNum != null && !!p.roleId);
-  const canSubmit = claimantSeatNum != null && filledPicks.length > 0;
+  const canSubmit = filledPicks.length > 0;
   const updatePick = (i, patch) => setPicks(prev => prev.map((p, idx) => idx === i ? { ...p, ...patch } : p));
   return (
     <div className="fixed inset-0 z-50 bg-stone-950/85 flex items-start sm:items-center justify-center p-2 sm:p-4 overflow-y-auto">
@@ -11239,75 +11236,43 @@ function JugglerDayModal({ scriptCharIds, seats, onSubmit, onClose }) {
           )}
           <div className="flex-1 min-w-0">
             <div className="text-xs uppercase tracking-wider text-amber-300">Juggler claim</div>
-            <div className="text-amber-200 text-sm font-bold leading-tight">Up to 5 (player + character) guesses</div>
+            <div className="text-amber-200 text-sm font-bold leading-tight">
+              Claimant: seat #{claimantSeatNum}{claimant?.playerName ? ' · ' + claimant.playerName : ''}
+            </div>
+            <div className="text-[10px] text-stone-400 mt-0.5">Up to 5 (player + character) guesses. Same player/role may be picked multiple times.</div>
           </div>
           <button onClick={onClose} className="text-stone-400 hover:text-stone-200 text-xl leading-none">✕</button>
         </div>
 
-        <div>
-          <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">Claimant</div>
-          <ul className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-32 overflow-y-auto">
-            {aliveSeats.map(s => {
-              const picked = claimantSeatNum === s.seatNum;
-              const rc = CHAR_BY_ID[s.actualRoleId];
-              return (
-                <li key={s.seatNum}>
-                  <button onClick={() => setClaimantSeatNum(s.seatNum)}
-                    className={`w-full card rounded px-2 py-1.5 flex items-center gap-1.5 text-left text-sm
-                      ${picked ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}
-                      ${s.isDead ? 'opacity-60' : ''}`}>
-                    <span className="text-amber-200/80 text-xs w-6 text-center">#{s.seatNum}</span>
-                    {iconUrl(s.actualRoleId) && (
-                      <img src={iconUrl(s.actualRoleId)} alt=""
-                        className="w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0" />
-                    )}
-                    <div className="flex-1 min-w-0 leading-tight">
-                      <div className="truncate">{s.playerName || <span className="text-stone-500 italic">—</span>}</div>
-                      <div className={`text-[9px] uppercase tracking-wider truncate ${rc ? `team-${rc.team}` : 'text-stone-500'}`}>
-                        {rc?.name || '(no role)'}
-                      </div>
-                    </div>
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-
-        <div>
-          <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">
-            5 guesses (player + character). Same player/role may be picked multiple times. Blank rows are skipped.
-          </div>
-          <ul className="space-y-1.5">
-            {picks.map((p, i) => (
-              <li key={i} className="grid grid-cols-[auto,1fr,1fr] gap-1.5 items-center">
-                <span className="text-stone-400 text-xs w-5 text-center">{i + 1}.</span>
-                <select value={p.seatNum ?? ''}
-                  onChange={e => updatePick(i, { seatNum: e.target.value ? Number(e.target.value) : null })}
-                  className="text-xs bg-stone-900 border border-stone-700 rounded px-1.5 py-1.5 truncate">
-                  <option value="">(no player)</option>
-                  {aliveSeats.map(s => (
-                    <option key={s.seatNum} value={s.seatNum}>#{s.seatNum}{s.playerName ? ' · ' + s.playerName : ''}</option>
-                  ))}
-                </select>
-                <select value={p.roleId ?? ''}
-                  onChange={e => updatePick(i, { roleId: e.target.value || null })}
-                  className="text-xs bg-stone-900 border border-stone-700 rounded px-1.5 py-1.5 truncate">
-                  <option value="">(no role)</option>
-                  {scriptRoles.map(r => (
-                    <option key={r.id} value={r.id}>{r.name}</option>
-                  ))}
-                </select>
-              </li>
-            ))}
-          </ul>
-        </div>
+        <ul className="space-y-1.5">
+          {picks.map((p, i) => (
+            <li key={i} className="grid grid-cols-[auto,1fr,1fr] gap-1.5 items-center">
+              <span className="text-stone-400 text-xs w-5 text-center">{i + 1}.</span>
+              <select value={p.seatNum ?? ''}
+                onChange={e => updatePick(i, { seatNum: e.target.value ? Number(e.target.value) : null })}
+                className="text-xs bg-stone-900 border border-stone-700 rounded px-1.5 py-1.5 truncate">
+                <option value="">(no player)</option>
+                {aliveSeats.map(s => (
+                  <option key={s.seatNum} value={s.seatNum}>#{s.seatNum}{s.playerName ? ' · ' + s.playerName : ''}</option>
+                ))}
+              </select>
+              <select value={p.roleId ?? ''}
+                onChange={e => updatePick(i, { roleId: e.target.value || null })}
+                className="text-xs bg-stone-900 border border-stone-700 rounded px-1.5 py-1.5 truncate">
+                <option value="">(no role)</option>
+                {scriptRoles.map(r => (
+                  <option key={r.id} value={r.id}>{r.name}</option>
+                ))}
+              </select>
+            </li>
+          ))}
+        </ul>
 
         <div className="flex items-center gap-2 pt-3 border-t border-stone-800">
           <button onClick={onClose} className="text-xs px-3 py-2 rounded pill hover:border-stone-400 text-stone-400">
             Cancel
           </button>
-          <button onClick={() => onSubmit({ claimantSeatNum, picks: filledPicks })}
+          <button onClick={() => onSubmit({ picks: filledPicks })}
             disabled={!canSubmit}
             className={`flex-1 py-2.5 rounded font-semibold transition text-sm
               ${canSubmit
