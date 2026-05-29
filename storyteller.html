@@ -4034,7 +4034,118 @@ function App() {
       kind: 'warn',
       title: `Mutant publicly claimed Outsider`,
       body: `${claimantLabel} IS the Mutant${afflicted ? ' (but is drunk/poisoned — ST may waive)' : ''}. You may execute them (BotC rule).`,
-      actions: [{ label: 'Got it', primary: true }],
+      actions: [
+        { label: 'Ignore' },
+        { label: 'Execute', primary: true, onClick: () => {
+          _executePlayer(claimantSeatNum);
+          setTimeout(() => addCornerPrompt({
+            kind: 'success',
+            title: 'Mutant executed',
+            body: claimantLabel + ' was executed. The day phase should end now — click "Go to night".',
+            actions: [{ label: 'OK', primary: true }],
+          }), 0);
+        }},
+      ],
+    });
+  };
+
+  // Artist: claim-only day ability (once-per-game).
+  const resolveArtistClaim = ({ claimantSeatNum, dayIdx }) => {
+    const claimant = _seatBy(claimantSeatNum);
+    if (!claimant) return;
+    const claimantLabel = _seatLabel(claimant);
+    const isReal = claimant.actualRoleId === 'artist';
+    const afflicted = isDrunkOrPoisoned(claimant);
+    const alreadyUsed = (claimant.reminders || []).some(r =>
+      r && r.charId === 'artist' && /no ability|used/i.test(String(r.label || '')));
+    const logAudit = (outcome) => appendDayEntry(dayIdx, {
+      kind: 'claim', roleId: 'artist', claimantSeat: claimantSeatNum, targetSeat: null, outcome,
+    });
+    if (!isReal) { logAudit('fake'); return; }
+    if (alreadyUsed) {
+      logAudit('already-used');
+      addCornerPrompt({
+        kind: 'warn',
+        title: 'Artist already used',
+        body: claimantLabel + ' IS the Artist but the ability has already been used this game.',
+        actions: [{ label: 'OK', primary: true }],
+      });
+      return;
+    }
+    logAudit(afflicted ? 'artist-drunk' : 'artist-real');
+    _placeReminderInline(claimantSeatNum, 'artist', 'No ability');
+    addCornerPrompt({
+      kind: afflicted ? 'warn' : 'success',
+      title: afflicted ? 'Artist drunk/poisoned' : 'Artist used ability',
+      body: claimantLabel + ' IS the Artist' + (afflicted ? ' (drunk/poisoned — they may receive false info).' : '. Answer their yes/no question truthfully.'),
+      actions: [{ label: 'OK', primary: true }],
+    });
+  };
+
+  // Juggler: 5 (player + character) guesses on Day 1. Real Juggler + sober →
+  // compare each guess in order, place 'Juggler: Correct' / 'Juggler: Wrong'
+  // markers on the guessed players. Place 'No ability' on the Juggler.
+  const resolveJugglerClaim = ({ claimantSeatNum, picks, dayIdx }) => {
+    const claimant = _seatBy(claimantSeatNum);
+    if (!claimant) return;
+    const claimantLabel = _seatLabel(claimant);
+    const isReal = claimant.actualRoleId === 'juggler';
+    const afflicted = isDrunkOrPoisoned(claimant);
+    const alreadyUsed = (claimant.reminders || []).some(r =>
+      r && r.charId === 'juggler' && /no ability|used/i.test(String(r.label || '')));
+    const logAudit = (outcome, extras = {}) => appendDayEntry(dayIdx, {
+      kind: 'claim', roleId: 'juggler', claimantSeat: claimantSeatNum, targetSeat: null,
+      outcome, jugglerPicks: picks, ...extras,
+    });
+    if (!isReal) { logAudit('fake'); return; }
+    if (alreadyUsed) {
+      logAudit('already-used');
+      addCornerPrompt({
+        kind: 'warn',
+        title: 'Juggler already used',
+        body: claimantLabel + ' IS the Juggler but the ability has already been used this game.',
+        actions: [{ label: 'OK', primary: true }],
+      });
+      return;
+    }
+    if (afflicted) {
+      logAudit('juggler-drunk');
+      _placeReminderInline(claimantSeatNum, 'juggler', 'No ability');
+      addCornerPrompt({
+        kind: 'warn',
+        title: 'Juggler drunk/poisoned',
+        body: claimantLabel + ' IS the Juggler but is drunk/poisoned — no Correct/Wrong markers placed. The night step reads 0 correct.',
+        actions: [{ label: 'OK', primary: true }],
+      });
+      return;
+    }
+    const results = picks.map(p => {
+      const ts = _seatBy(p.seatNum);
+      return ts && ts.actualRoleId === p.roleId ? 'correct' : 'wrong';
+    });
+    update(s => {
+      const seats0 = (s.grimoire.seats || []).map(seat => {
+        if (seat.seatNum !== claimantSeatNum) return seat;
+        return { ...seat, reminders: [...(seat.reminders || []), { charId: 'juggler', label: 'No ability', fromPrompt: true }] };
+      });
+      const withMarkers = seats0.map(seat => {
+        const myPickIdxs = picks.map((p, i) => p.seatNum === seat.seatNum ? i : -1).filter(i => i >= 0);
+        if (myPickIdxs.length === 0) return seat;
+        const newReminders = (seat.reminders || []).slice();
+        for (const idx of myPickIdxs) {
+          newReminders.push({ charId: 'juggler', label: results[idx] === 'correct' ? 'Correct' : 'Wrong', fromPrompt: true });
+        }
+        return { ...seat, reminders: newReminders };
+      });
+      return { grimoire: { ...s.grimoire, seats: withMarkers } };
+    });
+    const correctCount = results.filter(r => r === 'correct').length;
+    logAudit('juggler-real', { jugglerResults: results, correctCount });
+    addCornerPrompt({
+      kind: 'success',
+      title: 'Juggler guesses recorded',
+      body: claimantLabel + ' (Juggler) had ' + correctCount + ' correct out of ' + picks.length + '. Markers placed. The night step will auto-suggest ' + correctCount + '.',
+      actions: [{ label: 'OK', primary: true }],
     });
   };
 
@@ -4321,6 +4432,8 @@ function App() {
           onAdvanceToNight={advanceToNightWithExecution}
           onResolveClaimAndKill={resolveClaimAndKill}
           onResolveMutantClaim={resolveMutantClaim}
+          onResolveArtistClaim={resolveArtistClaim}
+          onResolveJugglerClaim={resolveJugglerClaim}
         />
       )}
 
@@ -7691,16 +7804,21 @@ function DayTabs({ days, viewingDayIndex, onSelect }) {
 // ---------------- Nominations page ----------------
 
 function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onSetViewingDay, onJumpToGrimoire,
-                            onResolveClaimAndKill, onResolveMutantClaim, onAdvanceToNight }) {
+                            onResolveClaimAndKill, onResolveMutantClaim, onResolveArtistClaim, onResolveJugglerClaim, onAdvanceToNight }) {
   const grim = state.grimoire;
   const [activeAbility, setActiveAbility] = useState(null);
   const [pendingClaimant, setPendingClaimant] = useState(null);
+  const [jugglerModalOpen, setJugglerModalOpen] = useState(false);
   const resetAbility = () => { setActiveAbility(null); setPendingClaimant(null); };
   const handleAbilityTap = (seatNum) => {
     if (!activeAbility) return;
     const dayIdx = grim.nominationsViewingDayIndex || 0;
     if (activeAbility.kind === 'claim-only') {
-      onResolveMutantClaim && onResolveMutantClaim({ claimantSeatNum: seatNum, dayIdx });
+      if (activeAbility.id === 'mutant') {
+        onResolveMutantClaim && onResolveMutantClaim({ claimantSeatNum: seatNum, dayIdx });
+      } else if (activeAbility.id === 'artist') {
+        onResolveArtistClaim && onResolveArtistClaim({ claimantSeatNum: seatNum, dayIdx });
+      }
       resetAbility();
     } else if (activeAbility.kind === 'claim-target') {
       if (pendingClaimant == null) setPendingClaimant(seatNum);
@@ -7758,8 +7876,29 @@ function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onS
         <DayAbilitiesBar
           scriptCharIds={state.characterIds || []}
           activeAbility={activeAbility}
-          onSelect={(ab) => { setActiveAbility(ab); setPendingClaimant(null); }}
+          onSelect={(ab) => {
+            if (ab.kind === 'claim-juggler') {
+              setJugglerModalOpen(true);
+              setActiveAbility(null);
+              setPendingClaimant(null);
+            } else {
+              setActiveAbility(ab);
+              setPendingClaimant(null);
+            }
+          }}
           onCancel={resetAbility}
+        />
+      )}
+      {jugglerModalOpen && (
+        <JugglerDayModal
+          scriptCharIds={state.characterIds || []}
+          seats={(state.grimoire?.seats || [])}
+          onSubmit={({ claimantSeatNum, picks }) => {
+            const dayIdx = (state.grimoire?.nominationsViewingDayIndex) || 0;
+            onResolveJugglerClaim && onResolveJugglerClaim({ claimantSeatNum, picks, dayIdx });
+            setJugglerModalOpen(false);
+          }}
+          onClose={() => setJugglerModalOpen(false)}
         />
       )}
 
@@ -9636,6 +9775,8 @@ const NIGHT_ACTIONS = {
                    infoType: 'direction', infoConfig: { display: 'The nearest evil player is:' } },
   preacher:      { action: 'target1',     reminder: 'Saw',         instruction: 'Choose a player. If they are a Minion, you learn their character and they can\'t use their ability tonight.', eligible: 'others' },
   villageidiot:  { action: 'target1any',  reminder: 'Chose',       instruction: 'Each night, choose a player. You learn their alignment. (1 Village Idiot is drunk — ST handles alignment reveal in person for now.)' },
+  juggler:       { action: 'info-st',     reminder: 'Juggler #',   instruction: 'You learn how many of your Day 1 guesses were correct.', phase: 'other',
+                   infoType: 'number',    infoConfig: { min: 0, max: 5, label: 'correct guesses', display: 'You learn there are' } },
   alchemist:     { action: 'manual',      instruction: 'Alchemist has a not-in-play Minion ability (picked at bag-setup). Their night step uses that Minion\'s timing — handle manually.' },
 
   // ===== Experimental — Townsfolk (passive) =====
@@ -9699,6 +9840,9 @@ const PERMANENT_REMINDER_CHARS = new Set([
   'snitch',
   // Mezepheles (mad word — permanent ability loss)
   'mezepheles',
+  // Juggler: 'Correct' / 'Wrong' / 'No ability' markers from Day 1 picks persist
+  // long enough for the Night 2 info-st step to count them.
+  'juggler',
   // Sweetheart: 'Drunk' marker placed on the chosen player when Sweetheart dies — permanent.
   'sweetheart',
   // Banshee: 'Triggered' marker placed when killed by Demon — permanent ability gain.
@@ -10093,8 +10237,18 @@ function infoSuggestion(roleId, mySeat, seats, ctx) {
     case 'towncrier':     return computeTownCrierSuggestion(ctx);
     case 'undertaker':    return computeUndertakerSuggestion(ctx);
     case 'grandmother':   return computeGrandmotherSuggestion(seats);
+    case 'juggler':       return computeJugglerCorrectCount(mySeat);
     default:              return null;
   }
+}
+
+// Juggler night step — count 'Correct' reminders placed by the day-time
+// resolveJugglerClaim on the Juggler's own seat. Suggestion = N.
+function computeJugglerCorrectCount(mySeat) {
+  if (!mySeat) return null;
+  const correct = (mySeat.reminders || []).filter(r =>
+    r && r.charId === 'juggler' && /^correct$/i.test(String(r.label || ''))).length;
+  return { value: correct, breakdown: { correctCount: correct } };
 }
 
 // ---------------- Night Step Action Row (automation) ----------------
@@ -11007,6 +11161,8 @@ const DAY_ABILITY_ROLES = [
   { id: 'slayer',     label: 'Slayer claim',     kind: 'claim-target', icon: 'slayer',     hint: '"I claim Slayer on X."' },
   { id: 'psychopath', label: 'Psychopath claim', kind: 'claim-target', icon: 'psychopath', hint: '"I claim Psychopath, killing X."' },
   { id: 'mutant',     label: 'Mutant claim',     kind: 'claim-only',   icon: 'mutant',     hint: 'Public Outsider claim — checks if they\'re the Mutant.' },
+  { id: 'artist',     label: 'Artist claim',     kind: 'claim-only',   icon: 'artist',     hint: 'Artist asks the ST a yes/no question (once per game).' },
+  { id: 'juggler',    label: 'Juggler claim',    kind: 'claim-juggler', icon: 'juggler',   hint: 'Up to 5 (player + character) public guesses (once per game).' },
 ];
 
 function DayAbilitiesSection({ scriptCharIds, seats, onResolveClaimAndKill, onResolveMutantClaim }) {
@@ -11059,6 +11215,109 @@ function DayAbilitiesSection({ scriptCharIds, seats, onResolveClaimAndKill, onRe
         />
       )}
     </section>
+  );
+}
+
+function JugglerDayModal({ scriptCharIds, seats, onSubmit, onClose }) {
+  const [claimantSeatNum, setClaimantSeatNum] = useState(null);
+  const [picks, setPicks] = useState(() => Array.from({ length: 5 }, () => ({ seatNum: null, roleId: null })));
+  const aliveSeats = (seats || []).filter(s => s && s.actualRoleId);
+  const scriptRoles = (scriptCharIds || [])
+    .map(id => CHAR_BY_ID[id])
+    .filter(Boolean)
+    .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  const filledPicks = picks.filter(p => p.seatNum != null && !!p.roleId);
+  const canSubmit = claimantSeatNum != null && filledPicks.length > 0;
+  const updatePick = (i, patch) => setPicks(prev => prev.map((p, idx) => idx === i ? { ...p, ...patch } : p));
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-950/85 flex items-start sm:items-center justify-center p-2 sm:p-4 overflow-y-auto">
+      <div className="parchment rounded-lg p-4 sm:p-5 max-w-lg w-full my-4 space-y-3 border-2 border-amber-700/60">
+        <div className="flex items-center gap-3">
+          {iconUrl('juggler') && (
+            <img src={iconUrl('juggler')} alt=""
+              className="w-12 h-12 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
+          )}
+          <div className="flex-1 min-w-0">
+            <div className="text-xs uppercase tracking-wider text-amber-300">Juggler claim</div>
+            <div className="text-amber-200 text-sm font-bold leading-tight">Up to 5 (player + character) guesses</div>
+          </div>
+          <button onClick={onClose} className="text-stone-400 hover:text-stone-200 text-xl leading-none">✕</button>
+        </div>
+
+        <div>
+          <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">Claimant</div>
+          <ul className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-32 overflow-y-auto">
+            {aliveSeats.map(s => {
+              const picked = claimantSeatNum === s.seatNum;
+              const rc = CHAR_BY_ID[s.actualRoleId];
+              return (
+                <li key={s.seatNum}>
+                  <button onClick={() => setClaimantSeatNum(s.seatNum)}
+                    className={`w-full card rounded px-2 py-1.5 flex items-center gap-1.5 text-left text-sm
+                      ${picked ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}
+                      ${s.isDead ? 'opacity-60' : ''}`}>
+                    <span className="text-amber-200/80 text-xs w-6 text-center">#{s.seatNum}</span>
+                    {iconUrl(s.actualRoleId) && (
+                      <img src={iconUrl(s.actualRoleId)} alt=""
+                        className="w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                    )}
+                    <div className="flex-1 min-w-0 leading-tight">
+                      <div className="truncate">{s.playerName || <span className="text-stone-500 italic">—</span>}</div>
+                      <div className={`text-[9px] uppercase tracking-wider truncate ${rc ? `team-${rc.team}` : 'text-stone-500'}`}>
+                        {rc?.name || '(no role)'}
+                      </div>
+                    </div>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+
+        <div>
+          <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">
+            5 guesses (player + character). Same player/role may be picked multiple times. Blank rows are skipped.
+          </div>
+          <ul className="space-y-1.5">
+            {picks.map((p, i) => (
+              <li key={i} className="grid grid-cols-[auto,1fr,1fr] gap-1.5 items-center">
+                <span className="text-stone-400 text-xs w-5 text-center">{i + 1}.</span>
+                <select value={p.seatNum ?? ''}
+                  onChange={e => updatePick(i, { seatNum: e.target.value ? Number(e.target.value) : null })}
+                  className="text-xs bg-stone-900 border border-stone-700 rounded px-1.5 py-1.5 truncate">
+                  <option value="">(no player)</option>
+                  {aliveSeats.map(s => (
+                    <option key={s.seatNum} value={s.seatNum}>#{s.seatNum}{s.playerName ? ' · ' + s.playerName : ''}</option>
+                  ))}
+                </select>
+                <select value={p.roleId ?? ''}
+                  onChange={e => updatePick(i, { roleId: e.target.value || null })}
+                  className="text-xs bg-stone-900 border border-stone-700 rounded px-1.5 py-1.5 truncate">
+                  <option value="">(no role)</option>
+                  {scriptRoles.map(r => (
+                    <option key={r.id} value={r.id}>{r.name}</option>
+                  ))}
+                </select>
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        <div className="flex items-center gap-2 pt-3 border-t border-stone-800">
+          <button onClick={onClose} className="text-xs px-3 py-2 rounded pill hover:border-stone-400 text-stone-400">
+            Cancel
+          </button>
+          <button onClick={() => onSubmit({ claimantSeatNum, picks: filledPicks })}
+            disabled={!canSubmit}
+            className={`flex-1 py-2.5 rounded font-semibold transition text-sm
+              ${canSubmit
+                ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40'
+                : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+            Resolve guesses →
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
