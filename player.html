@@ -390,7 +390,7 @@ function App() {
             // 'awaiting-st-response' so the ST can pick the info to return.
             // For info acks (Got it on an info display) the prompt already has
             // an infoPayload — those go straight to 'submitted'.
-            const isTwoStep = (curr.action === 'target2+yesno' || curr.action === 'target1+role' || curr.action === 'target2+number' || curr.action === 'target2+st-pick' || curr.action === 'target1+st-pick' || curr.action === 'target1+guess') && !curr.infoPayload;
+            const isTwoStep = (curr.action === 'target2+yesno' || curr.action === 'target1+role' || curr.action === 'target1+role-pair' || curr.action === 'target1+mad-claim' || curr.action === 'target2+number' || curr.action === 'target2+st-pick' || curr.action === 'target1+st-pick' || curr.action === 'target1+guess') && !curr.infoPayload;
             const newStatus = isTwoStep ? 'awaiting-st-response' : 'submitted';
             // Preserve existing targets when info-acking with an empty array,
             // so the ST effect can still place the per-target reminders.
@@ -1444,6 +1444,26 @@ function NightInfoScreen({ mySeat, seats, prompt, onAck, onQuestion }) {
             </div>
           </div>
         )}
+      </div>
+    );
+  } else if (info.type === 'mad-claim') {
+    const madRole = info.roleId ? CHAR_BY_ID[info.roleId] : null;
+    body = (
+      <div className="space-y-4">
+        <div className="text-center text-sm text-stone-300">
+          You are mad about being:
+        </div>
+        {madRole ? (
+          <div className="flex flex-col items-center gap-2">
+            {iconUrl(madRole.id) && (
+              <img src={iconUrl(madRole.id)} alt="" className="w-28 h-28 rounded-full border-2 border-amber-700 object-cover" />
+            )}
+            <div className={`text-3xl font-bold team-${madRole.team}`}>{madRole.name}</div>
+          </div>
+        ) : <div className="text-stone-400 italic text-center">(no role)</div>}
+        <div className="text-center text-xs text-stone-400 leading-snug">
+          Claim this character tomorrow. If you don't, you may be executed.
+        </div>
       </div>
     );
   } else if (info.type === 'lunatic-actions') {

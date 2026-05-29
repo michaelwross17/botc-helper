@@ -1464,6 +1464,48 @@ function App() {
   const NO_PLAYER_ACK_ACTIONS = new Set(['target2+st-pick', 'target1+st-pick', 'target1+guess']);
   const respondToNightPrompt = (seatNum, infoPayload) => {
     if (!seatNum) return;
+    // Cerenovus Send-to-Target — push a mad-claim info prompt to the player
+    // the Cerenovus picked. Place a 'Mad: <role>' reminder on the target.
+    if (infoPayload && infoPayload.type === 'cerenovus-mad') {
+      update(s => {
+        const g = s.grimoire;
+        const np2 = { ...(g.nightPrompts || {}) };
+        const ceP = np2[seatNum];
+        if (!ceP) return { grimoire: g };
+        const rawTargets = ceP.targets;
+        const tgts = Array.isArray(rawTargets)
+          ? rawTargets
+          : (rawTargets && typeof rawTargets === 'object'
+              ? Object.keys(rawTargets).sort((a, b) => Number(a) - Number(b)).map(k => rawTargets[k])
+              : []);
+        const targetSeatNum = tgts[0];
+        const madRole = CHAR_BY_ID[infoPayload.roleId];
+        const madRoleName = madRole?.name || infoPayload.roleId || '?';
+        let seats = g.seats || [];
+        if (targetSeatNum != null) {
+          seats = seats.map(seat => {
+            if (seat.seatNum !== targetSeatNum) return seat;
+            return { ...seat, reminders: [...(seat.reminders || []), { charId: 'cerenovus', label: 'Mad: ' + madRoleName, fromPrompt: true }] };
+          });
+          np2[targetSeatNum] = {
+            roleId: 'cerenovus',
+            action: 'info-st',
+            instruction: 'You are mad about being the role below. Claim it tomorrow or you may be executed.',
+            reminderLabel: '',
+            eligible: 'all',
+            status: 'awaiting',
+            targets: null,
+            infoPayload: { type: 'mad-claim', roleId: infoPayload.roleId },
+            ceremony: 'cerenovus-mad',
+            startedAt: Date.now(),
+            nightIdx: g.viewingDayIndex || 0,
+          };
+        }
+        np2[seatNum] = { ...ceP, status: 'done', doneAt: Date.now() };
+        return { grimoire: { ...g, seats, nightPrompts: np2 } };
+      });
+      return;
+    }
     // Lunatic Send-to-Demon — push a 'lunatic-actions' info prompt to the
     // real Demon's seat and mark the Lunatic's prompt as done. Intercepts
     // before the normal flow.
@@ -1601,7 +1643,7 @@ function App() {
     // the prompt as 'awaiting-st-response' so the ST sees the response popup.
     // Subsequent submission (info ack with infoPayload set) transitions to
     // 'submitted' so the existing effect places the 'Chose' reminders.
-    const isPickerSubmitForTwoStep = (step.action === 'target2+yesno' || step.action === 'target1+role' || step.action === 'target2+number' || step.action === 'target2+st-pick' || step.action === 'target1+st-pick' || step.action === 'target1+guess') && !infoPayload;
+    const isPickerSubmitForTwoStep = (step.action === 'target2+yesno' || step.action === 'target1+role' || step.action === 'target1+role-pair' || step.action === 'target1+mad-claim' || step.action === 'target2+number' || step.action === 'target2+st-pick' || step.action === 'target1+st-pick' || step.action === 'target1+guess') && !infoPayload;
     // `skipped` is passed by the local overlay when the player chose Skip on a
     // use/skip prompt. Sets status='declined' so the existing effect emits the
     // "saved for later" toast and the No ability marker is NOT placed.
@@ -2348,6 +2390,11 @@ function App() {
             // Shugenja — record the shown direction on the asking seat.
             const label = info.direction === 'cw' ? 'Saw CW' : 'Saw CCW';
             placeOn(seatNum, label);
+          } else if (info.type === 'seat+role-pair') {
+            // Dreamer: place 'Showed' (or configured reminderLabel) on the
+            // asking seat to mark the step as resolved. Picked seat + roles
+            // are visible on the player's phone via the info display.
+            placeOn(seatNum, p.reminderLabel || 'Showed');
           } else if (info.type === 'seat+role') {
             // Grandmother — the 'Saw: <role>' marker goes on the SHOWN seat
             // (info.askSeat), which may differ from the true Grandchild if
@@ -9756,8 +9803,9 @@ const NIGHT_ACTIONS = {
                    eligible: 'others' },
 
   // ===== Sects & Violets =====
-  dreamer:       { action: 'info-st',     reminder: 'Showed',      instruction: 'Choose a player (not yourself). You learn 1 good and 1 evil character — 1 of them is correct.',
-                   infoType: 'seat+role-pair', infoConfig: { eligible: 'others' } },
+  dreamer:       { action: 'target1+role-pair', reminder: 'Showed', instruction: 'Choose a player (not yourself). You will learn 1 good and 1 evil character — 1 of them is correct.',
+                   eligible: 'others',
+                   responseConfig: { title: 'Show Dreamer 2 roles for their chosen player' } },
   flowergirl:    { action: 'info-st',     reminder: 'Saw',         instruction: 'You learn if a Demon voted today.', phase: 'other',
                    infoType: 'yesno',      infoConfig: { yesLabel: 'A Demon voted today.', noLabel: 'No Demon voted today.' } },
   towncrier:     { action: 'info-st',     reminder: 'Saw',         instruction: 'You learn if any Minion nominated today.', phase: 'other',
@@ -9768,7 +9816,7 @@ const NIGHT_ACTIONS = {
   mathematician: { action: 'info-st',     reminder: 'Math #',      instruction: 'You learn how many players\' abilities malfunctioned last day or night.', phase: 'other',
                    infoType: 'number',     infoConfig: { min: 0, max: 10, label: 'malfunctions', display: 'You learn that' } },
   snakecharmer:  { action: 'target1',     reminder: 'Chose',       instruction: 'Choose a player. If they are the Demon, you swap roles and they become poisoned (ST will fire a popup).', eligible: 'others' },
-  cerenovus:     { action: 'target1',     reminder: 'Mad',         instruction: 'Choose a player. They are mad about being a good character (ST chooses which to whisper).' },
+  cerenovus:     { action: 'target1+mad-claim', reminder: 'Mad', instruction: 'Choose a player. They will be woken and told to be mad about a good character (ST chooses which).' },
   fanggu:        { action: 'target1',     reminder: 'Dead',        instruction: 'Choose a player to kill. The first Outsider killed becomes an evil Fang Gu instead (a ST popup will prompt).', eligible: 'others' },
   vigormortis:   { action: 'target1',     reminder: 'Dead',        instruction: 'Choose a player to die. Killed Minions keep their ability and 1 of their Townsfolk neighbours is poisoned (a ST popup will prompt).', eligible: 'others' },
   nodashii:      { action: 'target1',     reminder: 'Dead',        instruction: 'Choose a player to kill. Your 2 Townsfolk neighbours (nearest CW + CCW) are poisoned each night — auto-applied.', eligible: 'others' },
@@ -10189,6 +10237,24 @@ function computeTownCrierSuggestion(ctx) {
 //   - the recorded seat is still dead (ST hasn't manually revived them)
 // Uses actualRoleId — if a Drunk-who-thinks-they're-the-FT is executed, the
 // Undertaker learns "Drunk" (the real character), not "Fortune Teller".
+// Clockmaker — number of steps clockwise from the Demon to the nearest Minion.
+// Counts seats (alive or dead) in seatNum order, wrapping around the circle.
+function computeClockmakerSteps(seats) {
+  if (!seats || seats.length < 2) return null;
+  const sorted = [...seats].sort((a, b) => a.seatNum - b.seatNum);
+  const n = sorted.length;
+  const demonIdx = sorted.findIndex(s => (CHAR_BY_ID[s.actualRoleId] || {}).team === 'demon');
+  if (demonIdx === -1) return null;
+  for (let step = 1; step < n; step++) {
+    const idx = (demonIdx + step) % n;
+    const team = (CHAR_BY_ID[sorted[idx].actualRoleId] || {}).team;
+    if (team === 'minion') {
+      return { value: step, breakdown: { demonSeat: sorted[demonIdx].seatNum, minionSeat: sorted[idx].seatNum } };
+    }
+  }
+  return null;
+}
+
 function computeUndertakerSuggestion(ctx) {
   if (!ctx) return null;
   const lastEx = ctx.lastExecution;
@@ -10263,6 +10329,7 @@ function infoSuggestion(roleId, mySeat, seats, ctx) {
     case 'mathematician': return computeMathematicianCount(seats);
     case 'flowergirl':    return computeFlowerGirlSuggestion(ctx);
     case 'towncrier':     return computeTownCrierSuggestion(ctx);
+    case 'clockmaker':    return computeClockmakerSteps(seats);
     case 'undertaker':    return computeUndertakerSuggestion(ctx);
     case 'grandmother':   return computeGrandmotherSuggestion(seats);
     case 'juggler':       return computeJugglerCorrectCount(seats);
@@ -10678,6 +10745,33 @@ function STResponseCard({ seatNum, prompt, seats, scriptCharIds = [], onSend }) 
   // info prompt to the real Demon's seat (chambermaid-style two-step).
   const isLunatic = mySeat?.actualRoleId === 'lunatic';
   const lunaticPerceived = isLunatic ? CHAR_BY_ID[mySeat?.perceivedRoleId] : null;
+  // Dreamer two-step: player picked seat; ST picks 2 roles (1 true, 1 false).
+  const isRolePair = prompt.action === 'target1+role-pair';
+  // Cerenovus two-step: player picked seat; ST picks the mad-claim role.
+  const isCerenovus = prompt.action === 'target1+mad-claim';
+  const [pickedFalseRole, setPickedFalseRole] = useState('');
+  // True-role suggestion for Dreamer = picked seat's actualRoleId.
+  const dreamerTrueRoleSuggested = isRolePair && targetSeats[0] ? targetSeats[0].actualRoleId : null;
+  const dreamerTrueIsEvil = isRolePair && targetSeats[0]
+    ? ((CHAR_BY_ID[targetSeats[0].actualRoleId] || {}).team === 'minion' || (CHAR_BY_ID[targetSeats[0].actualRoleId] || {}).team === 'demon')
+    : null;
+  const dreamerFalseCandidates = (scriptCharIds || [])
+    .map(id => CHAR_BY_ID[id])
+    .filter(rc => {
+      if (!rc) return false;
+      if (rc.id === pickedRole) return false;
+      if (dreamerTrueIsEvil === true) return rc.team === 'townsfolk' || rc.team === 'outsider';
+      if (dreamerTrueIsEvil === false) return rc.team === 'minion' || rc.team === 'demon';
+      return true;
+    })
+    .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  // Cerenovus role picker = good characters only (Townsfolk / Outsider in script).
+  const cerenovusCandidates = isCerenovus
+    ? (scriptCharIds || [])
+        .map(id => CHAR_BY_ID[id])
+        .filter(rc => rc && (rc.team === 'townsfolk' || rc.team === 'outsider'))
+        .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+    : [];
   // Auto-suggested role for target1+role = the chosen seat's actualRoleId.
   const suggestedRoleId = isRolePick && targetSeats[0] ? targetSeats[0].actualRoleId : null;
   const [pickedRole, setPickedRole] = useState('');
@@ -10781,8 +10875,98 @@ function STResponseCard({ seatNum, prompt, seats, scriptCharIds = [], onSend }) 
         </ul>
       </div>
 
-      {/* Branch on response shape: yes/no buttons for FT, role grid for RK-style, number buttons for Chambermaid, Innkeeper/Gambler get their own forms, Sailor 2-option picker. Lunatic gets a simple Send-to-Demon button. */}
-      {isLunatic ? (
+      {/* Branch on response shape: yes/no buttons for FT, role grid for RK-style, number buttons for Chambermaid, Innkeeper/Gambler get their own forms, Sailor 2-option picker. Lunatic gets a simple Send-to-Demon button. Dreamer/Cerenovus get bespoke forms. */}
+      {isCerenovus ? (
+        <div>
+          <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">
+            Pick the Good character the target is mad about
+          </div>
+          <ul className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-60 overflow-y-auto">
+            {cerenovusCandidates.map(rc => (
+              <li key={rc.id}>
+                <button onClick={() => setPickedRole(rc.id)}
+                  className={`w-full card rounded px-2 py-1.5 flex items-center gap-2 text-left text-sm
+                    ${pickedRole === rc.id ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}`}>
+                  {iconUrl(rc.id) && <img src={iconUrl(rc.id)} alt="" className="w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0" />}
+                  <span className={`flex-1 min-w-0 truncate team-${rc.team}`}>{rc.name}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+          <div className="grid grid-cols-1 gap-2 pt-3">
+            <button onClick={() => onSend({ type: 'cerenovus-mad', roleId: pickedRole })}
+              disabled={!pickedRole}
+              className={`py-3 rounded-lg text-base font-bold transition
+                ${pickedRole
+                  ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40'
+                  : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+              Wake target & send mad-claim →
+            </button>
+          </div>
+        </div>
+      ) : isRolePair ? (
+        <div className="space-y-3">
+          <div>
+            <div className="flex items-baseline justify-between gap-2 mb-1.5">
+              <span className="text-xs uppercase tracking-wider text-amber-300">True role (suggested = chosen seat's actual)</span>
+              {dreamerTrueRoleSuggested && (
+                <button onClick={() => setPickedRole(dreamerTrueRoleSuggested)}
+                  className={`text-[11px] px-2 py-1 rounded transition
+                    ${pickedRole === dreamerTrueRoleSuggested
+                      ? 'bg-emerald-700/60 text-emerald-100 border border-emerald-600'
+                      : 'pill hover:border-emerald-500 hover:text-emerald-200 text-emerald-300'}`}>
+                  {pickedRole === dreamerTrueRoleSuggested ? '✓ Suggested: ' : 'Suggested: '}
+                  <span className="font-bold">{(CHAR_BY_ID[dreamerTrueRoleSuggested] || {}).name || dreamerTrueRoleSuggested}</span>
+                </button>
+              )}
+            </div>
+            <ul className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-40 overflow-y-auto">
+              {(scriptCharIds || []).map(id => CHAR_BY_ID[id]).filter(Boolean)
+                .sort((a, b) => (a.name || '').localeCompare(b.name || '')).map(rc => (
+                <li key={rc.id}>
+                  <button onClick={() => { setPickedRole(rc.id); setPickedFalseRole(''); }}
+                    className={`w-full card rounded px-2 py-1.5 flex items-center gap-2 text-left text-sm
+                      ${pickedRole === rc.id ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}`}>
+                    {iconUrl(rc.id) && <img src={iconUrl(rc.id)} alt="" className="w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0" />}
+                    <span className={`flex-1 min-w-0 truncate team-${rc.team}`}>{rc.name}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+          {pickedRole && (
+            <div>
+              <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">
+                False role (opposite alignment)
+              </div>
+              <ul className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-40 overflow-y-auto">
+                {dreamerFalseCandidates.map(rc => (
+                  <li key={rc.id}>
+                    <button onClick={() => setPickedFalseRole(rc.id)}
+                      className={`w-full card rounded px-2 py-1.5 flex items-center gap-2 text-left text-sm
+                        ${pickedFalseRole === rc.id ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}`}>
+                      {iconUrl(rc.id) && <img src={iconUrl(rc.id)} alt="" className="w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0" />}
+                      <span className={`flex-1 min-w-0 truncate team-${rc.team}`}>{rc.name}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <button onClick={() => {
+              const roles = [pickedRole, pickedFalseRole];
+              if (Math.random() < 0.5) roles.reverse();
+              onSend({ type: 'seat+role-pair', askSeat: targetSeats[0]?.seatNum, roles });
+            }}
+            disabled={!pickedRole || !pickedFalseRole}
+            className={`w-full py-3 rounded-lg text-base font-bold transition
+              ${(pickedRole && pickedFalseRole)
+                ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40'
+                : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+            Send role pair →
+          </button>
+        </div>
+      ) : isLunatic ? (
         <div className="space-y-3">
           <div className="rounded-md p-3 border-2 border-purple-700/70 bg-purple-950/40 text-purple-100 text-xs leading-snug">
             <span className="font-semibold">⚠ Lunatic acted as {lunaticPerceived?.name || mySeat?.perceivedRoleId || 'their perceived role'}.</span>{' '}
@@ -13151,6 +13335,26 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
               </li>
             ))}
           </ul>
+        </div>
+      );
+    } else if (info.type === 'mad-claim') {
+      const madRole = info.roleId ? CHAR_BY_ID[info.roleId] : null;
+      infoBody = (
+        <div className="space-y-4">
+          <div className="text-center text-sm text-stone-300">
+            You are mad about being:
+          </div>
+          {madRole ? (
+            <div className="flex flex-col items-center gap-2">
+              {iconUrl(madRole.id) && (
+                <img src={iconUrl(madRole.id)} alt="" className="w-28 h-28 rounded-full border-2 border-amber-700 object-cover" />
+              )}
+              <div className={`text-3xl font-bold team-${madRole.team}`}>{madRole.name}</div>
+            </div>
+          ) : <div className="text-stone-400 italic text-center">(no role)</div>}
+          <div className="text-center text-xs text-stone-400 leading-snug">
+            Claim this character tomorrow. If you don't, you may be executed.
+          </div>
         </div>
       );
     } else if (info.type === 'lunatic-actions') {
