@@ -369,8 +369,13 @@ function App() {
       // generic target picker for them flashes briefly between the player
       // tapping Got it and the ST effect transitioning the prompt to submitted.
       const myPrompt = (grim.nightPrompts || {})[mySeat.seatNum];
+      // Lunatic-as-X: when the prompt is parked at 'awaiting-st-response' (ST
+      // is reviewing the picks before clicking Send-to-Demon), skip the
+      // 'Choice recorded' screen and fall through to AcceptedScreen — the
+      // Lunatic shouldn't see they're in a waiting state.
+      const isLunaticSeat = mySeat.actualRoleId === 'lunatic';
       if (myPrompt && myPrompt.action !== 'show-grimoire' &&
-          (myPrompt.status === 'use-decision' || myPrompt.status === 'awaiting' || myPrompt.status === 'question' || myPrompt.status === 'awaiting-st-response')) {
+          (myPrompt.status === 'use-decision' || myPrompt.status === 'awaiting' || myPrompt.status === 'question' || (myPrompt.status === 'awaiting-st-response' && !isLunaticSeat))) {
         return <NightPromptScreen
           mySeat={mySeat}
           seats={grim.seats}
