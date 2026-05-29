@@ -2143,22 +2143,28 @@ function App() {
         //              the digit (Chef '1', Empath '2', etc.) — the icon is
         //              still the role's icon so the source is clear.
         const isInfo = !!p.infoPayload;
+        // Lunatic-as-X detection. The Lunatic seat acts as a perceived demon
+        // role (e.g. Pukka). Their picks should be recorded with the Lunatic
+        // icon for ST clarity AND should NOT actually affect game state.
+        const isLunaticActor = !!(seat && seat.actualRoleId === 'lunatic');
+        const charIdForReminder = isLunaticActor ? 'lunatic' : p.roleId;
         let manualNotePlease = null;          // toast suffix if we couldn't auto-place
         if (!isInfo && p.reminderLabel) {
           for (const tnum of targets) {
             const tseat = state.grimoire.seats.find(s => s.seatNum === tnum);
             if (!tseat) continue;
             const already = (tseat.reminders || []).some(r =>
-              r.charId === p.roleId && r.label === p.reminderLabel && r.fromPrompt);
+              r.charId === charIdForReminder && r.label === p.reminderLabel && r.fromPrompt);
             if (already) continue;
             const seatsCopy = (next.__seatsCopy || state.grimoire.seats).map(s =>
               s.seatNum === tnum
-                ? { ...s, reminders: [...(s.reminders || []), { charId: p.roleId, label: p.reminderLabel, fromPrompt: true }] }
+                ? { ...s, reminders: [...(s.reminders || []), { charId: charIdForReminder, label: p.reminderLabel, fromPrompt: true }] }
                 : s
             );
             next.__seatsCopy = seatsCopy;
-            // Queue a death-confirm prompt for auto-placed Dead reminders.
-            if (p.reminderLabel === 'Dead' && !tseat.isDead) {
+            // Queue death-confirm for non-Lunatic actors only (Lunatic picks
+            // are imaginary).
+            if (p.reminderLabel === 'Dead' && !tseat.isDead && !isLunaticActor) {
               newDeathConfirms.push({ seatNum: tnum, causeCharId: p.roleId });
             }
           }
@@ -2168,7 +2174,7 @@ function App() {
           // place an 'Exorcised' reminder on the demon (transient — cleared at
           // Go-to-Night) which dims the demon's wake step tonight and triggers
           // the synthetic 'Show Exorcism' step.
-          if (p.roleId === 'exorcist' && targets.length > 0) {
+          if (p.roleId === 'exorcist' && targets.length > 0 && !isLunaticActor) {
             const newTarget = targets[0];
             const baseSeats = next.__seatsCopy || state.grimoire.seats;
             const tgtSeat = baseSeats.find(s => s.seatNum === newTarget);
@@ -2201,7 +2207,7 @@ function App() {
           // permanent 'No ability' on the actor's own seat so the night row
           // dims on subsequent nights.
           const defForRoleT = NIGHT_ACTIONS[p.roleId];
-          if (defForRoleT && defForRoleT.oncePerGame) {
+          if (defForRoleT && defForRoleT.oncePerGame && !isLunaticActor) {
             const baseSeats = next.__seatsCopy || state.grimoire.seats;
             const ownSeat = baseSeats.find(s => s.seatNum === seatNum);
             const alreadyNoAbility = (ownSeat?.reminders || []).some(r =>
@@ -2217,11 +2223,11 @@ function App() {
           }
         } else if (isInfo && p.reminderLabel) {
           const info = p.infoPayload || {};
-          // Helper: append a reminder to the given seat number.
+          // Helper: append a reminder. Lunatic asker → 'lunatic' charId.
           const placeOn = (targetSeatNum, label) => {
             const seatsCopy = (next.__seatsCopy || state.grimoire.seats).map(s =>
               s.seatNum === targetSeatNum
-                ? { ...s, reminders: [...(s.reminders || []), { charId: p.roleId, label, fromPrompt: true }] }
+                ? { ...s, reminders: [...(s.reminders || []), { charId: charIdForReminder, label, fromPrompt: true }] }
                 : s
             );
             next.__seatsCopy = seatsCopy;
@@ -2302,6 +2308,25 @@ function App() {
               const label = shownRoleName ? `Saw: ${shownRoleName}` : (p.reminderLabel || 'Saw');
               placeOn(info.askSeat, label);
             }
+          }
+          // Lunatic acted — fire a corner popup that summarizes the picks
+          // for the ST and reminds them to wake the real Demon next.
+          if (isLunaticActor && (targets.length > 0 || isInfo)) {
+            const perceived = CHAR_BY_ID[seat?.perceivedRoleId];
+            const perceivedName = perceived?.name || seat?.perceivedRoleId || 'their role';
+            const lunLabel = 'seat #' + seat.seatNum + (seat.playerName ? ' · ' + seat.playerName : '');
+            const targetSeats = targets.map(tn => state.grimoire.seats.find(s => s.seatNum === tn)).filter(Boolean);
+            const picksText = targetSeats.length > 0
+              ? targetSeats.map(ts => '• seat #' + ts.seatNum + (ts.playerName ? ' · ' + ts.playerName : '')).join('\n')
+              : '(no player targets - info action)';
+            setTimeout(() => addCornerPrompt({
+              kind: 'warn',
+              title: 'Lunatic acted - wake the Demon',
+              body: 'The Lunatic (' + lunLabel + ', acting as ' + perceivedName + ') made these picks:\n' +
+                    picksText +
+                    '\n\nNow wake the real Demon for their actual choice.',
+              actions: [{ label: 'OK', primary: true }],
+            }), 0);
           }
           // Two-step picker actions (target2+yesno, target2+number,
           // target1+role) only land on 'submitted' AFTER the ST has responded
@@ -9749,10 +9774,13 @@ function isDrunkOrPoisoned(seat) {
   if (!seat) return false;
   if (seat.actualRoleId === 'drunk' || seat.actualRoleId === 'marionette') return true;
   return (seat.reminders || []).some(r => {
-    const label = String(r?.label || '').toLowerCase();
+    if (!r) return false;
+    // Lunatic-charId reminders are informational only — the Lunatic
+    // thinks they are the demon and may "place" tokens (e.g. 'Poisoned'
+    // when acting as Pukka), but those should NOT affect game state.
+    if (r.charId === 'lunatic') return false;
+    const label = String(r.label || '').toLowerCase();
     if (label.includes('drunk')) return true;
-    // Match 'poison' as a word so 'Poisoned' and 'Poison Dead' both
-    // count, but 'Poisoner' (unlikely as a label) doesn't.
     return /\bpoison(ed)?\b/.test(label);
   });
 }
@@ -13196,7 +13224,15 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                    infoType: def.infoType, infoConfig: def.infoConfig,
                    prompt: null });
     } else {
-      for (const seat of matched) {
+      // Sort matched seats so any Lunatic (perceived as this role) is
+      // emitted BEFORE the real holder of the role — the ST wakes the
+      // Lunatic first, then wakes the real Demon to get the actual pick.
+      const matchedSorted = matched.slice().sort((a, b) => {
+        const aLun = a.actualRoleId === 'lunatic' ? 0 : 1;
+        const bLun = b.actualRoleId === 'lunatic' ? 0 : 1;
+        return aLun - bLun;
+      });
+      for (const seat of matchedSorted) {
         stepNum += 1;
         const prompt = nightPrompts[seat.seatNum];
         steps.push({ type: 'char', stepNum, char: c, seat, reminder, isExtra,
