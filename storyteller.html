@@ -9711,8 +9711,10 @@ const PERMANENT_REMINDER_CHARS = new Set([
   'vigormortis',
   // Fang Gu: 'Swapped' marker tracks that the first-Outsider-kill swap happened.
   'fanggu',
-  // Lunatic: 'Minion 1/2/3...' markers placed on ST-assigned fake-Minion seats.
-  'lunatic',
+  // (Lunatic was previously here for the fake-Minion markers — now
+  // handled by a specific rule in isReminderPermanent so action-related
+  // placements (Pukka's 'Poisoned' etc. when Lunatic-as-Pukka picks) are
+  // transient and clear at Go-to-Night like the real role's placements.)
 ]);
 const PERMANENT_REMINDER_LABELS = new Set(['No ability', 'Used']);
 // Compute today's chopping-block state from a day's nominations + alive count.
@@ -9763,6 +9765,11 @@ function isReminderPermanent(reminder) {
   if (reminder.charId === 'po' && /hungry|3 to kill/i.test(reminder.label || '')) return true;
   // Moonchild 'Triggered' (just died) persists until ST resolves the pick.
   if (reminder.charId === 'moonchild' && /trigger/i.test(reminder.label || '')) return true;
+  // Lunatic: only the ST-assigned 'Minion N' markers from the Lunatic-wakes
+  // picker persist; ANY OTHER lunatic-charId reminder (e.g. 'Poisoned' /
+  // 'Dead' placed when Lunatic-as-Pukka or Lunatic-as-Imp picks) is transient
+  // and gets cleared at Go-to-Night with the rest of the role placements.
+  if (reminder.charId === 'lunatic' && /^minion\s*\d+$/i.test(reminder.label || '')) return true;
   // Zombuul 'Executed once' marker persists for the whole game — it
   // tracks the one-time death-evasion trigger.
   if (reminder.charId === 'zombuul' && /^executed once$/i.test(reminder.label || '')) return true;
