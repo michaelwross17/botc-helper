@@ -13362,7 +13362,12 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
       });
       for (const seat of matchedSorted) {
         stepNum += 1;
-        const prompt = nightPrompts[seat.seatNum];
+        // Ceremony prompts (minioninfo / demoninfo / lunaticinfo /
+        // lunatic-actions / etc.) live on the same seat as role prompts but
+        // are conceptually separate — they shouldn't make the role's night
+        // row show as Done / Awaiting / Question. Skip them here.
+        const rawPrompt = nightPrompts[seat.seatNum];
+        const prompt = (rawPrompt && rawPrompt.ceremony) ? null : rawPrompt;
         steps.push({ type: 'char', stepNum, char: c, seat, reminder, isExtra,
                      action: effectiveAction, instruction: def.instruction, reminderLabel: def.reminder,
                      requiresDeath: def.requiresDeath, oncePerGame: def.oncePerGame, canSkip: def.canSkip,
