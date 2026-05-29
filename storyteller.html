@@ -1299,6 +1299,103 @@ function App() {
   const clearAllNightPrompts = () => {
     update({ grimoire: { ...state.grimoire, nightPrompts: {} } });
   };
+  // sendCeremonyInfo — auto-pushes 'team-reveal' info prompts to the relevant
+  // players for the Minions wake / Demon wakes ceremonies.
+  //   - 'minioninfo': each real Minion sees the other Minions + the Demon.
+  //     If a Magician is in play, the Minions see the Magician AS the demon
+  //     (per the Magician rule: "Minions think you are the Demon").
+  //   - 'demoninfo': the actual Demon sees the Minions + 3 bluffs. If a
+  //     Magician is in play, the Demon also sees the Magician among the
+  //     Minions. If a Lunatic is in play, they receive the same minion
+  //     list + the LUNATIC bluffs (they think they are the Demon).
+  // Drunk/poisoned demons / minions still receive normal info — the ST
+  // can manually override if a malfunction is appropriate.
+  const sendCeremonyInfo = (ceremonyId) => {
+    update(s => {
+      const g = s.grimoire;
+      const np = { ...(g.nightPrompts || {}) };
+      const seats = g.seats || [];
+      const magician = seats.find(x => x.actualRoleId === 'magician' && !x.isDead);
+      const realDemon = seats.find(x => (CHAR_BY_ID[x.actualRoleId] || {}).team === 'demon');
+      const realMinions = seats.filter(x => (CHAR_BY_ID[x.actualRoleId] || {}).team === 'minion');
+      const seatMini = (sx) => ({ seatNum: sx.seatNum, playerName: sx.playerName || null });
+      if (ceremonyId === 'minioninfo') {
+        const demonShown = magician || realDemon;
+        const demonInfo = demonShown ? seatMini(demonShown) : null;
+        const minionList = realMinions.map(seatMini);
+        for (const m of realMinions) {
+          const others = minionList.filter(x => x.seatNum !== m.seatNum);
+          np[m.seatNum] = {
+            roleId: m.actualRoleId,
+            action: 'info-st',
+            instruction: 'Minion info — learn your fellow Minions and the Demon.',
+            reminderLabel: '',
+            eligible: 'all',
+            status: 'awaiting',
+            targets: null,
+            infoPayload: {
+              type: 'team-reveal',
+              viewerRole: 'minion',
+              minions: others,
+              demon: demonInfo,
+            },
+            ceremony: 'minioninfo',
+            startedAt: Date.now(),
+            nightIdx: 0,
+          };
+        }
+      } else if (ceremonyId === 'demoninfo') {
+        const minionList = realMinions.map(seatMini);
+        const minionsForDemon = magician
+          ? [...minionList, seatMini(magician)]
+          : minionList;
+        const bluffs = (g.demonBluffs || []).filter(Boolean);
+        if (realDemon) {
+          np[realDemon.seatNum] = {
+            roleId: realDemon.actualRoleId,
+            action: 'info-st',
+            instruction: 'Demon info — learn your Minions and your bluffs.',
+            reminderLabel: '',
+            eligible: 'all',
+            status: 'awaiting',
+            targets: null,
+            infoPayload: {
+              type: 'team-reveal',
+              viewerRole: 'demon',
+              minions: minionsForDemon,
+              bluffs,
+            },
+            ceremony: 'demoninfo',
+            startedAt: Date.now(),
+            nightIdx: 0,
+          };
+        }
+        const lunatic = seats.find(x => x.actualRoleId === 'lunatic');
+        if (lunatic) {
+          const lunaticBluffs = (g.lunaticBluffs || []).filter(Boolean);
+          np[lunatic.seatNum] = {
+            roleId: 'lunatic',
+            action: 'info-st',
+            instruction: 'Lunatic info — you think you are the Demon. Learn your "Minions" and your Lunatic bluffs.',
+            reminderLabel: '',
+            eligible: 'all',
+            status: 'awaiting',
+            targets: null,
+            infoPayload: {
+              type: 'team-reveal',
+              viewerRole: 'demon',
+              minions: minionsForDemon,
+              bluffs: lunaticBluffs,
+            },
+            ceremony: 'demoninfo-lunatic',
+            startedAt: Date.now(),
+            nightIdx: 0,
+          };
+        }
+      }
+      return { grimoire: { ...g, nightPrompts: np } };
+    });
+  };
   // ST responds to a two-step prompt (Fortune Teller, Innkeeper, Gambler, …).
   // Player has already submitted targets — now ST sets the infoPayload. For
   // actions whose player needs to ack info (FT, RK, Chambermaid) we flip to
@@ -1352,6 +1449,34 @@ function App() {
     setLocalOverlayStep({ step, infoPayload: infoPayload || null });
   };
   const closeLocalPrompt = () => setLocalOverlayStep(null);
+  // Auto-open the local overlay for ceremony prompts targeting a local seat.
+  // Ceremonies (Minions wake / Demon wakes) auto-push prompts to multiple
+  // seats at once; for any local seat the ST needs the overlay to render the
+  // info for that player. The effect picks up awaiting ceremony prompts and
+  // opens them sequentially as the previous one is acked + closed.
+  useEffect(() => {
+    if (!loaded || isSpectator) return;
+    if (localOverlayStep) return;
+    const np = state.grimoire.nightPrompts || {};
+    for (const [seatNumStr, p] of Object.entries(np)) {
+      if (!p || p.status !== 'awaiting') continue;
+      if (!p.ceremony) continue;
+      const seatNum = Number(seatNumStr);
+      const seat = (state.grimoire.seats || []).find(s => s.seatNum === seatNum);
+      if (!seat || !seat.isLocal) continue;
+      const c = CHAR_BY_ID[p.roleId];
+      const def = nightActionFor(p.roleId);
+      const step = {
+        char: c || { id: p.roleId, name: p.roleId },
+        seat,
+        action: p.action,
+        instruction: p.instruction || def.instruction,
+        reminderLabel: p.reminderLabel || def.reminder,
+      };
+      setLocalOverlayStep({ step, infoPayload: p.infoPayload || null });
+      return;
+    }
+  }, [JSON.stringify(state.grimoire.nightPrompts || {}), !!localOverlayStep, loaded, isSpectator]);
   // Submit a local prompt — writes status='submitted' directly (skip 'awaiting'
   // since there's no remote phone to listen). `targets` for picker actions,
   // `infoPayload` echoed back for info actions.
@@ -5710,6 +5835,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         nominationsByDay={grim.nominationsByDay || {}}
         onPromoteScarletWoman={onPromoteScarletWoman}
         onStartShowGrimoire={onStartShowGrimoire}
+        onSendCeremony={sendCeremonyInfo}
         lastExecution={grim.lastExecution || null}
       />
 
@@ -12384,6 +12510,61 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
           ) : <div className="text-stone-400 italic text-center">(no role)</div>}
         </div>
       );
+    } else if (info.type === 'team-reveal') {
+      const viewerIsDemon = info.viewerRole === 'demon';
+      const minions = info.minions || [];
+      const demon = info.demon || null;
+      const bluffs = (info.bluffs || []).map(id => CHAR_BY_ID[id]).filter(Boolean);
+      infoBody = (
+        <div className="space-y-4">
+          <div className={`text-center text-xl font-extrabold ${viewerIsDemon ? 'text-red-300' : 'text-purple-300'}`}>
+            {viewerIsDemon ? 'You are the Demon' : 'You are a Minion'}
+          </div>
+          {minions.length > 0 && (
+            <div>
+              <div className="text-center text-xs text-stone-400 mb-2 uppercase tracking-wider">
+                {viewerIsDemon
+                  ? (minions.length === 1 ? 'Your Minion' : 'Your Minions')
+                  : (minions.length === 1 ? 'Your fellow Minion' : 'Your fellow Minions')}
+              </div>
+              <ul className="grid grid-cols-2 gap-2">
+                {minions.map(m => (
+                  <li key={m.seatNum} className="card rounded p-3 text-center border-purple-700/50 bg-purple-950/30">
+                    <div className="text-amber-200/80 text-xs">seat #{m.seatNum}</div>
+                    <div className="text-base text-amber-100 font-semibold truncate">
+                      {m.playerName || <span className="text-stone-500 italic">—</span>}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {!viewerIsDemon && demon && (
+            <div>
+              <div className="text-center text-xs text-stone-400 mb-2 uppercase tracking-wider">The Demon</div>
+              <div className="card rounded p-3 text-center border-red-700/60 bg-red-950/40 mx-auto max-w-xs">
+                <div className="text-amber-200/80 text-xs">seat #{demon.seatNum}</div>
+                <div className="text-lg text-amber-100 font-bold truncate">
+                  {demon.playerName || <span className="text-stone-500 italic">—</span>}
+                </div>
+              </div>
+            </div>
+          )}
+          {viewerIsDemon && bluffs.length > 0 && (
+            <div>
+              <div className="text-center text-xs text-stone-400 mb-2 uppercase tracking-wider">Your Bluffs (not in play)</div>
+              <ul className="grid grid-cols-3 gap-2">
+                {bluffs.map(b => (
+                  <li key={b.id} className="card rounded p-2 flex flex-col items-center gap-1 text-center">
+                    {iconUrl(b.id) && <img src={iconUrl(b.id)} alt="" className="w-14 h-14 rounded-full border-2 border-amber-700 object-cover" />}
+                    <div className={`text-[11px] font-bold team-${b.team}`}>{b.name}</div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      );
     } else if (info.type === 'seat') {
       const askSeat = seatBy[info.askSeat];
       const top = info.display || 'The Storyteller shows you:';
@@ -12653,6 +12834,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                               scriptCharIds = [], onOpenLocalPrompt,
                               nominationsByDay = {}, onPromoteScarletWoman, onStartShowGrimoire,
                               onOpenMoonchildCapture, onResolveMoonchild,
+                              onSendCeremony,
                               lastExecution = null }) {
   // Auto-expand when automation is on so the ST sees the interactive panel immediately.
   const [collapsed, setCollapsed] = useState(!automation);
@@ -13013,11 +13195,53 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
             <p className="text-sm text-stone-500 italic">No in-play characters wake this night.</p>
           ) : (
             <ol className="space-y-1.5">
-              {steps.map((s, i) => s.type === 'ceremony' ? (
-                <li key={i} className="card rounded px-3 py-1.5 border-stone-700 bg-stone-900/60 text-stone-300 text-xs uppercase tracking-wider text-center">
-                  {s.label}
-                </li>
-              ) : s.type === 'sw-promote' ? (
+              {steps.map((s, i) => s.type === 'ceremony' ? (() => {
+                const clickable = automation && gameStarted && isFirstNight &&
+                  (s.id === 'minioninfo' || s.id === 'demoninfo') && !!onSendCeremony;
+                if (!clickable) {
+                  return (
+                    <li key={i} className="card rounded px-3 py-1.5 border-stone-700 bg-stone-900/60 text-stone-300 text-xs uppercase tracking-wider text-center">
+                      {s.label}
+                    </li>
+                  );
+                }
+                // Targets that should receive the ceremony info.
+                const hasTargets = s.id === 'minioninfo'
+                  ? (seats || []).some(x => (CHAR_BY_ID[x.actualRoleId] || {}).team === 'minion')
+                  : ((seats || []).some(x => (CHAR_BY_ID[x.actualRoleId] || {}).team === 'demon')
+                      || (seats || []).some(x => x.actualRoleId === 'lunatic'));
+                // Progress over prompts created for this ceremony.
+                const ceremonyTags = s.id === 'minioninfo' ? ['minioninfo'] : ['demoninfo', 'demoninfo-lunatic'];
+                const cPrompts = Object.values(nightPrompts || {}).filter(p =>
+                  p && ceremonyTags.includes(p.ceremony));
+                const totalSent = cPrompts.length;
+                const acked = cPrompts.filter(p => p.status === 'submitted' || p.status === 'done').length;
+                return (
+                  <li key={i} className="card rounded px-3 py-2 border-amber-700/60 bg-amber-950/20">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <span className="text-amber-200 text-xs uppercase tracking-wider">{s.label}</span>
+                      <div className="flex items-center gap-2">
+                        {totalSent > 0 && (
+                          <span className="text-[10px] text-stone-400 normal-case tracking-normal">
+                            {acked}/{totalSent} acked
+                          </span>
+                        )}
+                        <button
+                          onClick={() => onSendCeremony(s.id)}
+                          disabled={!hasTargets}
+                          className={`text-[11px] px-3 py-1 rounded font-medium normal-case tracking-normal
+                            ${hasTargets
+                              ? (totalSent > 0
+                                  ? 'pill hover:border-amber-500 hover:text-amber-200 text-amber-300'
+                                  : 'bg-amber-600 hover:bg-amber-500 text-stone-950')
+                              : 'opacity-40 cursor-not-allowed text-stone-500'}`}>
+                          {totalSent > 0 ? 'Resend →' : 'Send →'}
+                        </button>
+                      </div>
+                    </div>
+                  </li>
+                );
+              })() : s.type === 'sw-promote' ? (
                 <li key={i} className="card rounded p-2 flex items-start gap-2 border-red-600/70 bg-red-950/30">
                   <span className="text-stone-500 text-xs tabular-nums w-6 text-center pt-0.5">{s.stepNum}</span>
                   {iconUrl('scarletwoman') && (
