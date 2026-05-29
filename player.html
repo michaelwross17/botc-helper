@@ -1163,8 +1163,13 @@ function KazaliPicksScreen({ mySeat, game, onSubmit }) {
 // Tap "Got it" to acknowledge (parent submits a status='submitted' with no
 // targets so the ST gets a toast). Question still flags the ST.
 function NightInfoScreen({ mySeat, seats, prompt, onAck, onQuestion }) {
-  const c = CHAR_BY_ID[prompt.roleId];
   const info = prompt.infoPayload || {};
+  // For team-reveal info, override the role shown in the header so a Lunatic
+  // player sees the demon role they think they are, not "Lunatic".
+  const _teamRevealRoleId = (info && info.type === 'team-reveal' && info.viewerRoleId)
+    ? info.viewerRoleId : null;
+  const _displayRoleId = _teamRevealRoleId || prompt.roleId;
+  const c = CHAR_BY_ID[_displayRoleId];
   const seatBy = Object.fromEntries((seats || []).map(s => [s.seatNum, s]));
 
   let body;
