@@ -7881,6 +7881,7 @@ function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onS
         <DayAbilitiesBar
           scriptCharIds={state.characterIds || []}
           activeAbility={activeAbility}
+          dayIdx={viewingIdx}
           onSelect={(ab) => { setActiveAbility(ab); setPendingClaimant(null); }}
           onCancel={resetAbility}
         />
@@ -8203,6 +8204,10 @@ function NominationRow({ index, nom, seatById = {}, nominator, nominee, readOnly
       'already-used':   'already used — no effect',
       'mutant-real':    'is the Mutant (ST may execute)',
       'mutant-drunk':   'is the Mutant but drunk/poisoned (ST may waive)',
+      'artist-real':    'is the Artist — ST answers the yes/no question',
+      'artist-drunk':   'is the Artist but drunk/poisoned',
+      'juggler-real':   (nom.correctCount != null && nom.jugglerPicks ? (nom.correctCount + ' / ' + nom.jugglerPicks.length + ' correct') : 'guesses recorded'),
+      'juggler-drunk':  'drunk/poisoned — no Correct markers placed',
     })[nom.outcome] || nom.outcome || '';
     const outcomeColor = /killed/.test(nom.outcome || '') ? 'text-red-300'
       : /fake|no-effect|already|drunk|spared/.test(nom.outcome || '') ? 'text-stone-400'
@@ -8226,6 +8231,32 @@ function NominationRow({ index, nom, seatById = {}, nominator, nominee, readOnly
               </>)}
             </div>
             <div className={`text-[11px] ${outcomeColor} mt-0.5`}>{outcomeText}</div>
+            {nom.roleId === 'juggler' && Array.isArray(nom.jugglerPicks) && nom.jugglerPicks.length > 0 && (
+              <ol className="mt-1.5 space-y-0.5">
+                {nom.jugglerPicks.map((p, idx) => {
+                  const ps = seatById[p.seatNum];
+                  const guessRc = CHAR_BY_ID[p.roleId];
+                  const result = Array.isArray(nom.jugglerResults) ? nom.jugglerResults[idx] : null;
+                  const resultBadge = result === 'correct'
+                    ? <span className="text-emerald-300 text-[10px] font-semibold uppercase tracking-wider">✓ Correct</span>
+                    : result === 'wrong'
+                      ? <span className="text-red-300 text-[10px] font-semibold uppercase tracking-wider">✗ Wrong</span>
+                      : null;
+                  return (
+                    <li key={idx} className="text-[11px] flex items-center gap-1.5 flex-wrap">
+                      <span className="text-stone-500 tabular-nums w-4 text-center">{idx + 1}.</span>
+                      <span className="text-amber-200">{seatLabel(ps)}</span>
+                      <span className="text-stone-500">→</span>
+                      {guessRc && iconUrl(guessRc.id) && (
+                        <img src={iconUrl(guessRc.id)} alt="" className="w-4 h-4 rounded-full border border-stone-700 object-cover" />
+                      )}
+                      <span className={`team-${guessRc?.team || 'townsfolk'}`}>{guessRc?.name || p.roleId}</span>
+                      {resultBadge}
+                    </li>
+                  );
+                })}
+              </ol>
+            )}
           </div>
           {!readOnly && (
             <button onClick={onRemove}
@@ -11113,10 +11144,12 @@ function STCornerPrompts({ prompts, onAction, onDismiss }) {
 // Compact horizontal row of role buttons. Clicking selects an ability — the
 // CircularNominator below switches to ability mode and clicks in the circle
 // resolve as claimant + (optional) target.
-function DayAbilitiesBar({ scriptCharIds, activeAbility, onSelect, onCancel }) {
+function DayAbilitiesBar({ scriptCharIds, activeAbility, onSelect, onCancel, dayIdx = 0 }) {
   const inScript = new Set(scriptCharIds || []);
   const available = DAY_ABILITY_ROLES.filter(r => inScript.has(r.id));
   if (available.length === 0) return null;
+  // Juggler is Day-1-only — dim the button on later days.
+  const isDay1 = dayIdx === 0;
   return (
     <section className={`parchment rounded-lg p-3 sm:p-4 ${activeAbility ? 'border-amber-500/70 ring-1 ring-amber-700/30' : 'border-amber-700/40'}`}>
       <div className="flex items-baseline justify-between gap-2 mb-2 flex-wrap">
@@ -11134,13 +11167,18 @@ function DayAbilitiesBar({ scriptCharIds, activeAbility, onSelect, onCancel }) {
       <ul className="flex flex-wrap gap-1.5">
         {available.map(r => {
           const isActive = activeAbility?.id === r.id;
+          const disabled = r.id === 'juggler' && !isDay1;
           return (
             <li key={r.id}>
-              <button onClick={() => isActive ? onCancel() : onSelect({ id: r.id, kind: r.kind, label: r.label, roleName: (CHAR_BY_ID[r.id] || {}).name || r.id })}
+              <button onClick={() => disabled ? null : (isActive ? onCancel() : onSelect({ id: r.id, kind: r.kind, label: r.label, roleName: (CHAR_BY_ID[r.id] || {}).name || r.id }))}
+                disabled={disabled}
+                title={disabled ? 'Juggler can only claim on Day 1' : undefined}
                 className={`card rounded px-2.5 py-1.5 flex items-center gap-2 text-sm transition
-                  ${isActive ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}`}>
+                  ${disabled
+                    ? 'opacity-40 cursor-not-allowed'
+                    : isActive ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}`}>
                 {iconUrl(r.icon) && (
-                  <img src={iconUrl(r.icon)} alt="" className="w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                  <img src={iconUrl(r.icon)} alt="" className={`w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0 ${disabled ? 'grayscale' : ''}`} />
                 )}
                 <span className="text-amber-200 font-medium leading-tight">{r.label}</span>
               </button>
