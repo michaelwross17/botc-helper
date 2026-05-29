@@ -1291,6 +1291,33 @@ function NightInfoScreen({ mySeat, seats, prompt, onAck, onQuestion }) {
         </ul>
       </div>
     );
+  } else if (info.type === 'role-alignment') {
+    const role = info.roleId ? CHAR_BY_ID[info.roleId] : null;
+    const align = info.alignment || 'good';
+    body = (
+      <div className="text-center space-y-4">
+        <div className="text-sm text-stone-300">Your role</div>
+        {role ? (
+          <div className="flex flex-col items-center gap-2">
+            {iconUrl(role.id) && (
+              <img src={iconUrl(role.id)} alt="" className="w-28 h-28 rounded-full border-2 border-amber-700 object-cover" />
+            )}
+            <div className={`text-3xl font-bold team-${role.team}`}>{role.name}</div>
+            {role.ability && (
+              <div className="text-sm text-stone-200 leading-relaxed max-w-md border-l-2 border-amber-700/50 pl-3 text-left mt-2">
+                {role.ability}
+              </div>
+            )}
+          </div>
+        ) : <div className="text-stone-400 italic">(unknown role)</div>}
+        <div className="pt-3 border-t border-stone-800">
+          <div className="text-sm text-stone-300">Your alignment</div>
+          <div className={`text-2xl font-bold mt-1 ${align === 'evil' ? 'text-red-300' : 'text-emerald-300'}`}>
+            {align.toUpperCase()}
+          </div>
+        </div>
+      </div>
+    );
   } else if (info.type === 'alignment') {
     const align = info.alignment || 'good';
     const top = info.displayLabel || 'Your new alignment is:';
@@ -1733,8 +1760,8 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
         </div>
       </section>
 
+      {!isRoleOnly && (
       <section className="parchment rounded-lg p-3 sm:p-4 space-y-2">
-        {!isRoleOnly && (
         <div className="flex items-baseline justify-between gap-2">
           <h3 className="text-amber-200 font-semibold text-sm">
             {isPoFlex
@@ -1745,8 +1772,6 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
             {picked.length} of {isPoFlex ? '0–1' : need} chosen
           </span>
         </div>
-        )}
-        {!isRoleOnly && (
         <ul className="grid grid-cols-2 gap-1.5">
           {eligibleSeats.map(s => {
             const isMe = s.seatNum === mySeat.seatNum;
@@ -1773,9 +1798,11 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
             );
           })}
         </ul>
-        )}
-        {wantsRolePick && (
-          <div className="mt-3 pt-3 border-t border-stone-800">
+      </section>
+      )}
+      {wantsRolePick && (
+        <section className="parchment rounded-lg p-3 sm:p-4 space-y-2">
+          <div className={isRoleOnly ? '' : 'mt-3 pt-3 border-t border-stone-800'}>
             <div className="flex items-baseline justify-between gap-2 mb-1.5">
               <h3 className="text-amber-200 font-semibold text-sm">
                 {isRoleClaim ? 'Pick a good character' : 'Guess their character'}
@@ -1810,8 +1837,8 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
                 })}
             </ul>
           </div>
+        </section>
         )}
-      </section>
 
       <div className={`grid ${isPoFlex ? 'grid-cols-3' : 'grid-cols-2'} gap-2 pt-1`}>
         {isPoFlex && (

@@ -2664,6 +2664,20 @@ function App() {
             }
           }
         }
+        // Snake Charmer reveal steps: when the role-alignment info prompt
+        // comes back submitted/done, strip the 'Reveal: ...' marker from
+        // the affected seat so the synthetic step retires.
+        if (p.infoPayload && p.infoPayload.type === 'role-alignment' && (p.status === 'submitted' || p.status === 'done')) {
+          const baseSeats = next.__seatsCopy || state.grimoire.seats;
+          const seatsCopy = baseSeats.map(sx => {
+            if (sx.seatNum !== seatNum) return sx;
+            const reminders = (sx.reminders || []).filter(r =>
+              !(r && r.charId === 'snakecharmer' && /^reveal:/i.test(String(r.label || ''))));
+            if (reminders.length === (sx.reminders || []).length) return sx;
+            return { ...sx, reminders };
+          });
+          next.__seatsCopy = seatsCopy;
+        }
         // Snake Charmer: picked a player. If sober & target is the Demon,
         // fire an ST popup offering Ignore / Swap.
         if (p.roleId === 'snakecharmer' && targets.length === 1 && !p.snakecharmerPrompted) {
@@ -2683,56 +2697,37 @@ function App() {
               body: scLabel + ' (Snake Charmer) picked ' + tgtLabel + ', who IS the ' + demonName + '. Swap roles (SC becomes ' + demonName + ', original Demon becomes SC and is poisoned) or Ignore (just place a Chose marker).',
               actions: [
                 { label: 'Swap', primary: true, onClick: () => {
+                  // Swap roles + alignment. Place persistent markers that
+                  // the step builder converts into 2 synthetic 'sc-reveal'
+                  // steps directly under SC's row. The ST starts each one
+                  // to push a clean role+alignment info prompt to the
+                  // affected player. NOTHING auto-sends here.
                   update(s => {
                     const seats = (s.grimoire.seats || []).map(seat => {
                       if (seat.seatNum === scSeat.seatNum) {
-                        // SC becomes the Demon role + evil alignment.
                         return { ...seat,
                           actualRoleId: tgt.actualRoleId,
                           perceivedRoleId: tgt.actualRoleId,
                           alignment: 'evil',
-                          reminders: [...(seat.reminders || []), { charId: 'snakecharmer', label: 'Chose', fromPrompt: true }] };
+                          reminders: [...(seat.reminders || []),
+                            { charId: 'snakecharmer', label: 'Chose', fromPrompt: true },
+                            { charId: 'snakecharmer', label: 'Reveal: new demon', fromPrompt: true }] };
                       }
                       if (seat.seatNum === tgt.seatNum) {
-                        // Demon becomes SC + good alignment + poisoned.
                         return { ...seat,
                           actualRoleId: 'snakecharmer',
                           perceivedRoleId: 'snakecharmer',
                           alignment: 'good',
-                          reminders: [...(seat.reminders || []), { charId: 'snakecharmer', label: 'Snake Charmer: Poisoned', fromPrompt: true }] };
+                          reminders: [...(seat.reminders || []),
+                            // Label is just 'Poisoned' — the reminder UI prefixes
+                            // the charId display name automatically, so this
+                            // renders as "Snake Charmer: Poisoned".
+                            { charId: 'snakecharmer', label: 'Poisoned', fromPrompt: true },
+                            { charId: 'snakecharmer', label: 'Reveal: new sc', fromPrompt: true }] };
                       }
                       return seat;
                     });
-                    const np = { ...(s.grimoire.nightPrompts || {}) };
-                    // Notify NEW demon (was SC) — role + evil alignment.
-                    np[String(scSeat.seatNum)] = {
-                      roleId: 'snakecharmer',
-                      action: 'info-st',
-                      instruction: 'You swapped roles with the Demon. Your new role and alignment are shown below — no minion info or bluffs (game already in progress).',
-                      reminderLabel: '',
-                      eligible: 'all',
-                      status: 'awaiting',
-                      targets: null,
-                      infoPayload: { type: 'role-alignment', roleId: tgt.actualRoleId, alignment: 'evil' },
-                      ceremony: 'snakecharmer-newdemon',
-                      startedAt: Date.now(),
-                      nightIdx: s.grimoire.viewingDayIndex || 0,
-                    };
-                    // Notify NEW SC (was Demon) — role + good alignment + poisoned.
-                    np[String(tgt.seatNum)] = {
-                      roleId: 'snakecharmer',
-                      action: 'info-st',
-                      instruction: 'The Snake Charmer swapped roles with you. You are now the Snake Charmer (good) but poisoned tonight.',
-                      reminderLabel: '',
-                      eligible: 'all',
-                      status: 'awaiting',
-                      targets: null,
-                      infoPayload: { type: 'role-alignment', roleId: 'snakecharmer', alignment: 'good', poisoned: true },
-                      ceremony: 'snakecharmer-newsc',
-                      startedAt: Date.now(),
-                      nightIdx: s.grimoire.viewingDayIndex || 0,
-                    };
-                    return { grimoire: { ...s.grimoire, seats, nightPrompts: np } };
+                    return { grimoire: { ...s.grimoire, seats } };
                   });
                 }},
                 { label: 'Ignore' },
@@ -3561,6 +3556,16 @@ function App() {
         if (n >= 2) return null;     // remove at the next Go-to-Night
         return { ...r, label: `Drunk ${n + 1}` };
       }).filter(Boolean);
+      // Barber 'Haircuts tonight' markers: keep only those tagged with the
+      // day being snapshotted now (dayIdx === idx). Once the Go-to-Night that
+      // matches their day passes, the next Go-to-Night sweeps them — the
+      // Demon already had this night to do the swap.
+      const stripStaleHaircuts = (rs) => (rs || []).filter(r => {
+        if (r && r.charId === 'barber' && /haircuts tonight/i.test(String(r.label || ''))) {
+          return r.dayIdx === idx;
+        }
+        return true;
+      });
       // Zombuul 'Died today' markers: keep only those tagged with the
       // day being snapshotted now (dayIdx === idx). Older markers are
       // stale (from previous active periods) and get stripped.
@@ -4979,8 +4984,11 @@ function App() {
       {evilTwinModalData != null && (
         <EvilTwinStartModal
           etSeat={(state.grimoire.seats || []).find(s => s.seatNum === evilTwinModalData.etSeatNum)}
-          twinSeat={(state.grimoire.seats || []).find(s => s.seatNum === evilTwinModalData.twinSeatNum)}
-          onAccept={() => acceptEvilTwinPair(evilTwinModalData)}
+          twinSeat={evilTwinModalData.twinSeatNum != null
+            ? (state.grimoire.seats || []).find(s => s.seatNum === evilTwinModalData.twinSeatNum)
+            : null}
+          seats={state.grimoire.seats || []}
+          onAccept={(pickedTwinNum) => acceptEvilTwinPair({ etSeatNum: evilTwinModalData.etSeatNum, twinSeatNum: pickedTwinNum })}
           onCancel={cancelEvilTwinModal}
         />
       )}
@@ -10187,6 +10195,7 @@ const NIGHT_ACTIONS = {
   snakecharmer:  { action: 'target1',     reminder: 'Chose',       instruction: 'Choose a player. If they are the Demon, you swap roles and they become poisoned (ST will fire a popup).', eligible: 'others' },
   cerenovus:     { action: 'target1+role-claim', reminder: 'Mad', instruction: 'Choose a player and a good character (Townsfolk or Outsider). They wake and are told to be mad about that character.', eligible: 'others',
                    roleClaimFilter: 'good' },
+  eviltwin:      { action: 'manual',          reminder: 'Twin',  instruction: 'On the first night, Evil Twin and their twin wake and learn each other. Place the "Twin" reminder on a good player at setup.', phase: 'first' },
   fanggu:        { action: 'target1',     reminder: 'Dead',        instruction: 'Choose a player to kill. The first Outsider killed becomes an evil Fang Gu instead (a ST popup will prompt).', eligible: 'others' },
   vigormortis:   { action: 'target1',     reminder: 'Dead',        instruction: 'Choose a player to die. Killed Minions keep their ability and 1 of their Townsfolk neighbours is poisoned (a ST popup will prompt).', eligible: 'others' },
   nodashii:      { action: 'target1',     reminder: 'Dead',        instruction: 'Choose a player to kill. Your 2 Townsfolk neighbours (nearest CW + CCW) are poisoned each night — auto-applied.', eligible: 'others' },
@@ -10292,6 +10301,9 @@ const PERMANENT_REMINDER_CHARS = new Set([
   'juggler',
   // Sweetheart: 'Drunk' marker placed on the chosen player when Sweetheart dies — permanent.
   'sweetheart',
+  // Snake Charmer: 'Poisoned' marker on the swapped player and 'Reveal: ...'
+  // markers driving the synthetic post-swap reveal steps.
+  'snakecharmer',
   // Banshee: 'Triggered' marker placed when killed by Demon — permanent ability gain.
   'banshee',
   // Pit-Hag: 'Was X' marker tracks the previous role for converted players.
@@ -10743,7 +10755,7 @@ function computeJugglerCorrectCount(seats) {
 // reminder / fire toast) is not yet implemented. The Start button currently
 // shows a placeholder confirming what *would* happen. Phase B replaces this
 // placeholder with the real flow.
-function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onMarkDone: onMarkDoneProp, onOpenInfoPicker, onOpenLocalPrompt, onStartShowGrimoire, onOpenMoonchildCapture, onResolveMoonchild, gameStarted = false }) {
+function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onMarkDone: onMarkDoneProp, onOpenInfoPicker, onOpenLocalPrompt, onStartShowGrimoire, onOpenMoonchildCapture, onResolveMoonchild, onOpenEvilTwinModal, gameStarted = false }) {
   const { action, seat, instruction, reminderLabel, prompt, requiresDeath, oncePerGame,
           moonchildTargetSeatNum, moonchildTargetIsGood, moonchildAfflicted } = step;
   if (readOnly) return null;
@@ -10960,7 +10972,42 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
         {statusBadge && <span className="ml-2">{statusBadge}</span>}
       </div>
       <div className="flex items-center gap-2 flex-wrap">
-        {action === 'manual' ? (
+        {action === 'sc-reveal' ? (
+          (() => {
+            const isDone = prompt?.status === 'done' || prompt?.status === 'submitted';
+            return isDone ? (
+              <span className="text-xs text-emerald-300 font-medium">✓ Sent</span>
+            ) : (
+              <button onClick={() => onStartPrompt && onStartPrompt(seat.seatNum, step, {
+                type: 'role-alignment',
+                roleId: step.scReveal && step.scReveal.roleId,
+                alignment: step.scReveal && step.scReveal.alignment,
+              })}
+                className="text-xs px-3 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
+                ▶ Start
+              </button>
+            );
+          })()
+        ) : action === 'manual' && step.char && step.char.id === 'eviltwin' ? (
+          (() => {
+            const twinNum = step.eviltwinTwinSeatNum;
+            const etPrompt = prompt;
+            const haveBoth = etPrompt?.evilTwinBothSubmitted;
+            if (haveBoth) {
+              return (
+                <span className="text-xs text-emerald-300 font-medium">
+                  ✓ Both Evil Twins acknowledged.
+                </span>
+              );
+            }
+            return (
+              <button onClick={() => onOpenEvilTwinModal && onOpenEvilTwinModal(seat.seatNum, twinNum)}
+                className="text-xs px-3 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
+                ▶ Start
+              </button>
+            );
+          })()
+        ) : action === 'manual' ? (
           <button onClick={onMarkDone}
             className={`text-xs px-3 py-1 rounded pill hover:border-amber-500 hover:text-amber-200 ${prompt?.status === 'done' ? 'opacity-50' : ''}`}>
             {prompt?.status === 'done' ? '✓ Done' : 'Mark done'}
@@ -12276,10 +12323,14 @@ function MoonchildPickModal({ mcSeat, seats, onApply, onCancel }) {
   );
 }
 
-function EvilTwinStartModal({ etSeat, twinSeat, onAccept, onCancel }) {
-  if (!etSeat || !twinSeat) return null;
+function EvilTwinStartModal({ etSeat, twinSeat, seats, onAccept, onCancel }) {
+  const [pickedTwinSeat, setPickedTwinSeat] = useState(twinSeat ? twinSeat.seatNum : null);
+  if (!etSeat) return null;
+  const effectiveTwin = twinSeat || (seats || []).find(s => s.seatNum === pickedTwinSeat);
   const etRole = CHAR_BY_ID[etSeat.actualRoleId];
-  const twinRole = CHAR_BY_ID[twinSeat.actualRoleId];
+  const twinRole = effectiveTwin ? CHAR_BY_ID[effectiveTwin.actualRoleId] : null;
+  const needsPicker = !twinSeat;
+  const eligibleTwins = (seats || []).filter(s => s && s.seatNum !== etSeat.seatNum && s.actualRoleId);
   return (
     <div className="fixed inset-0 z-50 bg-stone-950/85 flex items-start sm:items-center justify-center p-2 sm:p-4 overflow-y-auto">
       <div className="parchment rounded-lg p-4 sm:p-5 max-w-lg w-full space-y-3 my-4 border-2 border-red-700/70">
@@ -12307,19 +12358,48 @@ function EvilTwinStartModal({ etSeat, twinSeat, onAccept, onCancel }) {
               <div className="text-[10px] team-minion truncate">{etRole?.name || '(no role)'}</div>
             </div>
           </li>
+          {effectiveTwin ? (
           <li className="card rounded p-2 flex items-start gap-2 border-emerald-700/40">
-            <span className="text-stone-500 text-xs w-6 text-center pt-0.5">#{twinSeat.seatNum}</span>
-            {iconUrl(twinSeat.actualRoleId) && (
-              <img src={iconUrl(twinSeat.actualRoleId)} alt=""
+            <span className="text-stone-500 text-xs w-6 text-center pt-0.5">#{effectiveTwin.seatNum}</span>
+            {iconUrl(effectiveTwin.actualRoleId) && (
+              <img src={iconUrl(effectiveTwin.actualRoleId)} alt=""
                 className="w-9 h-9 rounded-full border border-stone-700 object-cover flex-shrink-0" />
             )}
             <div className="flex-1 min-w-0 leading-tight">
               <div className="text-[10px] uppercase tracking-wider text-emerald-300/80">Good Twin</div>
-              <div className="text-sm truncate">{twinSeat.playerName || <span className="text-stone-500 italic">—</span>}</div>
+              <div className="text-sm truncate">{effectiveTwin.playerName || <span className="text-stone-500 italic">—</span>}</div>
               <div className="text-[10px] team-townsfolk truncate">{twinRole?.name || '(no role)'}</div>
             </div>
           </li>
+          ) : (
+          <li className="card rounded p-2 border-amber-700/40 bg-amber-950/20">
+            <div className="text-[10px] uppercase tracking-wider text-amber-300/80 mb-1">Good Twin · pick a seat</div>
+            <div className="text-[11px] text-stone-400">No "Twin" reminder placed yet — choose the good player below.</div>
+          </li>
+          )}
         </ul>
+        {needsPicker && (
+          <div>
+            <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">Pick the Twin</div>
+            <ul className="grid grid-cols-2 gap-1.5 max-h-48 overflow-y-auto">
+              {eligibleTwins.map(s => {
+                const isP = pickedTwinSeat === s.seatNum;
+                const rc = CHAR_BY_ID[s.actualRoleId];
+                return (
+                  <li key={s.seatNum}>
+                    <button onClick={() => setPickedTwinSeat(s.seatNum)}
+                      className={`w-full card rounded px-2 py-1.5 flex items-center gap-2 text-left text-sm
+                        ${isP ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}`}>
+                      <span className="text-amber-200/80 text-xs w-6 text-center">#{s.seatNum}</span>
+                      <span className="flex-1 min-w-0 truncate">{s.playerName || <span className="text-stone-500 italic">—</span>}</span>
+                      {rc && <span className={`text-[10px] team-${rc.team}`}>{rc.name}</span>}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
         <div className="text-[11px] text-stone-300 leading-snug border-l-2 border-amber-700/50 pl-2">
           On Accept, both seats receive an info card showing the other's seat + role icon. Each must hit Accept to clear the row.
         </div>
@@ -12328,8 +12408,9 @@ function EvilTwinStartModal({ etSeat, twinSeat, onAccept, onCancel }) {
             className="py-2.5 rounded-lg text-sm font-semibold bg-stone-800 hover:bg-stone-700 text-stone-300 border border-stone-700">
             Cancel
           </button>
-          <button onClick={onAccept}
-            className="py-2.5 rounded-lg text-sm font-bold bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40">
+          <button onClick={() => onAccept(effectiveTwin ? effectiveTwin.seatNum : null)}
+            disabled={!effectiveTwin}
+            className={`py-2.5 rounded-lg text-sm font-bold ${effectiveTwin ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40' : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
             Accept — send pair info →
           </button>
         </div>
@@ -14196,7 +14277,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                               onStartPrompt, onCancelPrompt, onMarkDone, onClearAllPrompts,
                               scriptCharIds = [], onOpenLocalPrompt,
                               nominationsByDay = {}, onPromoteScarletWoman, onStartShowGrimoire,
-                              onOpenMoonchildCapture, onResolveMoonchild,
+                              onOpenMoonchildCapture, onResolveMoonchild, onOpenEvilTwinModal,
                               onSendCeremony,
                               lastExecution = null }) {
   // Auto-expand when automation is on so the ST sees the interactive panel immediately.
@@ -14333,6 +14414,49 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
         effectiveAction = 'target3';
       }
     }
+    // Snake Charmer post-swap synthetic steps. If any seat carries a
+    // 'Reveal: new demon' / 'Reveal: new sc' marker (placed by Swap),
+    // emit a synthetic manual step directly under SC's row so the ST
+    // can push a clean role+alignment info on Start.
+    if (id === 'snakecharmer') {
+      const revealMarkers = [];
+      for (const sx of (seats || [])) {
+        for (const r of (sx.reminders || [])) {
+          if (!r || r.charId !== 'snakecharmer') continue;
+          if (/^reveal: new demon$/i.test(String(r.label || ''))) {
+            revealMarkers.push({ kind: 'newdemon', seatNum: sx.seatNum, roleId: sx.actualRoleId, alignment: sx.alignment || 'evil' });
+          } else if (/^reveal: new sc$/i.test(String(r.label || ''))) {
+            revealMarkers.push({ kind: 'newsc', seatNum: sx.seatNum, roleId: sx.actualRoleId, alignment: sx.alignment || 'good' });
+          }
+        }
+      }
+      const scActorChar = CHAR_BY_ID['snakecharmer'] || { id: 'snakecharmer', name: 'Snake Charmer', team: 'townsfolk' };
+      for (const rev of revealMarkers) {
+        stepNum += 1;
+        const revealSeat = (seats || []).find(x => x.seatNum === rev.seatNum);
+        const promptForReveal = nightPrompts[rev.seatNum];
+        steps.push({
+          type: 'char',
+          stepNum,
+          char: scActorChar,
+          seat: revealSeat,
+          reminder: rev.kind === 'newdemon' ? 'Reveal new role + alignment' : 'Reveal new role + alignment',
+          isExtra: false,
+          action: 'sc-reveal',
+          instruction: rev.kind === 'newdemon'
+            ? 'Wake this player and show them their new role and alignment.'
+            : 'Wake this player and show them their new role and alignment.',
+          reminderLabel: '',
+          requiresDeath: false,
+          oncePerGame: false,
+          canSkip: false,
+          infoType: 'role-alignment',
+          infoConfig: { roleId: rev.roleId, alignment: rev.alignment },
+          scReveal: { kind: rev.kind, seatNum: rev.seatNum, roleId: rev.roleId, alignment: rev.alignment },
+          prompt: promptForReveal && !promptForReveal.ceremony ? promptForReveal : null,
+        });
+      }
+    }
     // Moonchild natural-slot: scan for a 'Moonchild: Dead' marker on any
     // seat (placed at capture). If present → action='moonchild-resolve'
     // (rendered inline with Execute/Skip buttons in NightStepActionRow).
@@ -14421,6 +14545,10 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                      jugglerWrongNight: id === 'juggler' && nightNum !== 1,
                      barberHasHaircut: id === 'barber' && (seat.reminders || []).some(r =>
                        r && r.charId === 'barber' && /haircuts tonight/i.test(String(r.label || ''))),
+                     eviltwinTwinSeatNum: id === 'eviltwin'
+                       ? (((seats || []).find(x => (x.reminders || []).some(r =>
+                           r && r.charId === 'eviltwin' && /^twin$/i.test(String(r.label || '')))) || {}).seatNum || null)
+                       : null,
                      prompt });
       }
     }
@@ -14735,6 +14863,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                         onOpenLocalPrompt={onOpenLocalPrompt}
                         onStartShowGrimoire={onStartShowGrimoire}
                         onOpenMoonchildCapture={onOpenMoonchildCapture}
+                        onOpenEvilTwinModal={onOpenEvilTwinModal}
                         onResolveMoonchild={onResolveMoonchild}
                         gameStarted={gameStarted}
                       />
