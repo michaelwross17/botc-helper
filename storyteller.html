@@ -1354,7 +1354,7 @@ function App() {
           np[realDemon.seatNum] = {
             roleId: realDemon.actualRoleId,
             action: 'info-st',
-            instruction: 'Demon info — learn your Minions and your bluffs.',
+            instruction: 'You wake. Learn your Minions and 3 bluff roles that are not in play.',
             reminderLabel: '',
             eligible: 'all',
             status: 'awaiting',
@@ -1425,7 +1425,7 @@ function App() {
       np[lunaticSeatNum] = {
         roleId: 'lunatic',
         action: 'info-st',
-        instruction: 'Lunatic info — you think you are the Demon. Learn your "Minions" and your Lunatic bluffs.',
+        instruction: 'You wake. Learn the people you think are your Minions, and 3 bluff roles you may be told are in play.',
         reminderLabel: '',
         eligible: 'all',
         status: 'awaiting',
@@ -12434,7 +12434,12 @@ function LocalGrimoireOverlay({ seat, grimoire, phase, onAck, onReturn, onCancel
 //                            NightPromptScreen) with Submit/Cancel
 // No Question button — for local players the ST IS the storyteller.
 function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, scriptCharIds = [] }) {
-  const c = CHAR_BY_ID[step.char.id];
+  // For team-reveal info, use the viewerRoleId to populate the header so a
+  // Lunatic player sees the demon role they were dealt rather than "Lunatic".
+  const _teamRevealRoleId = (infoPayload && infoPayload.type === 'team-reveal' && infoPayload.viewerRoleId)
+    ? infoPayload.viewerRoleId : null;
+  const c = CHAR_BY_ID[_teamRevealRoleId || step.char.id];
+  const _displayCharId = _teamRevealRoleId || step.char.id;
   const mySeat = step.seat;
   const isInfo = !!infoPayload;
   const isTwo = step.action === 'target2' || step.action === 'target2+yesno' || step.action === 'target2+number' || step.action === 'target2+st-pick';
@@ -12864,13 +12869,13 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
 
         <section className="parchment rounded-lg p-4 sm:p-5 space-y-3 border-2 border-amber-600/70">
           <div className="flex items-center gap-3">
-            {iconUrl(step.char.id) && (
-              <img src={iconUrl(step.char.id)} alt=""
+            {iconUrl(_displayCharId) && (
+              <img src={iconUrl(_displayCharId)} alt=""
                 className="w-14 h-14 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
             )}
             <div className="min-w-0">
               <div className={`text-xs uppercase tracking-wider team-${c?.team || 'townsfolk'}`}>{c?.team || 'role'}</div>
-              <div className="text-amber-200 text-lg font-bold">{c?.name || step.char.id}</div>
+              <div className="text-amber-200 text-lg font-bold">{c?.name || _displayCharId}</div>
             </div>
           </div>
           <div className="text-sm text-stone-200 leading-relaxed border-l-2 border-amber-700/50 pl-3">
