@@ -1361,11 +1361,20 @@ function NightInfoScreen({ mySeat, seats, prompt, onAck, onQuestion }) {
     const minions = info.minions || [];
     const demon = info.demon || null;
     const bluffs = (info.bluffs || []).map(id => CHAR_BY_ID[id]).filter(Boolean);
+    const viewerRole = info.viewerRoleId ? CHAR_BY_ID[info.viewerRoleId] : null;
+    const headerLabel = viewerIsDemon
+      ? (viewerRole ? ('You are the ' + viewerRole.name) : 'You are the Demon')
+      : 'You are a Minion';
     body = (
       <div className="space-y-4">
         <div className={`text-center text-xl font-extrabold ${viewerIsDemon ? 'text-red-300' : 'text-purple-300'}`}>
-          {viewerIsDemon ? 'You are the Demon' : 'You are a Minion'}
+          {headerLabel}
         </div>
+        {viewerIsDemon && viewerRole && iconUrl(viewerRole.id) && (
+          <div className="flex justify-center">
+            <img src={iconUrl(viewerRole.id)} alt="" className="w-20 h-20 rounded-full border-2 border-red-700 object-cover" />
+          </div>
+        )}
         {minions.length > 0 && (
           <div>
             <div className="text-center text-xs text-stone-400 mb-2 uppercase tracking-wider">

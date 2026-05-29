@@ -1362,6 +1362,7 @@ function App() {
             infoPayload: {
               type: 'team-reveal',
               viewerRole: 'demon',
+              viewerRoleId: realDemon.actualRoleId,
               minions: minionsForDemon,
               bluffs,
             },
@@ -1370,31 +1371,79 @@ function App() {
             nightIdx: 0,
           };
         }
-        const lunatic = seats.find(x => x.actualRoleId === 'lunatic');
-        if (lunatic) {
-          const lunaticBluffs = (g.lunaticBluffs || []).filter(Boolean);
-          np[lunatic.seatNum] = {
-            roleId: 'lunatic',
-            action: 'info-st',
-            instruction: 'Lunatic info — you think you are the Demon. Learn your "Minions" and your Lunatic bluffs.',
-            reminderLabel: '',
-            eligible: 'all',
-            status: 'awaiting',
-            targets: null,
-            infoPayload: {
-              type: 'team-reveal',
-              viewerRole: 'demon',
-              minions: minionsForDemon,
-              bluffs: lunaticBluffs,
-            },
-            ceremony: 'demoninfo-lunatic',
-            startedAt: Date.now(),
-            nightIdx: 0,
-          };
-        }
       }
       return { grimoire: { ...g, nightPrompts: np } };
     });
+    // For lunaticinfo we OPEN the ST picker instead of pushing a prompt
+    // directly — the ST needs to choose which seats to represent as the
+    // Lunatic's "Minions" first. After Confirm, finishLunaticCeremony
+    // places the reminders + pushes the prompt.
+    if (ceremonyId === 'lunaticinfo') {
+      const seats = state.grimoire.seats || [];
+      const lunatic = seats.find(x => x.actualRoleId === 'lunatic');
+      if (!lunatic) return;
+      const realMinions = seats.filter(x => (CHAR_BY_ID[x.actualRoleId] || {}).team === 'minion');
+      const magician = seats.find(x => x.actualRoleId === 'magician');
+      const targetCount = Math.max(1, realMinions.length + (magician ? 1 : 0));
+      setLunaticPickerData({ lunaticSeat: lunatic, targetCount });
+    }
+  };
+  // Lunatic minion picker state — opened by sendCeremonyInfo('lunaticinfo').
+  const [lunaticPickerData, setLunaticPickerData] = useState(null);
+  const cancelLunaticPicker = () => setLunaticPickerData(null);
+  // After ST picks the fake-minion seats, place 'Lunatic: Minion N' reminders
+  // on each + push the team-reveal prompt to the Lunatic. The prompt uses
+  // viewerRoleId = lunatic.perceivedRoleId so the player sees their fake
+  // demon role name (e.g. "You are the Imp") rather than "You are the Lunatic".
+  const finishLunaticCeremony = (pickedSeatNums) => {
+    const data = lunaticPickerData;
+    if (!data) return;
+    const lunaticSeatNum = data.lunaticSeat.seatNum;
+    update(s => {
+      const g = s.grimoire;
+      const seats = g.seats || [];
+      const lunatic = seats.find(x => x.seatNum === lunaticSeatNum);
+      // Strip any prior Lunatic Minion N reminders + place fresh ones on the
+      // chosen seats (idempotent if ST re-runs the picker).
+      const stripped = seats.map(seat => ({
+        ...seat,
+        reminders: (seat.reminders || []).filter(r =>
+          !(r && r.charId === 'lunatic' && /^minion\s*\d+$/i.test(String(r.label || '')))),
+      }));
+      const withPicks = stripped.map(seat => {
+        const idx = pickedSeatNums.indexOf(seat.seatNum);
+        if (idx === -1) return seat;
+        return { ...seat, reminders: [...(seat.reminders || []), { charId: 'lunatic', label: 'Minion ' + (idx + 1), fromPrompt: true }] };
+      });
+      // Build the prompt payload using the picked seats as the "minions".
+      const pickedSeatObjs = pickedSeatNums
+        .map(n => seats.find(x => x.seatNum === n))
+        .filter(Boolean)
+        .map(x => ({ seatNum: x.seatNum, playerName: x.playerName || null }));
+      const lunaticBluffs = (g.lunaticBluffs || []).filter(Boolean);
+      const np = { ...(g.nightPrompts || {}) };
+      np[lunaticSeatNum] = {
+        roleId: 'lunatic',
+        action: 'info-st',
+        instruction: 'Lunatic info — you think you are the Demon. Learn your "Minions" and your Lunatic bluffs.',
+        reminderLabel: '',
+        eligible: 'all',
+        status: 'awaiting',
+        targets: null,
+        infoPayload: {
+          type: 'team-reveal',
+          viewerRole: 'demon',
+          viewerRoleId: lunatic?.perceivedRoleId || null,
+          minions: pickedSeatObjs,
+          bluffs: lunaticBluffs,
+        },
+        ceremony: 'lunaticinfo',
+        startedAt: Date.now(),
+        nightIdx: 0,
+      };
+      return { grimoire: { ...g, seats: withPicks, nightPrompts: np } };
+    });
+    setLunaticPickerData(null);
   };
   // ST responds to a two-step prompt (Fortune Teller, Innkeeper, Gambler, …).
   // Player has already submitted targets — now ST sets the infoPayload. For
@@ -4303,7 +4352,7 @@ function App() {
           ability fired" leaking that they just targeted the Fool).
           The popups reappear the moment the ST taps "Return to
           storyteller" and the overlay closes. */}
-      {cornerPrompts.length > 0 && localOverlayStep == null && localGrimoireSeat == null && moonchildPickSeat == null && (
+      {cornerPrompts.length > 0 && localOverlayStep == null && localGrimoireSeat == null && moonchildPickSeat == null && lunaticPickerData == null && (
         <STCornerPrompts
           prompts={cornerPrompts}
           onAction={(promptId, actionIdx) => {
@@ -4327,6 +4376,15 @@ function App() {
           seats={state.grimoire.seats || []}
           onApply={applyMoonchildPick}
           onCancel={cancelMoonchildPick}
+        />
+      )}
+      {lunaticPickerData != null && (
+        <LunaticMinionPickerModal
+          lunaticSeat={lunaticPickerData.lunaticSeat}
+          seats={state.grimoire.seats || []}
+          targetCount={lunaticPickerData.targetCount}
+          onConfirm={finishLunaticCeremony}
+          onCancel={cancelLunaticPicker}
         />
       )}
 
@@ -9574,6 +9632,8 @@ const PERMANENT_REMINDER_CHARS = new Set([
   'vigormortis',
   // Fang Gu: 'Swapped' marker tracks that the first-Outsider-kill swap happened.
   'fanggu',
+  // Lunatic: 'Minion 1/2/3...' markers placed on ST-assigned fake-Minion seats.
+  'lunatic',
 ]);
 const PERMANENT_REMINDER_LABELS = new Set(['No ability', 'Used']);
 // Compute today's chopping-block state from a day's nominations + alive count.
@@ -11067,6 +11127,95 @@ function NightToastStack({ toasts, onDismiss }) {
   );
 }
 
+function LunaticMinionPickerModal({ lunaticSeat, seats, targetCount, onConfirm, onCancel }) {
+  const [picked, setPicked] = useState([]);
+  const togglePick = (seatNum) => {
+    setPicked(prev => {
+      if (prev.includes(seatNum)) return prev.filter(n => n !== seatNum);
+      if (prev.length >= targetCount) return [...prev.slice(1), seatNum];
+      return [...prev, seatNum];
+    });
+  };
+  const canConfirm = picked.length === targetCount;
+  const eligibleSeats = (seats || []).filter(s => s && s.seatNum !== lunaticSeat?.seatNum && s.actualRoleId);
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-950/85 flex items-start sm:items-center justify-center p-2 sm:p-4 overflow-y-auto">
+      <div className="parchment rounded-lg p-4 sm:p-5 max-w-lg w-full space-y-4 my-4">
+        <div className="flex items-start gap-3">
+          {iconUrl('lunatic') && (
+            <img src={iconUrl('lunatic')} alt=""
+              className="w-12 h-12 rounded-full border-2 border-purple-600 object-cover flex-shrink-0" />
+          )}
+          <div className="flex-1 min-w-0">
+            <div className="text-[10px] uppercase tracking-wider text-purple-300">Lunatic wakes</div>
+            <div className="text-amber-200 text-lg font-bold leading-tight">Pick fake "Minions" for the Lunatic</div>
+            <div className="text-xs text-stone-400 mt-0.5">
+              seat #{lunaticSeat?.seatNum}{lunaticSeat?.playerName ? ' · ' + lunaticSeat.playerName : ''}
+            </div>
+          </div>
+          <button onClick={onCancel}
+            className="text-stone-400 hover:text-stone-200 text-xl leading-none">✕</button>
+        </div>
+        <div className="text-xs text-stone-300/90 border-l-2 border-purple-700/50 pl-3">
+          The Lunatic thinks they are a Demon. Pick {targetCount} seat{targetCount === 1 ? '' : 's'} that
+          will be shown to them as their "Minions". Lunatic-flavoured reminder tokens are placed on the
+          chosen seats so you remember who was shown. Typically the ST picks players who would make
+          plausible bluffs (a mix of good and the actual evil team works).
+        </div>
+        <div>
+          <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">
+            Pick {targetCount} seat{targetCount === 1 ? '' : 's'}
+            <span className="text-stone-500 normal-case"> ({picked.length}/{targetCount})</span>
+          </div>
+          <ul className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-72 overflow-y-auto">
+            {eligibleSeats.map(s => {
+              const isPicked = picked.includes(s.seatNum);
+              const rc = CHAR_BY_ID[s.actualRoleId];
+              return (
+                <li key={s.seatNum}>
+                  <button onClick={() => togglePick(s.seatNum)}
+                    className={`w-full card rounded px-2 py-1.5 flex items-center gap-2 text-left text-sm
+                      ${isPicked ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}
+                      ${s.isDead ? 'opacity-60' : ''}`}>
+                    <span className="text-amber-200/80 text-xs w-6 text-center flex-shrink-0">#{s.seatNum}</span>
+                    {iconUrl(s.actualRoleId) ? (
+                      <img src={iconUrl(s.actualRoleId)} alt=""
+                        className="w-8 h-8 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                    ) : (
+                      <span className="w-8 h-8 flex-shrink-0"></span>
+                    )}
+                    <div className="flex-1 min-w-0 leading-tight">
+                      <div className="truncate">{s.playerName || <span className="text-stone-500 italic">—</span>}</div>
+                      <div className={`text-[10px] uppercase tracking-wider truncate ${rc ? `team-${rc.team}` : 'text-stone-500'}`}>
+                        {rc?.name || '(no role)'}
+                      </div>
+                    </div>
+                    {isPicked && <span className="text-amber-300 text-base">✓</span>}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+        <div className="flex items-center gap-2 pt-3 border-t border-stone-800">
+          <button onClick={onCancel}
+            className="text-xs px-3 py-2 rounded pill hover:border-stone-400 text-stone-400">
+            Cancel
+          </button>
+          <button onClick={() => onConfirm(picked)}
+            disabled={!canConfirm}
+            className={`flex-1 py-2.5 rounded font-semibold transition text-sm
+              ${canConfirm
+                ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40'
+                : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+            Confirm & send to Lunatic →
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ---------------- Death Confirmation Modal ----------------
 //
 // Pops on the ST device whenever a "Dead" reminder is placed on a non-dead
@@ -12516,11 +12665,20 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
       const minions = info.minions || [];
       const demon = info.demon || null;
       const bluffs = (info.bluffs || []).map(id => CHAR_BY_ID[id]).filter(Boolean);
+      const viewerRole = info.viewerRoleId ? CHAR_BY_ID[info.viewerRoleId] : null;
+      const headerLabel = viewerIsDemon
+        ? (viewerRole ? ('You are the ' + viewerRole.name) : 'You are the Demon')
+        : 'You are a Minion';
       infoBody = (
         <div className="space-y-4">
           <div className={`text-center text-xl font-extrabold ${viewerIsDemon ? 'text-red-300' : 'text-purple-300'}`}>
-            {viewerIsDemon ? 'You are the Demon' : 'You are a Minion'}
+            {headerLabel}
           </div>
+          {viewerIsDemon && viewerRole && iconUrl(viewerRole.id) && (
+            <div className="flex justify-center">
+              <img src={iconUrl(viewerRole.id)} alt="" className="w-20 h-20 rounded-full border-2 border-red-700 object-cover" />
+            </div>
+          )}
           {minions.length > 0 && (
             <div>
               <div className="text-center text-xs text-stone-400 mb-2 uppercase tracking-wider">
@@ -12827,6 +12985,7 @@ const NIGHT_CEREMONIES = {
   dawn:        'Dawn — everyone opens their eyes',
   minioninfo:  'Minions wake — learn each other & the Demon',
   demoninfo:   'Demon wakes — learns Minions & sees 3 bluffs',
+  lunaticinfo: 'Lunatic wakes — learns Minions & sees 3 bluffs',
 };
 
 function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted, extraCharIds = [],
@@ -12891,6 +13050,15 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
   for (const id of orderList) {
     if (NIGHT_CEREMONIES[id]) {
       steps.push({ type: 'ceremony', id, label: NIGHT_CEREMONIES[id] });
+      continue;
+    }
+    // 'lunatic' in the night order maps to a synthetic 'lunaticinfo' ceremony
+    // (only first night, only when a Lunatic is in play).
+    if (id === 'lunatic') {
+      const hasLunatic = (seats || []).some(s => s.actualRoleId === 'lunatic');
+      if (hasLunatic && isFirstNight) {
+        steps.push({ type: 'ceremony', id: 'lunaticinfo', label: NIGHT_CEREMONIES['lunaticinfo'] });
+      }
       continue;
     }
     const c = CHAR_BY_ID[id];
@@ -13198,7 +13366,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
             <ol className="space-y-1.5">
               {steps.map((s, i) => s.type === 'ceremony' ? (() => {
                 const clickable = automation && gameStarted && isFirstNight &&
-                  (s.id === 'minioninfo' || s.id === 'demoninfo') && !!onSendCeremony;
+                  (s.id === 'minioninfo' || s.id === 'demoninfo' || s.id === 'lunaticinfo') && !!onSendCeremony;
                 if (!clickable) {
                   return (
                     <li key={i} className="card rounded px-3 py-1.5 border-stone-700 bg-stone-900/60 text-stone-300 text-xs uppercase tracking-wider text-center">
@@ -13209,10 +13377,13 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                 // Targets that should receive the ceremony info.
                 const hasTargets = s.id === 'minioninfo'
                   ? (seats || []).some(x => (CHAR_BY_ID[x.actualRoleId] || {}).team === 'minion')
-                  : ((seats || []).some(x => (CHAR_BY_ID[x.actualRoleId] || {}).team === 'demon')
-                      || (seats || []).some(x => x.actualRoleId === 'lunatic'));
+                  : s.id === 'lunaticinfo'
+                    ? (seats || []).some(x => x.actualRoleId === 'lunatic')
+                    : (seats || []).some(x => (CHAR_BY_ID[x.actualRoleId] || {}).team === 'demon');
                 // Progress over prompts created for this ceremony.
-                const ceremonyTags = s.id === 'minioninfo' ? ['minioninfo'] : ['demoninfo', 'demoninfo-lunatic'];
+                const ceremonyTags = s.id === 'minioninfo' ? ['minioninfo']
+                  : s.id === 'lunaticinfo' ? ['lunaticinfo']
+                  : ['demoninfo'];
                 const cPrompts = Object.values(nightPrompts || {}).filter(p =>
                   p && ceremonyTags.includes(p.ceremony));
                 const totalSent = cPrompts.length;
