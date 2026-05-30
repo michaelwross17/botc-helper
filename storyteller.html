@@ -1269,13 +1269,17 @@ function App() {
     const useDecision = !!defForRole.canSkip && !infoPayload && !alreadyUsed;
     update(s => {
       const np = { ...(s.grimoire.nightPrompts || {}) };
+      // sc-reveal-info: stamp the player's NEW role as prompt.roleId so the
+      // NightInfoScreen header shows the new role icon/name (no SC reference).
+      const effectiveRoleId = step.scRevealRoleId || step.char.id;
       np[seatNum] = {
-        roleId:        step.char.id,
+        roleId:        effectiveRoleId,
         action:        step.action,
         instruction:   step.instruction || '',
         reminderLabel: step.reminderLabel || '',
         eligible:      defForRole.eligible || 'all',
         roleClaimFilter: defForRole.roleClaimFilter || null,
+        scRevealKind:   step.scRevealKind || null,
         status:        useDecision ? 'use-decision' : 'awaiting',
         targets:       null,
         infoPayload:   infoPayload || null,
@@ -1783,6 +1787,39 @@ function App() {
   const cancelKlutzPick = () => setKlutzPickSeat(null);
   const openEvilTwinModal = (etSeatNum, twinSeatNum) => setEvilTwinModalData({ etSeatNum, twinSeatNum });
   const cancelEvilTwinModal = () => setEvilTwinModalData(null);
+  // Barber flow — push the Yes/No prompt to the Demon. Decision handled
+  // by submitted-prompts effect (barber-ask → barber-pick → ST popup).
+  const openBarberFlow = (barberSeatNum) => {
+    const seats0 = state.grimoire.seats || [];
+    const demonSeat = seats0.find(s => (CHAR_BY_ID[s.actualRoleId] || {}).team === 'demon');
+    if (!demonSeat) {
+      addCornerPrompt({
+        kind: 'warn',
+        title: 'No Demon found',
+        body: 'Cannot start Barber flow — no demon-team seat is in play.',
+        actions: [{ label: 'OK', primary: true }],
+      });
+      return;
+    }
+    update(s => {
+      const np = { ...(s.grimoire.nightPrompts || {}) };
+      np[String(demonSeat.seatNum)] = {
+        roleId: demonSeat.actualRoleId,
+        action: 'barber-ask',
+        instruction: 'The Barber died. Would you like to swap 2 players\' characters tonight (instead of killing)?',
+        reminderLabel: '',
+        eligible: 'all',
+        status: 'awaiting',
+        targets: null,
+        infoPayload: { type: 'barber-ask' },
+        ceremony: 'barber-ask',
+        barberSourceSeatNum: barberSeatNum,
+        startedAt: Date.now(),
+        nightIdx: s.grimoire.viewingDayIndex || 0,
+      };
+      return { grimoire: { ...s.grimoire, nightPrompts: np } };
+    });
+  };
   const acceptEvilTwinPair = ({ etSeatNum, twinSeatNum }) => {
     const seats0 = state.grimoire.seats || [];
     const etSeat = seats0.find(s => s.seatNum === etSeatNum);
@@ -1793,12 +1830,12 @@ function App() {
       np[String(etSeatNum)] = {
         roleId: 'eviltwin',
         action: 'info-st',
-        instruction: 'Your good Twin is shown below — you may not nominate each other. If you both nominate the other, the game ends.',
+        instruction: 'Your good Twin is shown below.',
         reminderLabel: '',
         eligible: 'all',
         status: 'awaiting',
         targets: null,
-        infoPayload: { type: 'seat+role', seatNum: twinSeat.seatNum, roleId: twinSeat.actualRoleId, displayLabel: 'Your good Twin is:' },
+        infoPayload: { type: 'seat+role', askSeat: twinSeat.seatNum, roleId: twinSeat.actualRoleId, displayLabel: 'Your good Twin is:', displayRoleLabel: 'Their character is:' },
         ceremony: 'eviltwin-pair',
         startedAt: Date.now(),
         nightIdx: s.grimoire.viewingDayIndex || 0,
@@ -1806,12 +1843,12 @@ function App() {
       np[String(twinSeatNum)] = {
         roleId: 'eviltwin',
         action: 'info-st',
-        instruction: 'Your evil Twin is shown below — you may not nominate each other. If you both nominate the other, the game ends.',
+        instruction: 'Your evil Twin is shown below.',
         reminderLabel: '',
         eligible: 'all',
         status: 'awaiting',
         targets: null,
-        infoPayload: { type: 'seat+role', seatNum: etSeat.seatNum, roleId: etSeat.actualRoleId, displayLabel: 'Your evil Twin is:' },
+        infoPayload: { type: 'seat+role', askSeat: etSeat.seatNum, roleId: etSeat.actualRoleId, displayLabel: 'Your evil Twin is:', displayRoleLabel: 'Their character is:' },
         ceremony: 'eviltwin-pair',
         startedAt: Date.now(),
         nightIdx: s.grimoire.viewingDayIndex || 0,
@@ -2664,6 +2701,95 @@ function App() {
             }
           }
         }
+        // Barber Yes/No (barber-ask): when the demon submits, the targets
+        // sentinel encodes the Yes/No (we don't have a Yes/No payload type
+        // on player side yet, so we use a 'barber-yesno' status field).
+        if (p.ceremony === 'barber-ask' && p.status === 'submitted' && !p.barberAskHandled) {
+          // targets=[1] (or any non-empty array) means YES, [] means NO.
+          const tArr = Array.isArray(targets) ? targets : (targets && typeof targets === 'object' ? Object.keys(targets).map(k => targets[k]) : []);
+          const isYes = tArr.length > 0;
+          const isNo = !isYes;
+          // Mark handled so we don't re-process when next() updates.
+          next[seatStr] = { ...next[seatStr], barberAskHandled: true };
+          const barberSeatNum = p.barberSourceSeatNum;
+          if (isNo) {
+            // Place 'No swap' on barber seat + clear the demon's barber-ask prompt.
+            const baseSeats = next.__seatsCopy || state.grimoire.seats;
+            const seatsCopy = baseSeats.map(sx => {
+              if (sx.seatNum !== barberSeatNum) return sx;
+              const has = (sx.reminders || []).some(r =>
+                r && r.charId === 'barber' && /^no swap$/i.test(String(r.label || '')));
+              if (has) return sx;
+              return { ...sx, reminders: [...(sx.reminders || []), { charId: 'barber', label: 'No swap', fromPrompt: true }] };
+            });
+            next.__seatsCopy = seatsCopy;
+            delete next[seatStr];
+          } else if (isYes) {
+            // Replace the demon's prompt with a 2-player picker (barber-pick).
+            next[seatStr] = {
+              roleId: p.roleId,
+              action: 'target2',
+              instruction: 'Pick 2 players whose characters will be swapped.',
+              reminderLabel: '',
+              eligible: 'all',
+              status: 'awaiting',
+              targets: null,
+              infoPayload: null,
+              ceremony: 'barber-pick',
+              barberSourceSeatNum: barberSeatNum,
+              startedAt: Date.now(),
+              nightIdx: state.grimoire.viewingDayIndex || 0,
+            };
+          }
+        }
+        // Barber 2-player pick: when demon submits 2 targets, fire ST popup
+        // with Ignore / Swap (drunk/poison aware).
+        if (p.ceremony === 'barber-pick' && p.status === 'submitted' && Array.isArray(targets) && targets.length === 2 && !p.barberPickHandled) {
+          const baseSeats = next.__seatsCopy || state.grimoire.seats;
+          const a = (baseSeats || []).find(x => x.seatNum === targets[0]);
+          const b = (baseSeats || []).find(x => x.seatNum === targets[1]);
+          const aLabel = a && (a.playerName ? a.playerName + ' (#' + a.seatNum + ')' : '#' + a.seatNum);
+          const bLabel = b && (b.playerName ? b.playerName + ' (#' + b.seatNum + ')' : '#' + b.seatNum);
+          const aRoleName = a && ((CHAR_BY_ID[a.actualRoleId] || {}).name || a.actualRoleId);
+          const bRoleName = b && ((CHAR_BY_ID[b.actualRoleId] || {}).name || b.actualRoleId);
+          const demonSeat0 = (baseSeats || []).find(x => x.seatNum === seatNum);
+          const demonAfflicted = demonSeat0 ? isDrunkOrPoisoned(demonSeat0) : false;
+          const barberSeatNum = p.barberSourceSeatNum;
+          next[seatStr] = { ...next[seatStr], barberPickHandled: true };
+          setTimeout(() => addCornerPrompt({
+            kind: 'warn',
+            title: 'Barber: confirm swap',
+            body: 'Demon chose ' + aLabel + ' (' + aRoleName + ') and ' + bLabel + ' (' + bRoleName + ')' + (demonAfflicted ? ' — Demon is drunk/poisoned, swap may malfunction.' : '') + '. Swap their roles?',
+            actions: [
+              { label: 'Swap', primary: true, onClick: () => {
+                update(s => {
+                  const seats = (s.grimoire.seats || []).map(seat => {
+                    if (seat.seatNum === a.seatNum) {
+                      return { ...seat, actualRoleId: b.actualRoleId, perceivedRoleId: b.actualRoleId,
+                        reminders: [...(seat.reminders || []), { charId: 'barber', label: 'Reveal: new role', fromPrompt: true }] };
+                    }
+                    if (seat.seatNum === b.seatNum) {
+                      return { ...seat, actualRoleId: a.actualRoleId, perceivedRoleId: a.actualRoleId,
+                        reminders: [...(seat.reminders || []), { charId: 'barber', label: 'Reveal: new role', fromPrompt: true }] };
+                    }
+                    // Strip the demon's barber-pick prompt.
+                    return seat;
+                  });
+                  const np = { ...(s.grimoire.nightPrompts || {}) };
+                  delete np[String(seatNum)];
+                  return { grimoire: { ...s.grimoire, seats, nightPrompts: np } };
+                });
+              } },
+              { label: 'Ignore', onClick: () => {
+                update(s => {
+                  const np = { ...(s.grimoire.nightPrompts || {}) };
+                  delete np[String(seatNum)];
+                  return { grimoire: { ...s.grimoire, nightPrompts: np } };
+                });
+              } },
+            ],
+          }), 0);
+        }
         // Snake Charmer reveal steps: when the role-alignment info prompt
         // comes back submitted/done, strip the 'Reveal: ...' marker from
         // the affected seat so the synthetic step retires.
@@ -2671,8 +2797,12 @@ function App() {
           const baseSeats = next.__seatsCopy || state.grimoire.seats;
           const seatsCopy = baseSeats.map(sx => {
             if (sx.seatNum !== seatNum) return sx;
-            const reminders = (sx.reminders || []).filter(r =>
-              !(r && r.charId === 'snakecharmer' && /^reveal:/i.test(String(r.label || ''))));
+            const reminders = (sx.reminders || []).filter(r => {
+              if (!r) return true;
+              if (r.charId === 'snakecharmer' && /^reveal:/i.test(String(r.label || ''))) return false;
+              if (r.charId === 'barber' && /^reveal: new role$/i.test(String(r.label || ''))) return false;
+              return true;
+            });
             if (reminders.length === (sx.reminders || []).length) return sx;
             return { ...sx, reminders };
           });
@@ -2780,14 +2910,14 @@ function App() {
               // Push an info-st prompt so the converted player gets a card
               // showing their new role.
               next[String(targetSeatNum)] = {
-                roleId: 'pithag',
+                roleId: newRoleId,
                 action: 'info-st',
-                instruction: 'You have been converted by the Pit-Hag — your character is now shown below.',
+                instruction: 'Your role has changed — see below.',
                 reminderLabel: '',
                 eligible: 'all',
                 status: 'awaiting',
                 targets: null,
-                infoPayload: { type: 'role', roleId: newRoleId },
+                infoPayload: { type: 'role-alignment', roleId: newRoleId, alignment: ((CHAR_BY_ID[newRoleId] || {}).team === 'minion' || (CHAR_BY_ID[newRoleId] || {}).team === 'demon') ? 'evil' : 'good' },
                 ceremony: 'pithag-convert',
                 startedAt: Date.now(),
                 nightIdx: state.grimoire.viewingDayIndex || 0,
@@ -4046,14 +4176,28 @@ function App() {
         actions: [{ label: 'OK', primary: true }],
       }), 0);
     }
-    // Barber — day death only. Tonight the Demon must swap 2 player roles.
-    if (dyingSeat.actualRoleId === 'barber' && isDayDeath && !afflicted) {
-      setTimeout(() => addCornerPrompt({
-        kind: 'warn',
-        title: 'Barber died (day)',
-        body: seatLabel + ' (Barber) died during the day. TONIGHT the Demon must swap 2 player roles instead of killing. Handle the role swap via the "Change role" buttons on the chosen seats.',
-        actions: [{ label: 'OK', primary: true }],
-      }), 0);
+    // Barber — sober death (any cause). Auto-place 'Haircuts tonight' on
+    // the Barber's seat (dayIdx-tagged so it persists exactly one Go-to-Night).
+    if (dyingSeat.actualRoleId === 'barber' && !afflicted) {
+      setTimeout(() => {
+        update(s => {
+          const idx = (s.grimoire.days || []).length;
+          const seats = (s.grimoire.seats || []).map(seat => {
+            if (seat.seatNum !== dyingSeat.seatNum) return seat;
+            const has = (seat.reminders || []).some(r =>
+              r && r.charId === 'barber' && /haircuts tonight/i.test(String(r.label || '')));
+            if (has) return seat;
+            return { ...seat, reminders: [...(seat.reminders || []), { charId: 'barber', label: 'Haircuts tonight', dayIdx: idx, fromPrompt: true }] };
+          });
+          return { grimoire: { ...s.grimoire, seats } };
+        });
+        addCornerPrompt({
+          kind: 'warn',
+          title: 'Barber died',
+          body: seatLabel + ' (Barber) died. A "Haircuts tonight" reminder has been placed. Open the Barber\'s night row and Start the haircut sequence — the Demon will be prompted to swap 2 player roles.',
+          actions: [{ label: 'OK', primary: true }],
+        });
+      }, 0);
     }
     // Farmer — night death only. ST picks 1 alive good player to also become Farmer.
     if (dyingSeat.actualRoleId === 'farmer' && !isDayDeath && !afflicted) {
@@ -4294,6 +4438,33 @@ function App() {
     // Passive on-death triggers (Sweetheart any-death, Barber day-death etc.)
     const dyingExecuted = (state.grimoire.seats || []).find(s => s.seatNum === seatNum);
     firePassiveDeathTriggers(dyingExecuted, null, true);
+    // Evil Twin: if the executed seat carries the 'Twin' reminder placed by
+    // Evil Twin AND the Evil Twin is still alive, announce that the good
+    // twin has been executed (the Evil Twin's team typically wins).
+    try {
+      if (dyingExecuted) {
+        const hasTwinMarker = (dyingExecuted.reminders || []).some(r =>
+          r && r.charId === 'eviltwin' && /^twin$/i.test(String(r.label || '')));
+        if (hasTwinMarker) {
+          const etSeat = (state.grimoire.seats || []).find(s =>
+            s.actualRoleId === 'eviltwin' && !s.isDead);
+          if (etSeat) {
+            const twinLabel = dyingExecuted.playerName
+              ? dyingExecuted.playerName + ' (seat #' + dyingExecuted.seatNum + ')'
+              : 'seat #' + dyingExecuted.seatNum;
+            const etLabel = etSeat.playerName
+              ? etSeat.playerName + ' (seat #' + etSeat.seatNum + ')'
+              : 'seat #' + etSeat.seatNum;
+            setTimeout(() => addCornerPrompt({
+              kind: 'warn',
+              title: 'Good Twin executed - Evil Twin still lives',
+              body: 'The good twin (' + twinLabel + ') was executed while the Evil Twin (' + etLabel + ') is still alive. The Evil Twin\'s team typically wins - announce the game end if appropriate.',
+              actions: [{ label: 'OK', primary: true }],
+            }), 0);
+          }
+        }
+      }
+    } catch (_) { /* never let the trigger break the kill */ }
   };
 
   // Slayer / Psychopath: claim + target. If real + sober → target dies +
@@ -4847,9 +5018,13 @@ function App() {
           onCancelNightPrompt={cancelNightPrompt}
           onMarkStepDone={markStepDone}
           onClearAllNightPrompts={clearAllNightPrompts}
-          onOpenMoonchildCapture={(seatNum) => setMoonchildPickSeat(seatNum)}
+          onOpenMoonchildCapture={(seatNum, kind) => {
+            if (kind === 'klutz') setKlutzPickSeat(seatNum);
+            else setMoonchildPickSeat(seatNum);
+          }}
           onResolveMoonchild={resolveMoonchild}
           onOpenEvilTwinModal={openEvilTwinModal}
+          onOpenBarberFlow={openBarberFlow}
           onOpenLocalPrompt={openLocalPrompt}
           onMarkSetupReminder={markSetupReminder}
           onSkipSetupReminders={setSetupRemindersSkipped}
@@ -6154,7 +6329,7 @@ function eligibleSeatsForPending(roleId, seats) {
 
 function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
                         nightToasts = [], onDismissNightToast,
-                        onStartNightPrompt, onCancelNightPrompt, onMarkStepDone, onClearAllNightPrompts, onOpenMoonchildCapture, onResolveMoonchild, onOpenEvilTwinModal, onOpenLocalPrompt,
+                        onStartNightPrompt, onCancelNightPrompt, onMarkStepDone, onClearAllNightPrompts, onOpenMoonchildCapture, onResolveMoonchild, onOpenEvilTwinModal, onOpenBarberFlow, onOpenLocalPrompt,
                         onMarkSetupReminder, onSkipSetupReminders, onRespondToNightPrompt,
                         dismissedResponses, onDismissResponsePopup, onPromoteScarletWoman, onStartShowGrimoire, onSendCeremonyInfo,
                         dayBanners = [], onDismissDayBanner,
@@ -6505,6 +6680,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         onOpenLocalPrompt={onOpenLocalPrompt}
         onOpenMoonchildCapture={onOpenMoonchildCapture}
         onOpenEvilTwinModal={onOpenEvilTwinModal}
+        onOpenBarberFlow={onOpenBarberFlow}
         onResolveMoonchild={onResolveMoonchild}
         nominationsByDay={grim.nominationsByDay || {}}
         onPromoteScarletWoman={onPromoteScarletWoman}
@@ -10206,7 +10382,7 @@ const NIGHT_ACTIONS = {
                    infoType: 'number',    infoConfig: { min: 1, max: 10, label: 'steps', display: 'Demon → nearest Minion (clockwise):' } },
   sage:          { action: 'info-st',     reminder: 'Shown',       instruction: 'If killed by the Demon, learn 2 players — one is the Demon.', phase: 'other',
                    requiresDeath: true, oncePerGame: true,
-                   infoType: 'seats+role', infoConfig: { numSeats: 2, roleTeam: 'demon', allowNone: false, prefix: 'One of these players is the' } },
+                   infoType: 'seats',     infoConfig: { numSeats: 2, display: 'One of these players is the demon:' } },
   seamstress:    { action: 'target2+yesno', reminder: 'Chose',     instruction: 'Once per game at night, choose 2 players (not yourself) — you learn if they are the same alignment.', eligible: 'others',
                    oncePerGame: true, canSkip: true,
                    responseConfig: { yesLabel: 'YES — same alignment', noLabel: 'NO — different alignments' } },
@@ -10368,6 +10544,10 @@ function isReminderPermanent(reminder) {
   if (reminder.charId === 'po' && /hungry|3 to kill/i.test(reminder.label || '')) return true;
   // Moonchild 'Triggered' (just died) persists until ST resolves the pick.
   if (reminder.charId === 'moonchild' && /trigger/i.test(reminder.label || '')) return true;
+  // Barber: Haircuts tonight (dayIdx-tagged, stripped by stripStaleHaircuts);
+  // No swap (demon declined); Reveal: new role (drives sub-reveal steps).
+  if (reminder.charId === 'barber' && /haircuts tonight/i.test(reminder.label || '')) return true;
+  if (reminder.charId === 'barber' && /^(no swap|reveal:)/i.test(reminder.label || '')) return true;
   // Lunatic: only the ST-assigned 'Minion N' markers from the Lunatic-wakes
   // picker persist; ANY OTHER lunatic-charId reminder (e.g. 'Poisoned' /
   // 'Dead' placed when Lunatic-as-Pukka or Lunatic-as-Imp picks) is transient
@@ -10755,7 +10935,7 @@ function computeJugglerCorrectCount(seats) {
 // reminder / fire toast) is not yet implemented. The Start button currently
 // shows a placeholder confirming what *would* happen. Phase B replaces this
 // placeholder with the real flow.
-function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onMarkDone: onMarkDoneProp, onOpenInfoPicker, onOpenLocalPrompt, onStartShowGrimoire, onOpenMoonchildCapture, onResolveMoonchild, onOpenEvilTwinModal, gameStarted = false }) {
+function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onMarkDone: onMarkDoneProp, onOpenInfoPicker, onOpenLocalPrompt, onStartShowGrimoire, onOpenMoonchildCapture, onResolveMoonchild, onOpenEvilTwinModal, onOpenBarberFlow, gameStarted = false }) {
   const { action, seat, instruction, reminderLabel, prompt, requiresDeath, oncePerGame,
           moonchildTargetSeatNum, moonchildTargetIsGood, moonchildAfflicted } = step;
   if (readOnly) return null;
@@ -10778,19 +10958,35 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
     // surface a Mark resolved button so the ST can complete the demon swap.
     if (step.char && step.char.id === 'barber') {
       if (step.barberHasHaircut) {
-        const isDone = prompt?.status === 'done';
+        const hasNoSwap = (seat.reminders || []).some(r =>
+          r && r.charId === 'barber' && /^no swap$/i.test(String(r.label || '')));
+        const askPrompt = prompt && prompt.action === 'barber-ask';
+        const askStatus = askPrompt && askPrompt.status;
+        if (hasNoSwap) {
+          return (
+            <div className="mt-1.5 text-[11px] text-stone-500 italic">
+              Demon chose not to swap tonight — no haircut.
+            </div>
+          );
+        }
         return (
           <div className="mt-2 pt-2 border-t border-stone-800/70">
             <div className="text-[11px] text-stone-400 mb-1.5 italic">
-              Automation: <span className="text-amber-300/90 not-italic">demon swaps 2 player roles tonight</span>
+              Automation: <span className="text-amber-300/90 not-italic">prompt Demon to swap 2 player roles</span>
             </div>
-            <div className="text-xs text-stone-300 mb-2 leading-snug">
-              The Barber died — instead of killing tonight, the Demon picks 2 players and swaps their characters. Handle the swap via "Change role" on the chosen seats, then mark this resolved.
+            <div className="text-xs text-stone-300 mb-2 leading-snug">{instruction || 'The Barber died — Start the haircut sequence to prompt the Demon.'}</div>
+            <div className="flex items-center gap-2 flex-wrap">
+              {askStatus === 'awaiting' ? (
+                <span className="text-xs text-amber-300 font-medium">Awaiting demon yes/no…</span>
+              ) : askStatus === 'submitted' ? (
+                <span className="text-xs text-amber-300 font-medium">Demon picks (next phase)…</span>
+              ) : (
+                <button onClick={() => onOpenBarberFlow && onOpenBarberFlow(seat.seatNum)}
+                  className="text-xs px-3 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
+                  ▶ Start
+                </button>
+              )}
             </div>
-            <button onClick={onMarkDone}
-              className={`text-xs px-3 py-1 rounded pill hover:border-amber-500 hover:text-amber-200 ${isDone ? 'opacity-50' : ''}`}>
-              {isDone ? '✓ Done' : 'Mark resolved'}
-            </button>
           </div>
         );
       }
@@ -10972,13 +11168,29 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
         {statusBadge && <span className="ml-2">{statusBadge}</span>}
       </div>
       <div className="flex items-center gap-2 flex-wrap">
-        {action === 'sc-reveal' ? (
+        {action === 'klutz-capture' ? (
+          <button onClick={() => onOpenMoonchildCapture && onOpenMoonchildCapture(seat.seatNum, 'klutz')}
+            className="text-xs px-3 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
+            ▶ Start
+          </button>
+        ) : action === 'sc-reveal' ? (
           (() => {
-            const isDone = prompt?.status === 'done' || prompt?.status === 'submitted';
+            const sentMatches = prompt && prompt.scRevealKind === (step.scReveal && step.scReveal.kind);
+            const isDone = sentMatches && (prompt.status === 'done' || prompt.status === 'submitted');
+            const isAwaiting = sentMatches && prompt.status === 'awaiting';
             return isDone ? (
               <span className="text-xs text-emerald-300 font-medium">✓ Sent</span>
+            ) : isAwaiting ? (
+              <span className="text-xs text-amber-300 font-medium">Sent — waiting on player</span>
             ) : (
-              <button onClick={() => onStartPrompt && onStartPrompt(seat.seatNum, step, {
+              <button onClick={() => onStartPrompt && onStartPrompt(seat.seatNum, {
+                ...step,
+                char: { id: (step.scReveal && step.scReveal.roleId) || step.char.id, name: '', team: '' },
+                action: 'sc-reveal-info',
+                scRevealKind: step.scReveal && step.scReveal.kind,
+                scRevealRoleId: step.scReveal && step.scReveal.roleId,
+                scRevealAlignment: step.scReveal && step.scReveal.alignment,
+              }, {
                 type: 'role-alignment',
                 roleId: step.scReveal && step.scReveal.roleId,
                 alignment: step.scReveal && step.scReveal.alignment,
@@ -13390,6 +13602,25 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
               {cfg.display || (infoType === 'seat' ? 'Pick 1 player' : `Pick ${cfg.numSeats || 2} players`)}
               <span className="text-stone-500 normal-case"> ({pickedSeats.length}/{cfg.numSeats || (infoType === 'seat' ? 1 : 2)})</span>
             </div>
+            {step.char && step.char.id === 'sage' && (() => {
+              const demonSeat = (seats || []).find(s => (CHAR_BY_ID[s.actualRoleId] || {}).team === 'demon');
+              if (!demonSeat) return null;
+              const sageAfflicted = targetSeat ? isDrunkOrPoisoned(targetSeat) : false;
+              const alreadyPicked = pickedSeats.includes(demonSeat.seatNum);
+              return (
+                <div className="flex items-center justify-between gap-2 -mt-1 mb-1.5 text-[11px]">
+                  <span className="text-stone-400">
+                    {sageAfflicted
+                      ? 'Sage is drunk/poisoned — consider giving false info.'
+                      : 'Suggested: include the demon seat #' + demonSeat.seatNum + (demonSeat.playerName ? ' · ' + demonSeat.playerName : '')}
+                  </span>
+                  <button onClick={() => setPickedSeats(prev => prev.includes(demonSeat.seatNum) ? prev : (prev.length >= (cfg.numSeats || 2) ? [...prev.slice(1), demonSeat.seatNum] : [...prev, demonSeat.seatNum]))}
+                    className={`px-2 py-1 rounded transition ${alreadyPicked ? 'bg-emerald-700/60 text-emerald-100 border border-emerald-600' : 'pill hover:border-emerald-500 hover:text-emerald-200 text-emerald-300'}`}>
+                    {alreadyPicked ? '✓ Demon included' : '+ Add demon'}
+                  </button>
+                </div>
+              );
+            })()}
             <ul className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-72 overflow-y-auto">
               {(seats || []).map(s => {
                 const picked = pickedSeats.includes(s.seatNum);
@@ -13679,12 +13910,22 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
   // Cerenovus: player picks 1 seat AND 1 good-aligned character (no ST step).
   const isRoleClaim = step.action === 'target1+role-claim';
   const wantsRolePick = isGuess || isRoleClaim;
+  // Philosopher: role-only — auto-pick self, hide seat picker entirely.
+  const isLocalRoleOnly = isRoleClaim && step.char && step.char.id === 'philosopher';
   const [pickedGuess, setPickedGuess] = useState('');
+  React.useEffect(() => {
+    if (isLocalRoleOnly && mySeat && picked.length !== 1) {
+      setPicked([mySeat.seatNum]);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLocalRoleOnly]);
   const canSubmit = isInfo
     ? true
-    : (wantsRolePick
-        ? (picked.length === 1 && !!pickedGuess)
-        : (isPoFlex ? (picked.length <= 1) : (picked.length === need)));
+    : (isLocalRoleOnly
+        ? !!pickedGuess
+        : wantsRolePick
+          ? (picked.length === 1 && !!pickedGuess)
+          : (isPoFlex ? (picked.length <= 1) : (picked.length === need)));
 
   const doSubmit = () => {
     const v = isInfo ? [] : picked;
@@ -14162,6 +14403,7 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
           </section>
         ) : (
           <section className="parchment rounded-lg p-3 sm:p-4 space-y-2">
+            {!isLocalRoleOnly && (<>
             <div className="flex items-baseline justify-between gap-2">
               <h3 className="text-amber-200 font-semibold text-sm">
                 {isPoFlex
@@ -14196,6 +14438,7 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
                 );
               })}
             </ul>
+            </>)}
             {wantsRolePick && (
               <div className="mt-3 pt-3 border-t border-stone-800">
                 <div className="flex items-baseline justify-between gap-2 mb-1.5">
@@ -14277,7 +14520,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                               onStartPrompt, onCancelPrompt, onMarkDone, onClearAllPrompts,
                               scriptCharIds = [], onOpenLocalPrompt,
                               nominationsByDay = {}, onPromoteScarletWoman, onStartShowGrimoire,
-                              onOpenMoonchildCapture, onResolveMoonchild, onOpenEvilTwinModal,
+                              onOpenMoonchildCapture, onResolveMoonchild, onOpenEvilTwinModal, onOpenBarberFlow,
                               onSendCeremony,
                               lastExecution = null }) {
   // Auto-expand when automation is on so the ST sees the interactive panel immediately.
@@ -14414,49 +14657,6 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
         effectiveAction = 'target3';
       }
     }
-    // Snake Charmer post-swap synthetic steps. If any seat carries a
-    // 'Reveal: new demon' / 'Reveal: new sc' marker (placed by Swap),
-    // emit a synthetic manual step directly under SC's row so the ST
-    // can push a clean role+alignment info on Start.
-    if (id === 'snakecharmer') {
-      const revealMarkers = [];
-      for (const sx of (seats || [])) {
-        for (const r of (sx.reminders || [])) {
-          if (!r || r.charId !== 'snakecharmer') continue;
-          if (/^reveal: new demon$/i.test(String(r.label || ''))) {
-            revealMarkers.push({ kind: 'newdemon', seatNum: sx.seatNum, roleId: sx.actualRoleId, alignment: sx.alignment || 'evil' });
-          } else if (/^reveal: new sc$/i.test(String(r.label || ''))) {
-            revealMarkers.push({ kind: 'newsc', seatNum: sx.seatNum, roleId: sx.actualRoleId, alignment: sx.alignment || 'good' });
-          }
-        }
-      }
-      const scActorChar = CHAR_BY_ID['snakecharmer'] || { id: 'snakecharmer', name: 'Snake Charmer', team: 'townsfolk' };
-      for (const rev of revealMarkers) {
-        stepNum += 1;
-        const revealSeat = (seats || []).find(x => x.seatNum === rev.seatNum);
-        const promptForReveal = nightPrompts[rev.seatNum];
-        steps.push({
-          type: 'char',
-          stepNum,
-          char: scActorChar,
-          seat: revealSeat,
-          reminder: rev.kind === 'newdemon' ? 'Reveal new role + alignment' : 'Reveal new role + alignment',
-          isExtra: false,
-          action: 'sc-reveal',
-          instruction: rev.kind === 'newdemon'
-            ? 'Wake this player and show them their new role and alignment.'
-            : 'Wake this player and show them their new role and alignment.',
-          reminderLabel: '',
-          requiresDeath: false,
-          oncePerGame: false,
-          canSkip: false,
-          infoType: 'role-alignment',
-          infoConfig: { roleId: rev.roleId, alignment: rev.alignment },
-          scReveal: { kind: rev.kind, seatNum: rev.seatNum, roleId: rev.roleId, alignment: rev.alignment },
-          prompt: promptForReveal && !promptForReveal.ceremony ? promptForReveal : null,
-        });
-      }
-    }
     // Moonchild natural-slot: scan for a 'Moonchild: Dead' marker on any
     // seat (placed at capture). If present → action='moonchild-resolve'
     // (rendered inline with Execute/Skip buttons in NightStepActionRow).
@@ -14550,6 +14750,82 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                            r && r.charId === 'eviltwin' && /^twin$/i.test(String(r.label || '')))) || {}).seatNum || null)
                        : null,
                      prompt });
+      }
+    }
+    // Barber post-swap reveal steps — same pattern as SC reveal: emit 2
+    // synthetic reveal steps under Barber's row for each swapped seat.
+    if (id === 'barber') {
+      const revealSeats = (seats || []).filter(sx =>
+        (sx.reminders || []).some(r => r && r.charId === 'barber' && /^reveal: new role$/i.test(String(r.label || ''))));
+      for (const rev of revealSeats) {
+        stepNum += 1;
+        const newRoleId = rev.actualRoleId;
+        const newAlignment = (CHAR_BY_ID[newRoleId] || {}).team === 'minion' || (CHAR_BY_ID[newRoleId] || {}).team === 'demon' ? 'evil' : 'good';
+        const newRoleChar = CHAR_BY_ID[newRoleId] || { id: newRoleId, name: newRoleId, team: newAlignment === 'evil' ? 'demon' : 'townsfolk' };
+        const rawPrompt = nightPrompts[rev.seatNum];
+        const isOurPrompt = !!(rawPrompt && rawPrompt.scRevealKind === 'barber-' + rev.seatNum);
+        steps.push({
+          type: 'char',
+          stepNum,
+          char: newRoleChar,
+          seat: rev,
+          reminder: 'Show new role to swapped seat',
+          isExtra: false,
+          action: 'sc-reveal',
+          instruction: 'Wake this player and reveal their new role and alignment. Do not mention the Barber.',
+          reminderLabel: '',
+          requiresDeath: false,
+          oncePerGame: false,
+          canSkip: false,
+          infoType: 'role-alignment',
+          infoConfig: { roleId: newRoleId, alignment: newAlignment },
+          scReveal: { kind: 'barber-' + rev.seatNum, seatNum: rev.seatNum, roleId: newRoleId, alignment: newAlignment },
+          prompt: isOurPrompt ? rawPrompt : null,
+        });
+      }
+    }
+    // Snake Charmer post-swap synthetic steps — emitted AFTER SC's main row
+    // push so they appear BELOW SC in the night order. Each reveal step is
+    // independent (own prompt status keyed by scRevealKind on the prompt).
+    if (id === 'snakecharmer') {
+      const revealMarkers = [];
+      for (const sx of (seats || [])) {
+        for (const r of (sx.reminders || [])) {
+          if (!r || r.charId !== 'snakecharmer') continue;
+          if (/^reveal: new demon$/i.test(String(r.label || ''))) {
+            revealMarkers.push({ kind: 'newdemon', seatNum: sx.seatNum, roleId: sx.actualRoleId, alignment: sx.alignment || 'evil' });
+          } else if (/^reveal: new sc$/i.test(String(r.label || ''))) {
+            revealMarkers.push({ kind: 'newsc', seatNum: sx.seatNum, roleId: sx.actualRoleId, alignment: sx.alignment || 'good' });
+          }
+        }
+      }
+      for (const rev of revealMarkers) {
+        stepNum += 1;
+        const revealSeat = (seats || []).find(x => x.seatNum === rev.seatNum);
+        const newRoleChar = CHAR_BY_ID[rev.roleId] || { id: rev.roleId, name: rev.roleId, team: rev.alignment === 'evil' ? 'demon' : 'townsfolk' };
+        // Only count the seat's existing prompt as OUR prompt if it has the
+        // matching scRevealKind tag (set when we push the reveal payload).
+        // Otherwise leave prompt null so Start button shows.
+        const rawPrompt = nightPrompts[rev.seatNum];
+        const isOurPrompt = !!(rawPrompt && rawPrompt.scRevealKind === rev.kind);
+        steps.push({
+          type: 'char',
+          stepNum,
+          char: newRoleChar,
+          seat: revealSeat,
+          reminder: rev.kind === 'newdemon' ? 'Show new demon their role' : 'Show new snake charmer their role',
+          isExtra: false,
+          action: 'sc-reveal',
+          instruction: 'Wake this player and reveal their new role and alignment. Do not mention the Snake Charmer.',
+          reminderLabel: '',
+          requiresDeath: false,
+          oncePerGame: false,
+          canSkip: false,
+          infoType: 'role-alignment',
+          infoConfig: { roleId: rev.roleId, alignment: rev.alignment },
+          scReveal: { kind: rev.kind, seatNum: rev.seatNum, roleId: rev.roleId, alignment: rev.alignment },
+          prompt: isOurPrompt ? rawPrompt : null,
+        });
       }
     }
     // Synthetic 'Show Exorcism' step — emitted right after Exorcist's slot
@@ -14864,6 +15140,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                         onStartShowGrimoire={onStartShowGrimoire}
                         onOpenMoonchildCapture={onOpenMoonchildCapture}
                         onOpenEvilTwinModal={onOpenEvilTwinModal}
+                        onOpenBarberFlow={onOpenBarberFlow}
                         onResolveMoonchild={onResolveMoonchild}
                         gameStarted={gameStarted}
                       />
