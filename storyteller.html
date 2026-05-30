@@ -1806,7 +1806,7 @@ function App() {
       np[String(demonSeat.seatNum)] = {
         roleId: demonSeat.actualRoleId,
         action: 'barber-ask',
-        instruction: 'The Barber died. Would you like to swap 2 players\' characters tonight (instead of killing)?',
+        instruction: 'The Barber died. Would you like to swap 2 players\' characters tonight?',
         reminderLabel: '',
         eligible: 'all',
         status: 'awaiting',
@@ -4256,11 +4256,24 @@ function App() {
         }, 0);
       }
     }
-    // Klutz — any death (sober). Opens a Moonchild-style picker so the ST
-    // can record the public pick. The corner popup that fires from
-    // applyKlutzPick announces whether the picked player is evil (Good loses).
+    // Klutz — sober death. DAY death opens the picker immediately;
+    // NIGHT death places a 'Triggered' marker, deferring the picker to the
+    // synthetic post-Dawn klutz-capture step (mirrors Moonchild).
     if (dyingSeat.actualRoleId === 'klutz' && !afflicted) {
-      setTimeout(() => setKlutzPickSeat(dyingSeat.seatNum), 0);
+      if (isDayDeath) {
+        setTimeout(() => setKlutzPickSeat(dyingSeat.seatNum), 0);
+      } else {
+        setTimeout(() => update(s => {
+          const seats = (s.grimoire.seats || []).map(seat => {
+            if (seat.seatNum !== dyingSeat.seatNum) return seat;
+            const has = (seat.reminders || []).some(r =>
+              r && r.charId === 'klutz' && /^triggered$/i.test(String(r.label || '')));
+            if (has) return seat;
+            return { ...seat, reminders: [...(seat.reminders || []), { charId: 'klutz', label: 'Triggered', fromPrompt: true }] };
+          });
+          return { grimoire: { ...s.grimoire, seats } };
+        }), 0);
+      }
     }
     // Banshee — killed by the Demon. ST announces + Banshee gains new ability.
     if (dyingSeat.actualRoleId === 'banshee' && !afflicted) {
@@ -11178,23 +11191,32 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
             const sentMatches = prompt && prompt.scRevealKind === (step.scReveal && step.scReveal.kind);
             const isDone = sentMatches && (prompt.status === 'done' || prompt.status === 'submitted');
             const isAwaiting = sentMatches && prompt.status === 'awaiting';
+            const startStep = {
+              ...step,
+              char: CHAR_BY_ID[(step.scReveal && step.scReveal.roleId) || step.char.id] || step.char,
+              action: 'sc-reveal-info',
+              scRevealKind: step.scReveal && step.scReveal.kind,
+              scRevealRoleId: step.scReveal && step.scReveal.roleId,
+              scRevealAlignment: step.scReveal && step.scReveal.alignment,
+            };
+            const payload = {
+              type: 'role-alignment',
+              roleId: step.scReveal && step.scReveal.roleId,
+              alignment: step.scReveal && step.scReveal.alignment,
+            };
+            const onStartReveal = () => {
+              if (seat.isLocal) {
+                onOpenLocalPrompt && onOpenLocalPrompt(startStep, payload);
+              } else {
+                onStartPrompt && onStartPrompt(seat.seatNum, startStep, payload);
+              }
+            };
             return isDone ? (
               <span className="text-xs text-emerald-300 font-medium">✓ Sent</span>
             ) : isAwaiting ? (
               <span className="text-xs text-amber-300 font-medium">Sent — waiting on player</span>
             ) : (
-              <button onClick={() => onStartPrompt && onStartPrompt(seat.seatNum, {
-                ...step,
-                char: { id: (step.scReveal && step.scReveal.roleId) || step.char.id, name: '', team: '' },
-                action: 'sc-reveal-info',
-                scRevealKind: step.scReveal && step.scReveal.kind,
-                scRevealRoleId: step.scReveal && step.scReveal.roleId,
-                scRevealAlignment: step.scReveal && step.scReveal.alignment,
-              }, {
-                type: 'role-alignment',
-                roleId: step.scReveal && step.scReveal.roleId,
-                alignment: step.scReveal && step.scReveal.alignment,
-              })}
+              <button onClick={onStartReveal}
                 className="text-xs px-3 py-1 rounded pill hover:border-amber-500 hover:text-amber-200">
                 ▶ Start
               </button>
@@ -14289,6 +14311,50 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
           </div>
         </div>
       );
+    } else if (info.type === 'role-alignment') {
+      const rlRole = info.roleId ? CHAR_BY_ID[info.roleId] : null;
+      const rlAlign = info.alignment || 'good';
+      infoBody = (
+        <div className="text-center space-y-4">
+          <div className="text-sm text-stone-300">Your role</div>
+          {rlRole ? (
+            <div className="flex flex-col items-center gap-2">
+              {iconUrl(rlRole.id) && (
+                <img src={iconUrl(rlRole.id)} alt="" className="w-28 h-28 rounded-full border-2 border-amber-700 object-cover" />
+              )}
+              <div className={`text-3xl font-bold team-${rlRole.team}`}>{rlRole.name}</div>
+              {rlRole.ability && (
+                <div className="text-sm text-stone-200 leading-relaxed border-l-2 border-amber-700/50 pl-3 text-left mt-2">
+                  {rlRole.ability}
+                </div>
+              )}
+            </div>
+          ) : <div className="text-stone-400 italic">(unknown role)</div>}
+          <div className="pt-3 border-t border-stone-800">
+            <div className="text-sm text-stone-300">Your alignment</div>
+            <div className={`text-2xl font-bold mt-1 ${rlAlign === 'evil' ? 'text-red-300' : 'text-emerald-300'}`}>
+              {rlAlign.toUpperCase()}
+            </div>
+          </div>
+        </div>
+      );
+    } else if (info.type === 'barber-ask') {
+      infoBody = (
+        <div className="text-center space-y-3">
+          <div className="text-sm text-stone-200">The Barber died — would you like to swap 2 players' characters tonight?</div>
+          <div className="grid grid-cols-2 gap-3 pt-2">
+            <button onClick={() => { setSubmittedValue('no'); setPhase('confirmed'); onSubmit([]); }}
+              className="py-4 rounded-lg text-base font-bold transition bg-red-700 hover:bg-red-600 text-stone-100">
+              NO — kill as usual
+            </button>
+            <button onClick={() => { setSubmittedValue('yes'); setPhase('confirmed'); onSubmit([1]); }}
+              className="py-4 rounded-lg text-base font-bold transition bg-emerald-600 hover:bg-emerald-500 text-stone-950">
+              YES — swap 2 roles
+            </button>
+          </div>
+          <div className="text-[10px] text-stone-500 pt-2">Tap one option above.</div>
+        </div>
+      );
     }
   }
 
@@ -14475,6 +14541,7 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
           </section>
         )}
 
+        {(infoPayload && infoPayload.type === 'barber-ask') ? null : (<>
         <div className={`grid ${isPoFlex && !isInfo ? 'grid-cols-3' : 'grid-cols-2'} gap-2 pt-1`}>
           <button onClick={onClose}
             className="py-3 rounded-lg text-base font-semibold bg-stone-800 hover:bg-stone-700 text-stone-300 border border-stone-700">
@@ -14498,6 +14565,7 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
         <p className="text-[10px] text-stone-500 text-center">
           Hand the phone to the local player to {isInfo ? 'acknowledge' : 'make their choice'}.
         </p>
+        </>)}
       </div>
     </div>
   );
@@ -14816,7 +14884,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
           reminder: rev.kind === 'newdemon' ? 'Show new demon their role' : 'Show new snake charmer their role',
           isExtra: false,
           action: 'sc-reveal',
-          instruction: 'Wake this player and reveal their new role and alignment. Do not mention the Snake Charmer.',
+          instruction: 'Wake this player and reveal their new role and alignment.',
           reminderLabel: '',
           requiresDeath: false,
           oncePerGame: false,
