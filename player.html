@@ -431,7 +431,18 @@ function App() {
           }}
         />;
       }
-      return <AcceptedScreen seat={mySeat} />;
+      return <PlayerAidsShell
+        game={game}
+        mySeat={mySeat}
+        onSaveNotes={(notes) => {
+          const next = loadGame() || game;
+          if (!next.grimoire) return;
+          next.grimoire.playerNotes = { ...(next.grimoire.playerNotes || {}) };
+          next.grimoire.playerNotes[mySeat.seatNum] = notes;
+          saveGame(next);
+          setGame(next);
+        }}
+      />;
     }
     return <RoleReveal
       seat={mySeat}
@@ -1940,6 +1951,370 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
         Submit places your choice automatically. Question flags the storyteller to come over.
       </p>
     </ScreenShell>
+  );
+}
+
+// ---------------- Player aids — Notes + Script tabs ----------------
+//
+// Shell that wraps AcceptedScreen with a tab bar when features.playerAids
+// is enabled. Tabs only show on the resting screen (no active prompt).
+const PLAYER_COUNT_TABLE = [
+  { n: 5,  tf: 3, out: 0, min: 1, dem: 1 },
+  { n: 6,  tf: 3, out: 1, min: 1, dem: 1 },
+  { n: 7,  tf: 5, out: 0, min: 1, dem: 1 },
+  { n: 8,  tf: 5, out: 1, min: 1, dem: 1 },
+  { n: 9,  tf: 5, out: 2, min: 1, dem: 1 },
+  { n: 10, tf: 7, out: 0, min: 2, dem: 1 },
+  { n: 11, tf: 7, out: 1, min: 2, dem: 1 },
+  { n: 12, tf: 7, out: 2, min: 2, dem: 1 },
+  { n: 13, tf: 9, out: 0, min: 3, dem: 1 },
+  { n: 14, tf: 9, out: 1, min: 3, dem: 1 },
+  { n: 15, tf: 9, out: 2, min: 3, dem: 1 },
+];
+
+function PlayerAidsShell({ game, mySeat, onSaveNotes }) {
+  const grim = game?.grimoire || {};
+  const features = game?.features || {};
+  const playerAidsOn = !!features.playerAids;
+  const [tab, setTab] = useState('role');
+  if (!playerAidsOn) return <AcceptedScreen seat={mySeat} />;
+  return (
+    <ScreenShell>
+      <div className="flex gap-1 border-b border-stone-800 mb-3">
+        {[
+          { id: 'role',   label: 'Role' },
+          { id: 'notes',  label: 'Notes' },
+          { id: 'script', label: 'Script' },
+        ].map(t => {
+          const isA = tab === t.id;
+          return (
+            <button key={t.id}
+              onClick={() => setTab(t.id)}
+              className={`flex-1 px-3 py-2 rounded-t text-sm font-medium border
+                ${isA
+                  ? 'bg-stone-900 border-x border-t border-amber-600/60 text-amber-200'
+                  : 'border-transparent text-stone-400 hover:text-amber-200'}`}>
+              {t.label}
+            </button>
+          );
+        })}
+      </div>
+      {tab === 'role'   && <PlayerAidsRoleTab   seat={mySeat} />}
+      {tab === 'notes'  && <PlayerAidsNotesTab  seat={mySeat} game={game} onSaveNotes={onSaveNotes} />}
+      {tab === 'script' && <PlayerAidsScriptTab game={game} />}
+    </ScreenShell>
+  );
+}
+
+function PlayerAidsRoleTab({ seat }) {
+  return (
+    <section className="parchment rounded-lg p-6 text-center space-y-4">
+      <div className="text-5xl">✓</div>
+      <div className="text-emerald-300 text-2xl font-bold">Role confirmed</div>
+      <p className="text-sm text-stone-300">
+        You're all set, <span className="text-amber-200 font-semibold">{seat.playerName}</span>.
+      </p>
+      <p className="text-xs text-stone-500">
+        Your role is hidden so no one can see it over your shoulder.
+        The storyteller will guide the rest of the game.
+      </p>
+      <div className="text-xs text-amber-200/80 pt-4 border-t border-stone-800">
+        Seat #{seat.seatNum}
+      </div>
+    </section>
+  );
+}
+
+function PlayerAidsNotesTab({ seat, game, onSaveNotes }) {
+  const grim = game?.grimoire || {};
+  const seats = (grim.seats || []).filter(s => s && s.actualRoleId);
+  const scriptIds = game?.characterIds || [];
+  const myNotes = (grim.playerNotes || {})[seat.seatNum] || {};
+  // Local draft synced to props (debounced save to grimoire).
+  const [draft, setDraft] = useState(() => myNotes);
+  React.useEffect(() => {
+    // If remote notes change (e.g. another device for this seat), keep up.
+    setDraft(myNotes);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [JSON.stringify(myNotes)]);
+  const [pickerFor, setPickerFor] = useState(null); // { seatNum, slotIdx }
+  // Debounced save.
+  const saveTimer = React.useRef(null);
+  const scheduleSave = (next) => {
+    setDraft(next);
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      onSaveNotes && onSaveNotes(next);
+    }, 300);
+  };
+  const setRoleForSeat = (targetNum, slotIdx, roleId) => {
+    const cur = draft[targetNum] || { roles: [], text: '' };
+    const roles = (cur.roles || []).slice();
+    if (roleId) roles[slotIdx] = roleId;
+    else roles[slotIdx] = null;
+    // Compact nulls so the array stays tidy.
+    const cleaned = roles.filter(Boolean);
+    const next = { ...draft, [targetNum]: { ...cur, roles: cleaned } };
+    scheduleSave(next);
+  };
+  const setTextForSeat = (targetNum, text) => {
+    const cur = draft[targetNum] || { roles: [], text: '' };
+    const next = { ...draft, [targetNum]: { ...cur, text } };
+    scheduleSave(next);
+  };
+  return (
+    <section className="space-y-2">
+      <div className="text-xs text-stone-400 text-center pb-2">
+        Record up to 3 role guesses + free notes per player. Visible to the storyteller.
+      </div>
+      {seats.map(s => {
+        const isMe = s.seatNum === seat.seatNum;
+        const note = draft[s.seatNum] || { roles: [], text: '' };
+        return (
+          <div key={s.seatNum} className={`parchment rounded p-2 ${isMe ? 'border-purple-700/50' : ''}`}>
+            <div className="flex items-baseline gap-2 mb-1.5">
+              <span className="text-amber-200/80 text-xs w-7 text-center font-semibold">#{s.seatNum}</span>
+              <span className="text-sm flex-1 min-w-0 truncate">
+                {s.playerName || <span className="text-stone-500 italic">—</span>}
+                {isMe && <span className="ml-1 text-[10px] text-purple-300">· you</span>}
+              </span>
+            </div>
+            <div className="flex gap-1 mb-1.5">
+              {[0, 1, 2].map(i => {
+                const rid = (note.roles || [])[i];
+                const rc = rid ? CHAR_BY_ID[rid] : null;
+                return (
+                  <button key={i}
+                    onClick={() => setPickerFor({ seatNum: s.seatNum, slotIdx: i })}
+                    className={`flex-1 card rounded px-1.5 py-1 flex items-center gap-1.5 text-left text-xs border
+                      ${rc ? 'border-stone-700' : 'border-dashed border-stone-700 text-stone-500'}`}>
+                    {rc && iconUrl(rc.id) && <img src={iconUrl(rc.id)} alt="" className="w-5 h-5 rounded-full object-cover flex-shrink-0" />}
+                    <span className={`flex-1 min-w-0 truncate ${rc ? `team-${rc.team}` : ''}`}>
+                      {rc?.name || '+ role'}
+                    </span>
+                    {rc && (
+                      <span onClick={(e) => { e.stopPropagation(); setRoleForSeat(s.seatNum, i, null); }}
+                        className="text-stone-500 hover:text-red-400 text-xs px-1 cursor-pointer">✕</span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+            <textarea
+              value={note.text || ''}
+              onChange={(e) => setTextForSeat(s.seatNum, e.target.value)}
+              placeholder="Notes…"
+              className="w-full text-xs bg-stone-900/60 border border-stone-700 rounded p-1.5 text-stone-200 placeholder-stone-500 resize-y min-h-[2rem]" />
+          </div>
+        );
+      })}
+      {pickerFor && (
+        <PlayerAidsRolePicker
+          scriptIds={scriptIds}
+          onPick={(roleId) => { setRoleForSeat(pickerFor.seatNum, pickerFor.slotIdx, roleId); setPickerFor(null); }}
+          onClose={() => setPickerFor(null)} />
+      )}
+    </section>
+  );
+}
+
+function PlayerAidsRolePicker({ scriptIds, onPick, onClose }) {
+  const chars = (scriptIds || [])
+    .map(id => CHAR_BY_ID[id])
+    .filter(Boolean);
+  const byTeam = { townsfolk: [], outsider: [], minion: [], demon: [] };
+  for (const c of chars) {
+    if (byTeam[c.team]) byTeam[c.team].push(c);
+  }
+  for (const k of Object.keys(byTeam)) byTeam[k].sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  const groups = [
+    { id: 'townsfolk', label: 'Townsfolk' },
+    { id: 'outsider',  label: 'Outsiders' },
+    { id: 'minion',    label: 'Minions' },
+    { id: 'demon',     label: 'Demons' },
+  ];
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-950/85 flex items-start sm:items-center justify-center p-2 sm:p-4 overflow-y-auto">
+      <div className="parchment rounded-lg p-3 sm:p-4 max-w-lg w-full space-y-3 my-4 border-2 border-amber-600/70">
+        <div className="flex items-baseline justify-between gap-2">
+          <h3 className="text-amber-200 font-semibold text-sm">Pick a role</h3>
+          <button onClick={onClose}
+            className="text-stone-400 hover:text-stone-200 text-xl leading-none">✕</button>
+        </div>
+        <div className="space-y-3 max-h-[70vh] overflow-y-auto">
+          {groups.map(g => {
+            const list = byTeam[g.id] || [];
+            if (list.length === 0) return null;
+            return (
+              <div key={g.id}>
+                <div className={`text-[11px] uppercase tracking-wider mb-1 team-${g.id}`}>{g.label}</div>
+                <ul className="grid grid-cols-2 gap-1">
+                  {list.map(rc => (
+                    <li key={rc.id}>
+                      <button onClick={() => onPick(rc.id)}
+                        className="w-full card rounded px-1.5 py-1 flex items-center gap-1.5 text-left text-xs hover:border-amber-500">
+                        {iconUrl(rc.id) && <img src={iconUrl(rc.id)} alt="" className="w-6 h-6 rounded-full object-cover flex-shrink-0" />}
+                        <span className={`flex-1 min-w-0 truncate team-${rc.team}`}>{rc.name}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PlayerAidsScriptTab({ game }) {
+  const scriptIds = game?.characterIds || [];
+  const seats = (game?.grimoire?.seats || []).filter(s => s && s.actualRoleId);
+  const seatCount = seats.length;
+  const [sub, setSub] = useState('script');
+  return (
+    <section className="space-y-2">
+      <div className="flex gap-1 border-b border-stone-800 mb-2">
+        {[
+          { id: 'script',  label: 'Script' },
+          { id: 'counts',  label: 'Player counts' },
+          { id: 'order',   label: 'Night order' },
+        ].map(t => {
+          const isA = sub === t.id;
+          return (
+            <button key={t.id}
+              onClick={() => setSub(t.id)}
+              className={`flex-1 px-2 py-1.5 rounded-t text-xs font-medium border
+                ${isA
+                  ? 'bg-stone-900 border-x border-t border-amber-600/60 text-amber-200'
+                  : 'border-transparent text-stone-400 hover:text-amber-200'}`}>
+              {t.label}
+            </button>
+          );
+        })}
+      </div>
+      {sub === 'script' && <PlayerAidsScriptList scriptIds={scriptIds} />}
+      {sub === 'counts' && <PlayerAidsCounts seatCount={seatCount} />}
+      {sub === 'order'  && <PlayerAidsNightOrder scriptIds={scriptIds} />}
+    </section>
+  );
+}
+
+function PlayerAidsScriptList({ scriptIds }) {
+  const chars = (scriptIds || []).map(id => CHAR_BY_ID[id]).filter(Boolean);
+  const byTeam = { townsfolk: [], outsider: [], minion: [], demon: [], traveller: [] };
+  for (const c of chars) {
+    if (byTeam[c.team]) byTeam[c.team].push(c);
+  }
+  for (const k of Object.keys(byTeam)) byTeam[k].sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  const groups = [
+    { id: 'townsfolk', label: 'Townsfolk' },
+    { id: 'outsider',  label: 'Outsiders' },
+    { id: 'minion',    label: 'Minions' },
+    { id: 'demon',     label: 'Demons' },
+    { id: 'traveller', label: 'Travellers' },
+  ];
+  return (
+    <div className="space-y-3">
+      {groups.map(g => {
+        const list = byTeam[g.id] || [];
+        if (list.length === 0) return null;
+        return (
+          <div key={g.id}>
+            <div className={`text-xs uppercase tracking-wider mb-1.5 team-${g.id}`}>{g.label} ({list.length})</div>
+            <ul className="space-y-1">
+              {list.map(rc => (
+                <li key={rc.id} className="card rounded p-2 flex items-start gap-2">
+                  {iconUrl(rc.id) && <img src={iconUrl(rc.id)} alt="" className="w-8 h-8 rounded-full border border-stone-700 object-cover flex-shrink-0" />}
+                  <div className="flex-1 min-w-0">
+                    <div className={`text-sm font-medium team-${rc.team}`}>{rc.name}</div>
+                    {rc.ability && (
+                      <div className="text-[11px] text-stone-300/85 leading-snug mt-0.5">{rc.ability}</div>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function PlayerAidsCounts({ seatCount }) {
+  return (
+    <div className="space-y-2">
+      <div className="text-xs text-stone-400 text-center pb-1">
+        Standard composition table. This game's row is highlighted.
+      </div>
+      <table className="w-full text-sm border-collapse">
+        <thead>
+          <tr className="text-[11px] uppercase tracking-wider text-stone-400 border-b border-stone-800">
+            <th className="text-left py-1 pl-2">Players</th>
+            <th className="py-1 team-townsfolk">TF</th>
+            <th className="py-1 team-outsider">Out</th>
+            <th className="py-1 team-minion">Min</th>
+            <th className="py-1 team-demon">Dem</th>
+          </tr>
+        </thead>
+        <tbody>
+          {PLAYER_COUNT_TABLE.map(row => {
+            const isCurrent = row.n === seatCount;
+            return (
+              <tr key={row.n} className={`text-center border-b border-stone-800/40
+                ${isCurrent ? 'bg-amber-900/30 text-amber-100 font-bold' : 'text-stone-300'}`}>
+                <td className="text-left py-1 pl-2">{row.n}{isCurrent && ' ← you'}</td>
+                <td>{row.tf}</td>
+                <td>{row.out}</td>
+                <td>{row.min}</td>
+                <td>{row.dem}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function PlayerAidsNightOrder({ scriptIds }) {
+  const nightOrder = (typeof window !== 'undefined' && window.BOTC_DATA && window.BOTC_DATA.nightOrder) || { firstNight: [], otherNight: [] };
+  const inScript = new Set(scriptIds || []);
+  const CEREMONIES = { dusk: 'Dusk', minioninfo: 'Minions wake', demoninfo: 'Demon wakes', lunaticinfo: 'Lunatic wakes', dawn: 'Dawn' };
+  const renderList = (ids) => (
+    <ol className="space-y-1">
+      {ids.filter(id => CEREMONIES[id] || inScript.has(id)).map((id, i) => {
+        const isCer = !!CEREMONIES[id];
+        const c = !isCer ? CHAR_BY_ID[id] : null;
+        return (
+          <li key={i + ':' + id} className="card rounded p-1.5 flex items-center gap-2 text-sm">
+            <span className="text-stone-500 text-xs w-6 text-center">{i + 1}</span>
+            {isCer ? (
+              <span className="text-amber-300 italic">{CEREMONIES[id]}</span>
+            ) : (
+              <>
+                {iconUrl(id) && <img src={iconUrl(id)} alt="" className="w-7 h-7 rounded-full border border-stone-700 object-cover flex-shrink-0" />}
+                <span className={`flex-1 min-w-0 truncate team-${c?.team || 'townsfolk'}`}>{c?.name || id}</span>
+              </>
+            )}
+          </li>
+        );
+      })}
+    </ol>
+  );
+  return (
+    <div className="space-y-3">
+      <div>
+        <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">First night</div>
+        {renderList(nightOrder.firstNight || [])}
+      </div>
+      <div>
+        <div className="text-xs uppercase tracking-wider text-amber-300 mb-1.5">Other nights</div>
+        {renderList(nightOrder.otherNight || [])}
+      </div>
+    </div>
   );
 }
 

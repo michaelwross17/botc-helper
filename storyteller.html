@@ -5634,6 +5634,7 @@ function App() {
 
       {!isSpectator && (
         <PageNav active={state.page} onChange={(p) => update({ page: p })}
+          playerAidsOn={!!state.features?.playerAids}
           grimoireReady={state.grimoire.generated}
           gameStarted={state.grimoire.gameStarted} />
       )}
@@ -5685,6 +5686,9 @@ function App() {
         />
       )}
 
+      {state.page === 'playernotes' && !isSpectator && (
+        <PlayerNotesPage state={state} />
+      )}
       {state.page === 'tokens' && !isSpectator && (
         <TokensPage state={state}
           onShowGrimoireToSeat={showGrimoireToSeat}
@@ -6147,7 +6151,7 @@ function spectatorJoinUrl(roomCode) {
   return `${siteBaseUrl()}storyteller.html?room=${roomCode}&view=spectator`;
 }
 
-function PageNav({ active, onChange, grimoireReady, gameStarted }) {
+function PageNav({ active, onChange, grimoireReady, gameStarted, playerAidsOn }) {
   const tabs = [
     { id: 'script',      label: 'Script Builder', sub: 'Pick characters' },
     { id: 'bag',         label: 'Bag Setup',      sub: 'Player count & composition' },
@@ -6155,6 +6159,9 @@ function PageNav({ active, onChange, grimoireReady, gameStarted }) {
     { id: 'nominations', label: 'Nominations',    sub: gameStarted ? 'Track each day' : 'Available once game begins' },
     { id: 'tokens',      label: 'Tokens',         sub: 'Show to players' },
   ];
+  if (playerAidsOn) {
+    tabs.push({ id: 'playernotes', label: 'Player Notes', sub: 'See player aid notes' });
+  }
   return (
     <nav className="sticky top-0 z-30 -mx-4 sm:-mx-6 px-4 sm:px-6 py-2 backdrop-blur bg-stone-950/80 border-b border-stone-800">
       <div className="flex gap-1">
@@ -6197,7 +6204,8 @@ function ScriptBuilderPage(props) {
 function FeaturesPanel({ features, onSetFeature }) {
   const [expanded, setExpanded] = useState(false);
   const automationOn = !!features.automation;
-  const anyOn = automationOn;
+  const playerAidsOn = !!features.playerAids;
+  const anyOn = automationOn || playerAidsOn;
   return (
     <section className="parchment rounded-lg p-3 sm:p-4 border-amber-700/50">
       <button onClick={() => setExpanded(e => !e)}
@@ -6208,7 +6216,10 @@ function FeaturesPanel({ features, onSetFeature }) {
           </h3>
           <p className="text-xs text-stone-400 mt-0.5">
             {anyOn
-              ? <>Enabled: {automationOn && <span className="text-amber-300">Automation</span>}</>
+              ? <>Enabled: {[
+                  automationOn && <span key="auto" className="text-amber-300">Automation</span>,
+                  playerAidsOn && <span key="aids" className="text-amber-300">Player aids</span>,
+                ].filter(Boolean).reduce((acc, el, i) => acc.length === 0 ? [el] : [...acc, <span key={'sep'+i} className="text-stone-500">{' · '}</span>, el], [])}</>
               : <>No optional features enabled</>}
             <span className="text-stone-500"> · click to {expanded ? 'collapse' : 'expand'}</span>
           </p>
@@ -6222,6 +6233,12 @@ function FeaturesPanel({ features, onSetFeature }) {
             description="During the night, click each step to prompt the right player's phone to make their choice (e.g. Poisoner picks a target). Submissions auto-place the reminder; questions raise a flag."
             checked={automationOn}
             onChange={(v) => onSetFeature('automation', v)}
+          />
+          <FeatureToggle
+            label="Player aids"
+            description="Adds a Player Notes tab to the storyteller after Tokens, and gives every remote player two extra tabs on their phone: Notes (per-seat role guesses + free text) and Script (role list, player count grid, night order)."
+            checked={playerAidsOn}
+            onChange={(v) => onSetFeature('playerAids', v)}
           />
           {/* Add more features here as they are built. */}
         </div>
@@ -9691,6 +9708,92 @@ function NominationRow({ index, nom, seatById = {}, nominator, nominee, readOnly
         </label>
       </div>
     </li>
+  );
+}
+
+// ---------------- Player Notes page ----------------
+//
+// Shows each remote player's recorded notes (per-seat role guesses + free
+// text) on a sub-tabbed page. Read-only.
+function PlayerNotesPage({ state }) {
+  const grim = state?.grimoire || {};
+  const seats = grim.seats || [];
+  // Remote (non-local) seats only — local players use the ST device.
+  const remoteSeats = seats.filter(s => s && !s.isLocal && s.actualRoleId);
+  const [activeSeat, setActiveSeat] = useState(() =>
+    remoteSeats[0] ? remoteSeats[0].seatNum : null);
+  const allNotes = grim.playerNotes || {};
+  const focused = remoteSeats.find(s => s.seatNum === activeSeat) || remoteSeats[0];
+  if (remoteSeats.length === 0) {
+    return (
+      <section className="parchment rounded-lg p-6 text-center space-y-3">
+        <h2 className="text-amber-200 text-lg font-semibold">Player Notes</h2>
+        <p className="text-sm text-stone-400">No remote players. Notes are recorded by remote phones only.</p>
+      </section>
+    );
+  }
+  const notesForFocused = focused ? (allNotes[focused.seatNum] || {}) : {};
+  return (
+    <section className="parchment rounded-lg p-3 sm:p-4 space-y-3">
+      <div className="flex items-baseline justify-between gap-2 mb-1">
+        <h2 className="text-amber-200 text-lg font-semibold">Player Notes</h2>
+        <span className="text-[10px] text-stone-500">Live updates as players type.</span>
+      </div>
+      <div className="flex flex-wrap gap-1 border-b border-stone-800 pb-2">
+        {remoteSeats.map(s => {
+          const isActive = focused && s.seatNum === focused.seatNum;
+          const hasNotes = Object.keys(allNotes[s.seatNum] || {}).length > 0;
+          return (
+            <button key={s.seatNum}
+              onClick={() => setActiveSeat(s.seatNum)}
+              className={`px-2.5 py-1.5 rounded text-xs font-medium border
+                ${isActive
+                  ? 'bg-stone-900 border-amber-600/70 text-amber-200'
+                  : 'border-stone-700 text-stone-400 hover:border-amber-500 hover:text-amber-200'}`}>
+              #{s.seatNum}{s.playerName ? ' · ' + s.playerName : ''}
+              {hasNotes && <span className="ml-1 text-amber-400">●</span>}
+            </button>
+          );
+        })}
+      </div>
+      {focused && (
+        <div className="space-y-1.5">
+          {seats.map(s => {
+            const note = notesForFocused[s.seatNum] || {};
+            const roles = (note.roles || []).map(id => CHAR_BY_ID[id]).filter(Boolean);
+            const text = note.text || '';
+            const empty = roles.length === 0 && !text;
+            return (
+              <div key={s.seatNum} className={`card rounded p-2 flex items-start gap-2 ${empty ? 'opacity-50' : ''}`}>
+                <span className="text-amber-200/80 text-xs w-7 text-center font-semibold pt-0.5">#{s.seatNum}</span>
+                <div className="flex-1 min-w-0 space-y-1">
+                  <div className="flex items-baseline justify-between gap-2">
+                    <span className="text-sm truncate">{s.playerName || <span className="text-stone-500 italic">—</span>}</span>
+                    {focused.seatNum === s.seatNum && <span className="text-[10px] uppercase text-purple-300">self</span>}
+                  </div>
+                  {roles.length > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {roles.map((rc, i) => (
+                        <span key={i} className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 border text-[11px] team-${rc.team} border-stone-700 bg-stone-900/50`}>
+                          {iconUrl(rc.id) && <img src={iconUrl(rc.id)} alt="" className="w-4 h-4 rounded-full object-cover" />}
+                          {rc.name}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {text && (
+                    <div className="text-xs text-stone-300/90 leading-snug whitespace-pre-wrap break-words">{text}</div>
+                  )}
+                  {empty && (
+                    <div className="text-[11px] text-stone-500 italic">(no notes)</div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
   );
 }
 
