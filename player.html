@@ -34,6 +34,7 @@
 
 <!-- Shared character data (so the player can see role icons later when revealed) -->
 <script src="data/characters.js"></script>
+<script src="data/night_order.js"></script>
 
 <style>
   body { background: #0f0f14; color: #f1e9d2; font-family: ui-sans-serif, system-ui, sans-serif; min-height: 100dvh; }
@@ -2065,7 +2066,7 @@ function PlayerAidsNotesTab({ seat, game, onSaveNotes }) {
   return (
     <section className="space-y-2">
       <div className="text-xs text-stone-400 text-center pb-2">
-        Record up to 3 role guesses + free notes per player. Visible to the storyteller.
+        Record up to 3 role guesses + free notes per player.
       </div>
       {seats.map(s => {
         const isMe = s.seatNum === seat.seatNum;
