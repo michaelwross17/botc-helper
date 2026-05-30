@@ -15822,6 +15822,15 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
     const reminder = (isFirstNight ? c.firstNightReminder : c.otherNightReminder) || '';
     let def = nightActionFor(id);
     let phaseOk = def.phase === 'both' || (def.phase === 'first' && isFirstNight) || (def.phase === 'other' && !isFirstNight);
+    // Cannibal override: if any matched seat is a Cannibal-swapped seat
+    // (carries a 'Was Cannibal' marker), allow the borrowed role's ability
+    // to fire regardless of phase - the Cannibal gets the ability the night
+    // AFTER eating, not on the role's natural night-order phase.
+    if (!phaseOk) {
+      const anyCannibal = matched.some(seat => (seat.reminders || []).some(r =>
+        r && r.charId === 'cannibal' && /^was cannibal/i.test(String(r.label || ''))));
+      if (anyCannibal) phaseOk = true;
+    }
     let effectiveAction = phaseOk ? def.action : 'manual';
     // Godfather is special: first night = info-st showing in-play Outsiders;
     // other nights = target1 (kill someone) ONLY when Died Today is on their
