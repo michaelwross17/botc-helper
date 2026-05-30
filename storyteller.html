@@ -11053,6 +11053,9 @@ const NIGHT_ACTIONS = {
                    responseConfig: { min: 0, max: 2, label: 'players woke', display: 'Players who woke tonight' } },
   grandmother:   { action: 'info-st',     reminder: 'Saw',         instruction: 'Show the Grandmother her Grandchild and their character.', phase: 'first',
                    infoType: 'seat+role',  infoConfig: { suggestion: 'grandchild' } },
+  pixie:         { action: 'info-st',     reminder: 'Saw',         instruction: 'On the first night, you learn 1 in-play Townsfolk — the character you are mad about. If they die while you are mad, you gain their ability.', phase: 'first',
+                   oncePerGame: true,
+                   infoType: 'role',       infoConfig: { display: 'You are mad about the' } },
   undertaker:    { action: 'info-st',     reminder: 'Saw',         instruction: 'You learn which character was executed today.', phase: 'other',
                    infoType: 'role',       infoConfig: { display: 'The executed player was the' } },
 
@@ -11622,6 +11625,22 @@ function computeChambermaidSuggestion(targetSeats, isFirstNight) {
   };
 }
 
+// Pixie first-night suggestion: read the 'Mad about <Role>' reminder on
+// the Pixie's seat and return the corresponding role's id so the
+// InfoPickerModal pre-highlights it.
+function computePixieSuggestion(mySeat) {
+  if (!mySeat) return null;
+  const marker = (mySeat.reminders || []).find(r =>
+    r && r.charId === 'pixie' && /^mad about\s+/i.test(String(r.label || '')));
+  if (!marker) return null;
+  const name = String(marker.label).replace(/^mad about\s+/i, '').trim();
+  if (!name) return null;
+  const role = Object.values(CHAR_BY_ID).find(c =>
+    c && c.name && c.name.toLowerCase() === name.toLowerCase());
+  if (!role) return null;
+  return { value: role.id, breakdown: { roleName: role.name } };
+}
+
 // Top-level dispatch — returns a suggestion for any info role we can compute.
 // ctx supplies extra context for roles that need history (viewingDayIndex,
 // nominationsByDay, daysSnapshots, etc.).
@@ -11637,6 +11656,7 @@ function infoSuggestion(roleId, mySeat, seats, ctx) {
     case 'undertaker':    return computeUndertakerSuggestion(ctx);
     case 'grandmother':   return computeGrandmotherSuggestion(seats);
     case 'juggler':       return computeJugglerCorrectCount(seats);
+    case 'pixie':         return computePixieSuggestion(mySeat);
     default:              return null;
   }
 }
