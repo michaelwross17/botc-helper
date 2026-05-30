@@ -1813,6 +1813,17 @@ function App() {
   // Huntsman picker — not-in-play TF candidates for the Damsel's new role.
   const [huntsmanPickData, setHuntsmanPickData] = useState(null);
   const cancelHuntsmanPick = () => setHuntsmanPickData(null);
+  // Boomdandy: ST picks players to execute so 3 remain alive.
+  // { dyingLabel, candidates, needKill }.
+  const [boomdandyPickData, setBoomdandyPickData] = useState(null);
+  const cancelBoomdandyPick = () => setBoomdandyPickData(null);
+  const applyBoomdandyPick = (seatNums) => {
+    if (!Array.isArray(seatNums) || seatNums.length === 0) { setBoomdandyPickData(null); return; }
+    for (const sn of seatNums) {
+      try { _killSeatDirect(sn, 'boomdandy', 'Dead', true); } catch (e) { /* ignore */ }
+    }
+    setBoomdandyPickData(null);
+  };
   const applyHuntsmanPick = (newRoleId) => {
     const data = huntsmanPickData;
     if (!data || !newRoleId) { setHuntsmanPickData(null); return; }
@@ -4514,6 +4525,91 @@ function App() {
         }), 0);
       }
     }
+    // Pixie — if the Pixie's 'Mad about <Role>' marker matches the dying
+    // seat's actualRoleId, fire the gain-ability popup (drunk/poison aware
+    // on the Pixie). Accept: place permanent 'Pixie is: <Role>' on the
+    // Pixie + flip Pixie's perceivedRoleId so the step builder wakes them
+    // with that role's slot.
+    {
+      const pixie = (state.grimoire.seats || []).find(s => s.actualRoleId === 'pixie');
+      const pixieAfflicted = pixie ? isDrunkOrPoisoned(pixie) : false;
+      const madMarker = pixie && (pixie.reminders || []).find(r =>
+        r && r.charId === 'pixie' && /^mad about\s+/i.test(String(r.label || '')));
+      if (pixie && !pixieAfflicted && madMarker && dyingSeat && dyingSeat.actualRoleId) {
+        const madRoleName = String(madMarker.label).replace(/^mad about\s+/i, '').trim();
+        const dyingRoleName = (CHAR_BY_ID[dyingSeat.actualRoleId] || {}).name || '';
+        if (madRoleName && dyingRoleName && madRoleName.toLowerCase() === dyingRoleName.toLowerCase()) {
+          const alreadyGot = (pixie.reminders || []).some(r =>
+            r && r.charId === 'pixie' && /^pixie is:/i.test(String(r.label || '')));
+          if (!alreadyGot) {
+            const pixieLabel = pixie.playerName ? pixie.playerName + ' (seat #' + pixie.seatNum + ')' : 'seat #' + pixie.seatNum;
+            const matchedRoleId = dyingSeat.actualRoleId;
+            setTimeout(() => addCornerPrompt({
+              kind: 'warn',
+              title: 'Pixie\'s mad-about role died',
+              body: 'The ' + dyingRoleName + ' just died, and the Pixie (' + pixieLabel + ') is mad about being the ' + dyingRoleName + '. The Pixie may now gain that ability.',
+              actions: [
+                { label: 'Pixie gets ability', primary: true, onClick: () => {
+                  update(s => {
+                    const seats2 = (s.grimoire.seats || []).map(seat => {
+                      if (seat.seatNum !== pixie.seatNum) return seat;
+                      // Place 'Pixie is: <Role>' marker (permanent) and
+                      // flip perceivedRoleId so night-order wakes them.
+                      return { ...seat,
+                        perceivedRoleId: matchedRoleId,
+                        reminders: [...(seat.reminders || []), { charId: 'pixie', label: 'Pixie is: ' + dyingRoleName, fromPrompt: true }] };
+                    });
+                    return { grimoire: { ...s.grimoire, seats: seats2 } };
+                  });
+                  addCornerPrompt({
+                    kind: 'success',
+                    title: 'Pixie gained ' + dyingRoleName,
+                    body: 'The Pixie is now treated as the ' + dyingRoleName + ' for wake order. Their actual role is still Pixie; the "Pixie is" marker tracks the new ability.',
+                    actions: [{ label: 'OK', primary: true }],
+                  });
+                } },
+                { label: 'Ignore' },
+              ],
+            }), 0);
+          }
+        }
+      }
+    }
+    // Boomdandy — on execution, the ST may execute additional players so only
+    // 3 remain alive. Fire Ignore / Execute popup; Execute opens a picker.
+    if (dyingSeat.actualRoleId === 'boomdandy' && isDayDeath) {
+      setTimeout(() => {
+        // Compute candidates AT POPUP TIME so the alive count is accurate.
+        const seatsNow = state.grimoire.seats || [];
+        const alive = seatsNow.filter(s => !s.isDead && s.actualRoleId && s.seatNum !== dyingSeat.seatNum);
+        const targetKeep = 3;
+        const toKill = Math.max(0, alive.length - targetKeep);
+        if (toKill <= 0) {
+          addCornerPrompt({
+            kind: 'warn',
+            title: 'Boomdandy executed — already at ≤3 alive',
+            body: seatLabel + ' (Boomdandy) was executed. There are already ' + alive.length + ' alive players (target: 3). No additional executions needed.',
+            actions: [{ label: 'OK', primary: true }],
+          });
+          return;
+        }
+        addCornerPrompt({
+          kind: 'warn',
+          title: 'Boomdandy executed',
+          body: seatLabel + ' (Boomdandy) was executed. You may execute ' + toKill + ' more player' + (toKill === 1 ? '' : 's') + ' so only 3 remain alive.',
+          actions: [
+            { label: 'Execute players', primary: true, onClick: () => {
+              setBoomdandyPickData({
+                dyingLabel: seatLabel,
+                candidates: alive,
+                needKill: toKill,
+              });
+            } },
+            { label: 'Ignore' },
+          ],
+        });
+      }, 0);
+    }
     // Banshee — killed by the Demon. ST announces + Banshee gains new ability.
     if (dyingSeat.actualRoleId === 'banshee' && !afflicted) {
       const causeTeam = causeCharId ? (CHAR_BY_ID[causeCharId] || {}).team : null;
@@ -4789,10 +4885,58 @@ function App() {
     }
   };
 
+  // Puzzlemaster guess — claimant claims Puzzlemaster, target is the player
+  // they guess is drunk. Special-case before generic kill flow.
+  const _resolvePuzzlemasterGuess = ({ claimantSeatNum, targetSeatNum, dayIdx }) => {
+    const claimant = _seatBy(claimantSeatNum);
+    const target = _seatBy(targetSeatNum);
+    if (!claimant || !target) return;
+    const claimantLabel = _seatLabel(claimant);
+    const targetLabel = _seatLabel(target);
+    const isReal = claimant.actualRoleId === 'puzzlemaster';
+    const logAudit = (outcome) => appendDayEntry(dayIdx, {
+      kind: 'claim', roleId: 'puzzlemaster', claimantSeat: claimantSeatNum, targetSeat: targetSeatNum, outcome,
+    });
+    if (!isReal) {
+      logAudit('pm-fake');
+      addCornerPrompt({
+        kind: 'warn',
+        title: 'Puzzlemaster guess — not the Puzzlemaster',
+        body: claimantLabel + ' is not the Puzzlemaster. The guess has no effect.',
+        actions: [{ label: 'OK', primary: true }],
+      });
+      return;
+    }
+    // Real Puzzlemaster. Always place ability-used marker.
+    _placeReminderInline(claimantSeatNum, 'puzzlemaster', 'No ability');
+    const targetIsDrunk = (target.reminders || []).some(r =>
+      r && r.charId === 'puzzlemaster' && /drunk/i.test(String(r.label || '')));
+    if (targetIsDrunk) {
+      logAudit('pm-correct');
+      addCornerPrompt({
+        kind: 'success',
+        title: 'Puzzlemaster guessed correctly',
+        body: claimantLabel + ' (Puzzlemaster) correctly guessed ' + targetLabel + ' as the drunk player. Privately confirm to the Puzzlemaster.',
+        actions: [{ label: 'OK', primary: true }],
+      });
+    } else {
+      logAudit('pm-wrong');
+      addCornerPrompt({
+        kind: 'warn',
+        title: 'Puzzlemaster guessed wrong',
+        body: claimantLabel + ' (Puzzlemaster) guessed ' + targetLabel + ', but that is NOT the drunk player. Privately give them false info (point at any seat).',
+        actions: [{ label: 'OK', primary: true }],
+      });
+    }
+  };
+
   const resolveClaimAndKill = ({ roleId, label, claimantSeatNum, targetSeatNum, dayIdx }) => {
     // Damsel guess: dispatch to its own handler.
     if (roleId === 'damsel') {
       return _resolveDamselGuess({ claimantSeatNum, targetSeatNum, dayIdx });
+    }
+    if (roleId === 'puzzlemaster') {
+      return _resolvePuzzlemasterGuess({ claimantSeatNum, targetSeatNum, dayIdx });
     }
     const claimant = _seatBy(claimantSeatNum);
     const target = _seatBy(targetSeatNum);
@@ -5483,7 +5627,7 @@ function App() {
           ability fired" leaking that they just targeted the Fool).
           The popups reappear the moment the ST taps "Return to
           storyteller" and the overlay closes. */}
-      {cornerPrompts.length > 0 && localOverlayStep == null && localGrimoireSeat == null && moonchildPickSeat == null && klutzPickSeat == null && vigorPickData == null && pixiePickData == null && huntsmanPickData == null && evilTwinModalData == null && lunaticPickerData == null && (
+      {cornerPrompts.length > 0 && localOverlayStep == null && localGrimoireSeat == null && moonchildPickSeat == null && klutzPickSeat == null && vigorPickData == null && pixiePickData == null && huntsmanPickData == null && boomdandyPickData == null && evilTwinModalData == null && lunaticPickerData == null && (
         <STCornerPrompts
           prompts={cornerPrompts}
           onAction={(promptId, actionIdx) => {
@@ -5536,6 +5680,13 @@ function App() {
           data={huntsmanPickData}
           onApply={applyHuntsmanPick}
           onCancel={cancelHuntsmanPick}
+        />
+      )}
+      {boomdandyPickData != null && (
+        <BoomdandyPickModal
+          data={boomdandyPickData}
+          onApply={applyBoomdandyPick}
+          onCancel={cancelBoomdandyPick}
         />
       )}
       {evilTwinModalData != null && (
@@ -9206,6 +9357,9 @@ function NominationRow({ index, nom, seatById = {}, nominator, nominee, readOnly
       'damsel-already-guessed': 'Damsel guess already used — no effect',
       'damsel-no-minion':     'claimant is not a Minion — no effect',
       'damsel-not-in-play':   'no Damsel in play (e.g. Huntsman swapped)',
+      'pm-correct':           'is the Puzzlemaster — guessed the drunk player correctly',
+      'pm-wrong':             'is the Puzzlemaster — guessed wrong, gets false info',
+      'pm-fake':              'is not the Puzzlemaster — no effect',
       'juggler-real':   (nom.correctCount != null && nom.jugglerPicks ? (nom.correctCount + ' / ' + nom.jugglerPicks.length + ' correct') : 'guesses recorded'),
       'juggler-drunk':  'drunk/poisoned — no Correct markers placed',
     })[nom.outcome] || nom.outcome || '';
@@ -10781,8 +10935,6 @@ const NIGHT_ACTIONS = {
   pithag:        { action: 'target1+role-claim', reminder: 'Was',  instruction: 'Choose a player (not yourself) and a character. If that character is not in play, the player becomes that character. Otherwise, they get a reminder marker.', eligible: 'others', roleClaimFilter: 'all' },
   clockmaker:    { action: 'info-st',     reminder: 'Saw',         instruction: 'On the first night, you learn how many steps clockwise from the Demon to the nearest Minion.', phase: 'first',
                    infoType: 'number',    infoConfig: { min: 1, max: 10, label: 'steps', display: 'Demon → nearest Minion (clockwise):' } },
-  puzzlemaster:  { action: 'target1any',  reminder: 'Used',        instruction: 'Choose a player — you learn who is drunk. If you guessed correctly, you learn nothing extra; if wrong, you get false info. ST reveals the seat with the Puzzlemaster: Drunk marker.',
-                   eligible: 'others', oncePerGame: true, canSkip: true, phase: 'other' },
   sage:          { action: 'info-st',     reminder: 'Shown',       instruction: 'If killed by the Demon, learn 2 players — one is the Demon.', phase: 'other',
                    requiresDeath: true, oncePerGame: true,
                    infoType: 'seats',     infoConfig: { numSeats: 2, display: 'One of these players is the demon:' } },
@@ -12541,6 +12693,7 @@ const DAY_ABILITY_ROLES = [
   { id: 'savant',     label: 'Savant claim',     kind: 'claim-only',   icon: 'savant',     hint: 'Each day, the Savant asks the ST for 2 facts — 1 true, 1 false (repeatable).' },
   { id: 'fisherman',  label: 'Fisherman claim',  kind: 'claim-only',   icon: 'fisherman',  hint: 'Fisherman asks the ST for advice (once per game).' },
   { id: 'damsel',     label: 'Damsel guess',     kind: 'claim-target', icon: 'damsel',     hint: 'Pick the Minion claimant, then the player they guess is the Damsel.' },
+  { id: 'puzzlemaster', label: 'Puzzlemaster guess', kind: 'claim-target', icon: 'puzzlemaster', hint: 'Pick the Puzzlemaster claimant, then the player they guess is drunk.' },
   { id: 'juggler',    label: 'Juggler claim',    kind: 'claim-juggler', icon: 'juggler',   hint: 'Up to 5 (player + character) public guesses (once per game).' },
 ];
 
@@ -13152,6 +13305,87 @@ function PixiePickerModal({ data, onApply, onCancel }) {
                 ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40'
                 : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
             Place marker →
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BoomdandyPickModal({ data, onApply, onCancel }) {
+  const [picked, setPicked] = useState([]);
+  if (!data) return null;
+  const cands = data.candidates || [];
+  const need = data.needKill || 0;
+  const toggle = (n) => {
+    setPicked(prev => {
+      if (prev.includes(n)) return prev.filter(x => x !== n);
+      if (prev.length >= need) return prev;
+      return [...prev, n];
+    });
+  };
+  const ready = picked.length === need;
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-950/85 flex items-start sm:items-center justify-center p-2 sm:p-4 overflow-y-auto">
+      <div className="parchment rounded-lg p-4 sm:p-5 max-w-lg w-full space-y-3 my-4 border-2 border-red-700/70">
+        <div className="flex items-center gap-3">
+          {iconUrl('boomdandy') && (
+            <img src={iconUrl('boomdandy')} alt=""
+              className="w-12 h-12 rounded-full border-2 border-red-700 object-cover flex-shrink-0" />
+          )}
+          <div className="flex-1 min-w-0">
+            <div className="text-[10px] uppercase tracking-wider text-red-300">Minion · execution chain</div>
+            <div className="text-amber-200 text-lg font-bold leading-tight">Boomdandy executed</div>
+            <div className="text-xs text-stone-400 mt-0.5">{data.dyingLabel} — execute {need} more so only 3 remain alive.</div>
+          </div>
+        </div>
+        <div className="text-[11px] text-stone-300 leading-snug border-l-2 border-red-700/50 pl-2">
+          Pick exactly {need} player{need === 1 ? '' : 's'}. Selected seats are killed immediately.
+        </div>
+        {cands.length === 0 ? (
+          <div className="text-sm text-stone-400 italic text-center py-3">No additional alive players to execute.</div>
+        ) : (
+          <ul className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-80 overflow-y-auto">
+            {cands.map(c => {
+              const rc = CHAR_BY_ID[c.actualRoleId];
+              const isP = picked.includes(c.seatNum);
+              const order = isP ? picked.indexOf(c.seatNum) + 1 : null;
+              return (
+                <li key={c.seatNum}>
+                  <button onClick={() => toggle(c.seatNum)}
+                    className={`w-full card rounded p-2 flex items-center gap-2 text-left
+                      ${isP ? 'border-red-500 bg-red-900/30 ring-1 ring-red-700' : 'hover:border-red-500'}`}>
+                    <span className="text-stone-400 text-xs w-7 text-center font-semibold">#{c.seatNum}</span>
+                    {iconUrl(c.actualRoleId) && (
+                      <img src={iconUrl(c.actualRoleId)} alt=""
+                        className="w-8 h-8 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                    )}
+                    <div className="flex-1 min-w-0 leading-tight">
+                      <div className="text-sm truncate">{c.playerName || <span className="text-stone-500 italic">—</span>}</div>
+                      <div className={`text-[10px] uppercase tracking-wider truncate team-${rc?.team || 'townsfolk'}`}>
+                        {rc?.name || '(no role)'}
+                      </div>
+                    </div>
+                    {order != null && <span className="text-red-300 text-xs font-bold bg-red-900/70 rounded-full w-5 h-5 flex items-center justify-center">{order}</span>}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        <div className="text-[11px] text-stone-400 text-center">{picked.length} / {need} selected</div>
+        <div className="grid grid-cols-2 gap-2 pt-1">
+          <button onClick={onCancel}
+            className="py-2.5 rounded-lg text-sm font-semibold bg-stone-800 hover:bg-stone-700 text-stone-300 border border-stone-700">
+            Cancel
+          </button>
+          <button onClick={() => ready && onApply(picked)}
+            disabled={!ready}
+            className={`py-2.5 rounded-lg text-sm font-bold transition
+              ${ready
+                ? 'bg-red-700 hover:bg-red-600 text-stone-100 shadow-lg shadow-red-900/40'
+                : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+            Execute {need} player{need === 1 ? '' : 's'} →
           </button>
         </div>
       </div>
