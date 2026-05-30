@@ -1331,14 +1331,19 @@ function App() {
       const magician = seats.find(x => x.actualRoleId === 'magician' && !x.isDead);
       const realDemon = seats.find(x => (CHAR_BY_ID[x.actualRoleId] || {}).team === 'demon');
       const realMinions = seats.filter(x => (CHAR_BY_ID[x.actualRoleId] || {}).team === 'minion');
+      // The Marionette is team 'minion' but plays as a good character. They
+      // do NOT receive minion info and are NOT shown as a fellow minion to
+      // anyone — the Demon learns of them separately via marionetteSeat.
+      const realMinionsNoMario = realMinions.filter(x => x.actualRoleId !== 'marionette');
+      const marionetteSeatObj = realMinions.find(x => x.actualRoleId === 'marionette') || null;
       const seatMini = (sx) => ({ seatNum: sx.seatNum, playerName: sx.playerName || null });
       if (ceremonyId === 'minioninfo') {
         const demonShown = magician || realDemon;
         const demonInfo = demonShown ? seatMini(demonShown) : null;
-        const minionList = realMinions.map(seatMini);
+        const minionList = realMinionsNoMario.map(seatMini);
         // Damsel-in-play flag: minions learn that a Damsel exists (no seat).
         const damselInPlay = !!seats.find(x => x.actualRoleId === 'damsel');
-        for (const m of realMinions) {
+        for (const m of realMinionsNoMario) {
           const others = minionList.filter(x => x.seatNum !== m.seatNum);
           np[m.seatNum] = {
             roleId: m.actualRoleId,
@@ -1361,7 +1366,7 @@ function App() {
           };
         }
       } else if (ceremonyId === 'demoninfo') {
-        const minionList = realMinions.map(seatMini);
+        const minionList = realMinionsNoMario.map(seatMini);
         const minionsForDemon = magician
           ? [...minionList, seatMini(magician)]
           : minionList;
@@ -1390,6 +1395,7 @@ function App() {
               minions: minionsForDemon,
               bluffs,
               lunaticSeat: lunaticInfo,
+              marionetteSeat: marionetteSeatObj ? seatMini(marionetteSeatObj) : null,
             },
             ceremony: 'demoninfo',
             startedAt: Date.now(),
