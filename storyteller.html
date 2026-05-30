@@ -16192,6 +16192,64 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
       }
     }
   }
+  // Cannibal borrowed-role injection. If a Cannibal-swapped seat's current
+  // actualRoleId isn't in the current night-order list (e.g. Investigator,
+  // Washerwoman — phase='first' roles iterated only on night 1), build a
+  // synthetic interactive step for that role and splice it in before Dawn
+  // so the Cannibal can act on the borrowed ability.
+  {
+    const cannibalSwappedSeats = (seats || []).filter(s =>
+      (s.reminders || []).some(r => r && r.charId === 'cannibal' && /^was cannibal/i.test(String(r.label || '')))
+    );
+    for (const canSeat of cannibalSwappedSeats) {
+      const borrowedId = canSeat.actualRoleId;
+      if (!borrowedId || borrowedId === 'cannibal') continue;
+      // Skip if the role is already iterated in the current night order
+      // (the phase override in the main loop already handles those).
+      if (orderList.includes(borrowedId)) continue;
+      // Skip if the role isn't a night role at all (no firstNight slot).
+      const firstOrder = (nightOrder && nightOrder.firstNight) || [];
+      if (!firstOrder.includes(borrowedId)) continue;
+      const c = CHAR_BY_ID[borrowedId];
+      if (!c) continue;
+      const def = nightActionFor(borrowedId);
+      stepNum += 1;
+      // Use the role's firstNight reminder text since the otherNight slot
+      // doesn't apply — this is essentially a first-night-style ability use.
+      const reminderText = c.firstNightReminder || c.otherNightReminder || '';
+      const rawPrompt = nightPrompts[canSeat.seatNum];
+      const prompt = (rawPrompt && rawPrompt.ceremony) ? null : rawPrompt;
+      const synthStep = {
+        type: 'char',
+        stepNum,
+        char: c,
+        seat: canSeat,
+        reminder: reminderText,
+        isExtra: false,
+        action: def.action || 'manual',
+        instruction: def.instruction || '',
+        reminderLabel: def.reminder || '',
+        requiresDeath: !!def.requiresDeath,
+        oncePerGame: !!def.oncePerGame,
+        canSkip: !!def.canSkip,
+        infoType: def.infoType,
+        infoConfig: def.infoConfig,
+        prompt,
+      };
+      // Splice before Dawn ceremony if present, else append at end.
+      const dawnIdx = steps.findIndex(s => s.type === 'ceremony' && s.id === 'dawn');
+      if (dawnIdx >= 0) {
+        steps.splice(dawnIdx, 0, synthStep);
+      } else {
+        steps.push(synthStep);
+      }
+    }
+    // Renumber char steps so the UI shows clean ordering.
+    let n = 0;
+    for (const s of steps) {
+      if (s.type === 'char') { n += 1; s.stepNum = n; }
+    }
+  }
   // Klutz after-dawn injection. When any Klutz seat carries the 'Triggered'
   // reminder (placed on night death by firePassiveDeathTriggers), splice a
   // synthetic klutz-capture step right after Dawn so the ST opens the picker
