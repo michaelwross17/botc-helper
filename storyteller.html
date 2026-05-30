@@ -1791,6 +1791,80 @@ function App() {
     });
   };
   const cancelKlutzPick = () => setKlutzPickSeat(null);
+  // Pixie setup picker — list of in-play TF, ST picks one, marker placed on
+  // the Pixie seat. State holds { pixieSeatNum, candidates }.
+  const [pixiePickData, setPixiePickData] = useState(null);
+  const cancelPixiePick = () => setPixiePickData(null);
+  const applyPixiePick = (roleId) => {
+    const data = pixiePickData;
+    if (!data || !roleId) { setPixiePickData(null); return; }
+    const rc = CHAR_BY_ID[roleId];
+    update(s => {
+      const seats2 = (s.grimoire.seats || []).map(seat => {
+        if (seat.seatNum !== data.pixieSeatNum) return seat;
+        const reminders = (seat.reminders || []).filter(r =>
+          !(r && r.charId === 'pixie' && /^mad about/i.test(String(r.label || ''))));
+        return { ...seat, reminders: [...reminders, { charId: 'pixie', label: 'Mad about ' + (rc?.name || roleId), fromPrompt: true }] };
+      });
+      return { grimoire: { ...s.grimoire, seats: seats2 } };
+    });
+    setPixiePickData(null);
+  };
+  // Huntsman picker — not-in-play TF candidates for the Damsel's new role.
+  const [huntsmanPickData, setHuntsmanPickData] = useState(null);
+  const cancelHuntsmanPick = () => setHuntsmanPickData(null);
+  const applyHuntsmanPick = (newRoleId) => {
+    const data = huntsmanPickData;
+    if (!data || !newRoleId) { setHuntsmanPickData(null); return; }
+    const pick = CHAR_BY_ID[newRoleId];
+    if (!pick) { setHuntsmanPickData(null); return; }
+    const damselSeatNum = data.damselSeatNum;
+    update(s => {
+      const seats2 = (s.grimoire.seats || []).map(seat => {
+        if (seat.seatNum !== damselSeatNum) return seat;
+        return { ...seat,
+          actualRoleId: pick.id,
+          perceivedRoleId: pick.id,
+          reminders: [...(seat.reminders || []), { charId: 'huntsman', label: 'Was Damsel', fromPrompt: true }] };
+      });
+      const np = { ...(s.grimoire.nightPrompts || {}) };
+      np[String(damselSeatNum)] = {
+        roleId: pick.id,
+        action: 'info-st',
+        instruction: 'Your role has changed — see below.',
+        reminderLabel: '',
+        eligible: 'all',
+        status: 'awaiting',
+        targets: null,
+        infoPayload: { type: 'role-alignment', roleId: pick.id, alignment: 'good' },
+        ceremony: 'huntsman-convert',
+        startedAt: Date.now(),
+        nightIdx: s.grimoire.viewingDayIndex || 0,
+      };
+      return { grimoire: { ...s.grimoire, seats: seats2, nightPrompts: np } };
+    });
+    setHuntsmanPickData(null);
+  };
+  // Dispatcher invoked by setup-reminder action buttons.
+  const onSetupReminderActionApp = (kind) => {
+    if (kind === 'pixie-madabout') {
+      const seats0 = state.grimoire.seats || [];
+      const pixie = seats0.find(s => s.actualRoleId === 'pixie');
+      if (!pixie) return;
+      const candidates = seats0
+        .map(s => CHAR_BY_ID[s.actualRoleId])
+        .filter(rc => rc && rc.team === 'townsfolk');
+      // Dedupe by role id.
+      const seen = new Set();
+      const uniq = [];
+      for (const rc of candidates) {
+        if (seen.has(rc.id)) continue;
+        seen.add(rc.id);
+        uniq.push(rc);
+      }
+      setPixiePickData({ pixieSeatNum: pixie.seatNum, candidates: uniq });
+    }
+  };
   const cancelVigorPick = () => setVigorPickData(null);
   const applyVigorPick = (pickedSeatNum) => {
     if (pickedSeatNum == null) { setVigorPickData(null); return; }
@@ -2989,47 +3063,12 @@ function App() {
             const candidates = scriptIds
               .map(id => CHAR_BY_ID[id])
               .filter(rc => rc && rc.team === 'townsfolk' && !inPlayIds.has(rc.id));
-            const pick = candidates.length > 0
-              ? candidates[Math.floor(Math.random() * candidates.length)]
-              : null;
-            if (pick) {
-              const seatsCopy = baseSeats.map(s => {
-                if (s.seatNum !== targetSeatNum) return s;
-                return { ...s,
-                  actualRoleId: pick.id,
-                  perceivedRoleId: pick.id,
-                  reminders: [...(s.reminders || []), { charId: 'huntsman', label: 'Was Damsel', fromPrompt: true }] };
-              });
-              next.__seatsCopy = seatsCopy;
-              const tgtLabel = tgt.playerName ? tgt.playerName + ' (seat #' + tgt.seatNum + ')' : 'seat #' + tgt.seatNum;
-              setTimeout(() => addCornerPrompt({
-                kind: 'success',
-                title: 'Huntsman hit the Damsel',
-                body: tgtLabel + ' was the Damsel and is now the ' + pick.name + ' (random not-in-play Townsfolk). Wake them — their phone will show the new role.',
-                actions: [{ label: 'OK', primary: true }],
-              }), 0);
-              // Push a role-alignment reveal prompt to the converted player.
-              next[String(targetSeatNum)] = {
-                roleId: pick.id,
-                action: 'info-st',
-                instruction: 'Your role has changed — see below.',
-                reminderLabel: '',
-                eligible: 'all',
-                status: 'awaiting',
-                targets: null,
-                infoPayload: { type: 'role-alignment', roleId: pick.id, alignment: 'good' },
-                ceremony: 'huntsman-convert',
-                startedAt: Date.now(),
-                nightIdx: state.grimoire.viewingDayIndex || 0,
-              };
-            } else {
-              setTimeout(() => addCornerPrompt({
-                kind: 'warn',
-                title: 'Huntsman hit the Damsel — no swap available',
-                body: 'Damsel can\'t be swapped — no spare Townsfolk in the script. Handle manually.',
-                actions: [{ label: 'OK', primary: true }],
-              }), 0);
-            }
+            const tgtLabel = tgt.playerName ? tgt.playerName + ' (seat #' + tgt.seatNum + ')' : 'seat #' + tgt.seatNum;
+            setTimeout(() => setHuntsmanPickData({
+              damselSeatNum: targetSeatNum,
+              damselLabel: tgtLabel,
+              candidates,
+            }), 0);
           }
           next[seatStr] = { ...next[seatStr], huntsmanResolved: true };
         }
@@ -5347,6 +5386,7 @@ function App() {
           onSweetheartPick={applySweetheartPick}
           onOpenLocalPrompt={openLocalPrompt}
           onMarkSetupReminder={markSetupReminder}
+          onSetupReminderAction={onSetupReminderActionApp}
           onSkipSetupReminders={setSetupRemindersSkipped}
           onRespondToNightPrompt={respondToNightPrompt}
           dismissedResponses={dismissedResponses}
@@ -5442,7 +5482,7 @@ function App() {
           ability fired" leaking that they just targeted the Fool).
           The popups reappear the moment the ST taps "Return to
           storyteller" and the overlay closes. */}
-      {cornerPrompts.length > 0 && localOverlayStep == null && localGrimoireSeat == null && moonchildPickSeat == null && klutzPickSeat == null && vigorPickData == null && evilTwinModalData == null && lunaticPickerData == null && (
+      {cornerPrompts.length > 0 && localOverlayStep == null && localGrimoireSeat == null && moonchildPickSeat == null && klutzPickSeat == null && vigorPickData == null && pixiePickData == null && huntsmanPickData == null && evilTwinModalData == null && lunaticPickerData == null && (
         <STCornerPrompts
           prompts={cornerPrompts}
           onAction={(promptId, actionIdx) => {
@@ -5481,6 +5521,20 @@ function App() {
           data={vigorPickData}
           onApply={applyVigorPick}
           onCancel={cancelVigorPick}
+        />
+      )}
+      {pixiePickData != null && (
+        <PixiePickerModal
+          data={pixiePickData}
+          onApply={applyPixiePick}
+          onCancel={cancelPixiePick}
+        />
+      )}
+      {huntsmanPickData != null && (
+        <HuntsmanPickerModal
+          data={huntsmanPickData}
+          onApply={applyHuntsmanPick}
+          onCancel={cancelHuntsmanPick}
         />
       )}
       {evilTwinModalData != null && (
@@ -6657,7 +6711,7 @@ function eligibleSeatsForPending(roleId, seats) {
 function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
                         nightToasts = [], onDismissNightToast,
                         onStartNightPrompt, onCancelNightPrompt, onMarkStepDone, onClearAllNightPrompts, onOpenMoonchildCapture, onResolveMoonchild, onOpenEvilTwinModal, onOpenBarberFlow, onSweetheartPick, onOpenLocalPrompt,
-                        onMarkSetupReminder, onSkipSetupReminders, onRespondToNightPrompt,
+                        onMarkSetupReminder, onSkipSetupReminders, onSetupReminderAction, onRespondToNightPrompt,
                         dismissedResponses, onDismissResponsePopup, onPromoteScarletWoman, onStartShowGrimoire, onSendCeremonyInfo,
                         dayBanners = [], onDismissDayBanner,
                         onSeatTap, onCancelSwap, onPickupAssignment, onCancelAssignment,
@@ -6867,6 +6921,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         setupRemindersSkipped={!!grim.setupRemindersSkipped}
         onMarkSetupReminder={onMarkSetupReminder}
         onSkipSetupReminders={onSkipSetupReminders}
+        onSetupReminderAction={onSetupReminderAction}
         gameStarted={!!grim.gameStarted}
       />
 
@@ -7498,7 +7553,7 @@ function getSetupNote(charId) {
 // Top-of-grimoire checklist: every in-play character with setup: true, plus any
 // pending hidden roles (Drunk/Marionette) that need ST assignment.
 function SetupNeedsPanel({ seats, pendingAssignments, assigningRoleId, eligibleCount, onPickup, onCancel, onUndo,
-                            setupRemindersDone = {}, setupRemindersSkipped = false, onMarkSetupReminder, onSkipSetupReminders, gameStarted = false }) {
+                            setupRemindersDone = {}, setupRemindersSkipped = false, onMarkSetupReminder, onSkipSetupReminders, onSetupReminderAction, gameStarted = false }) {
   // In-play characters (by actualRoleId) with setup: true
   const inPlay = new Set(seats.map(s => s.actualRoleId));
   const charIds = [...inPlay].filter(id => CHAR_BY_ID[id]?.setup);
@@ -7596,6 +7651,12 @@ function SetupNeedsPanel({ seats, pendingAssignments, assigningRoleId, eligibleC
                   </div>
                   <div className="text-xs text-stone-400 mt-0.5">{it.description}</div>
                 </div>
+                {it.actionLabel && !it.done && (
+                  <button onClick={() => onSetupReminderAction && onSetupReminderAction(it.actionKind)}
+                    className="text-[11px] px-2 py-1 rounded transition flex-shrink-0 pill hover:border-emerald-500 hover:text-emerald-200 text-emerald-300 mr-1">
+                    {it.actionLabel}
+                  </button>
+                )}
                 <button onClick={() => onMarkSetupReminder && onMarkSetupReminder(it.id, !it.done)}
                   disabled={it.autoDetected}
                   title={it.autoDetected ? 'Auto-detected from grimoire reminders' : undefined}
@@ -11712,6 +11773,8 @@ function listSetupReminders(seats, doneMap) {
       icon: 'pixie',
       done: auto || manual,
       autoDetected: auto,
+      actionLabel: auto ? null : 'Pick character',
+      actionKind: 'pixie-madabout',
     });
   }
   const pmSeat = (seats || []).find(s => s.actualRoleId === 'puzzlemaster');
@@ -13028,6 +13091,126 @@ function EvilTwinStartModal({ etSeat, twinSeat, seats, onAccept, onCancel }) {
             disabled={!effectiveTwin}
             className={`py-2.5 rounded-lg text-sm font-bold ${effectiveTwin ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40' : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
             Accept — send pair info →
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PixiePickerModal({ data, onApply, onCancel }) {
+  const [picked, setPicked] = useState(null);
+  if (!data) return null;
+  const cands = data.candidates || [];
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-950/85 flex items-start sm:items-center justify-center p-2 sm:p-4 overflow-y-auto">
+      <div className="parchment rounded-lg p-4 sm:p-5 max-w-lg w-full space-y-3 my-4 border-2 border-amber-600/70">
+        <div className="flex items-center gap-3">
+          {iconUrl('pixie') && (
+            <img src={iconUrl('pixie')} alt=""
+              className="w-12 h-12 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
+          )}
+          <div className="flex-1 min-w-0">
+            <div className="text-[10px] uppercase tracking-wider text-amber-300">Setup · Pixie</div>
+            <div className="text-amber-200 text-lg font-bold leading-tight">Pick the "Mad about" character</div>
+            <div className="text-xs text-stone-400 mt-0.5">In-play Townsfolk only. A "Pixie: Mad about &lt;Role&gt;" reminder will be placed on the Pixie's seat.</div>
+          </div>
+        </div>
+        {cands.length === 0 ? (
+          <div className="text-sm text-stone-400 italic text-center py-3">No in-play Townsfolk found.</div>
+        ) : (
+          <ul className="grid grid-cols-2 gap-2 max-h-80 overflow-y-auto">
+            {cands.map(rc => {
+              const isP = picked === rc.id;
+              return (
+                <li key={rc.id}>
+                  <button onClick={() => setPicked(rc.id)}
+                    className={`w-full card rounded p-2 flex items-center gap-2 text-left
+                      ${isP ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}`}>
+                    {iconUrl(rc.id) && (
+                      <img src={iconUrl(rc.id)} alt=""
+                        className="w-9 h-9 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                    )}
+                    <span className={`flex-1 min-w-0 truncate text-sm team-${rc.team}`}>{rc.name}</span>
+                    {isP && <span className="text-amber-300 text-base">✓</span>}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        <div className="grid grid-cols-2 gap-2 pt-1">
+          <button onClick={onCancel}
+            className="py-2.5 rounded-lg text-sm font-semibold bg-stone-800 hover:bg-stone-700 text-stone-300 border border-stone-700">
+            Cancel
+          </button>
+          <button onClick={() => picked && onApply(picked)}
+            disabled={!picked}
+            className={`py-2.5 rounded-lg text-sm font-bold transition
+              ${picked
+                ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40'
+                : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+            Place marker →
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function HuntsmanPickerModal({ data, onApply, onCancel }) {
+  const [picked, setPicked] = useState(null);
+  if (!data) return null;
+  const cands = data.candidates || [];
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-950/85 flex items-start sm:items-center justify-center p-2 sm:p-4 overflow-y-auto">
+      <div className="parchment rounded-lg p-4 sm:p-5 max-w-lg w-full space-y-3 my-4 border-2 border-amber-600/70">
+        <div className="flex items-center gap-3">
+          {iconUrl('huntsman') && (
+            <img src={iconUrl('huntsman')} alt=""
+              className="w-12 h-12 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
+          )}
+          <div className="flex-1 min-w-0">
+            <div className="text-[10px] uppercase tracking-wider text-amber-300">Huntsman hit the Damsel</div>
+            <div className="text-amber-200 text-lg font-bold leading-tight">Pick the Damsel's new Townsfolk role</div>
+            <div className="text-xs text-stone-400 mt-0.5">Not-in-play Townsfolk from the script. The Damsel becomes this role and is notified.</div>
+          </div>
+        </div>
+        {cands.length === 0 ? (
+          <div className="text-sm text-stone-400 italic text-center py-3">No spare Townsfolk in the script.</div>
+        ) : (
+          <ul className="grid grid-cols-2 gap-2 max-h-80 overflow-y-auto">
+            {cands.map(rc => {
+              const isP = picked === rc.id;
+              return (
+                <li key={rc.id}>
+                  <button onClick={() => setPicked(rc.id)}
+                    className={`w-full card rounded p-2 flex items-center gap-2 text-left
+                      ${isP ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}`}>
+                    {iconUrl(rc.id) && (
+                      <img src={iconUrl(rc.id)} alt=""
+                        className="w-9 h-9 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                    )}
+                    <span className={`flex-1 min-w-0 truncate text-sm team-${rc.team}`}>{rc.name}</span>
+                    {isP && <span className="text-amber-300 text-base">✓</span>}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        <div className="grid grid-cols-2 gap-2 pt-1">
+          <button onClick={onCancel}
+            className="py-2.5 rounded-lg text-sm font-semibold bg-stone-800 hover:bg-stone-700 text-stone-300 border border-stone-700">
+            Cancel
+          </button>
+          <button onClick={() => picked && onApply(picked)}
+            disabled={!picked}
+            className={`py-2.5 rounded-lg text-sm font-bold transition
+              ${picked
+                ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40'
+                : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+            Apply →
           </button>
         </div>
       </div>
