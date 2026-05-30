@@ -1272,6 +1272,12 @@ function App() {
       // sc-reveal-info: stamp the player's NEW role as prompt.roleId so the
       // NightInfoScreen header shows the new role icon/name (no SC reference).
       const effectiveRoleId = step.scRevealRoleId || step.char.id;
+      // Cannibal stealth: if the destination seat has any 'cannibal' charId
+      // reminder (Was Cannibal / Drunk), stamp the prompt so the player UI
+      // hides the role identity regardless of mySeat sync state.
+      const destSeat = (s.grimoire.seats || []).find(x => x.seatNum === seatNum);
+      const stealthCannibal = !!(destSeat && (destSeat.reminders || []).some(r =>
+        r && r.charId === 'cannibal'));
       np[seatNum] = {
         roleId:        effectiveRoleId,
         action:        step.action,
@@ -1280,6 +1286,7 @@ function App() {
         eligible:      defForRole.eligible || 'all',
         roleClaimFilter: defForRole.roleClaimFilter || null,
         scRevealKind:   step.scRevealKind || null,
+        cannibalStealth: stealthCannibal,
         status:        useDecision ? 'use-decision' : 'awaiting',
         targets:       null,
         infoPayload:   infoPayload || null,
@@ -15560,8 +15567,11 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
 
         <section className="parchment rounded-lg p-4 sm:p-5 space-y-3 border-2 border-amber-600/70">
           {(() => {
-            const cannibalStealth = step.seat && (step.seat.reminders || []).some(r =>
-              r && r.charId === 'cannibal' && /^was cannibal/i.test(String(r.label || '')));
+            const cannibalStealth = (step.seat && (step.seat.reminders || []).some(r =>
+              r && r.charId === 'cannibal'))
+              || (infoPayload && infoPayload.cannibalStealth)
+              || (step.scRevealRoleId && step.seat && (step.seat.reminders || []).some(r =>
+                r && r.charId === 'cannibal'));
             if (cannibalStealth) {
               return (
                 <div className="text-center">

@@ -661,7 +661,8 @@ function RoleReveal({ seat, grimoire, bagCharacterIds, onAccept, onAsk }) {
   // their actualRoleId to a borrowed role), show the Cannibal token instead
   // — the player should never see what they ate.
   const _swappedFromCannibal = (seat.reminders || []).some(r =>
-    r && r.charId === 'cannibal' && /^was cannibal/i.test(String(r.label || '')));
+    r && r.charId === 'cannibal' && /^was cannibal/i.test(String(r.label || ''))) ||
+    (seat.reminders || []).some(r => r && r.charId === 'cannibal' && /drunk/i.test(String(r.label || '')));
   // Players see their PERCEIVED role (what they think they are).
   // For Drunk-as-Chef, the player sees Chef. The Drunk-ness is the storyteller's secret.
   const role = _swappedFromCannibal ? CHAR_BY_ID['cannibal'] : CHAR_BY_ID[seat.perceivedRoleId];
@@ -1586,8 +1587,8 @@ function NightInfoScreen({ mySeat, seats, prompt, onAck, onQuestion }) {
     body = <div className="text-stone-400 italic text-center">(no info)</div>;
   }
 
-  const _cannibalStealth = (mySeat.reminders || []).some(r =>
-    r && r.charId === 'cannibal' && /^was cannibal/i.test(String(r.label || '')));
+  const _cannibalStealth = !!prompt.cannibalStealth
+    || (mySeat.reminders || []).some(r => r && r.charId === 'cannibal');
   return (
     <ScreenShell>
       <section className="parchment rounded-lg p-4 sm:p-5 space-y-3 border-2 border-amber-600/70">
@@ -1803,8 +1804,8 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
     <ScreenShell>
       <section className="parchment rounded-lg p-4 sm:p-5 space-y-3 border-2 border-amber-600/70">
         {(() => {
-          const cannibalStealth = (mySeat.reminders || []).some(r =>
-            r && r.charId === 'cannibal' && /^was cannibal/i.test(String(r.label || '')));
+          const cannibalStealth = !!prompt.cannibalStealth
+            || (mySeat.reminders || []).some(r => r && r.charId === 'cannibal');
           if (cannibalStealth) {
             return (
               <div className="text-center">
