@@ -1328,12 +1328,14 @@ function App() {
         const demonShown = magician || realDemon;
         const demonInfo = demonShown ? seatMini(demonShown) : null;
         const minionList = realMinions.map(seatMini);
+        // Damsel-in-play flag: minions learn that a Damsel exists (no seat).
+        const damselInPlay = !!seats.find(x => x.actualRoleId === 'damsel');
         for (const m of realMinions) {
           const others = minionList.filter(x => x.seatNum !== m.seatNum);
           np[m.seatNum] = {
             roleId: m.actualRoleId,
             action: 'info-st',
-            instruction: 'Minion info — learn your fellow Minions and the Demon.',
+            instruction: 'Minion info — learn your fellow Minions and the Demon.' + (damselInPlay ? ' A Damsel is in play.' : ''),
             reminderLabel: '',
             eligible: 'all',
             status: 'awaiting',
@@ -1343,6 +1345,7 @@ function App() {
               viewerRole: 'minion',
               minions: others,
               demon: demonInfo,
+              damselInPlay,
             },
             ceremony: 'minioninfo',
             startedAt: Date.now(),
@@ -2973,6 +2976,62 @@ function App() {
             }
             next[seatStr] = { ...next[seatStr], pithagApplied: true };
           }
+        }
+        // Huntsman: if the picked seat is the Damsel, swap Damsel's role
+        // to a random not-in-play Townsfolk from the script and notify them.
+        if (p.roleId === 'huntsman' && targets.length === 1 && !p.huntsmanResolved) {
+          const targetSeatNum = targets[0];
+          const baseSeats = next.__seatsCopy || state.grimoire.seats;
+          const tgt = (baseSeats || []).find(x => x.seatNum === targetSeatNum);
+          if (tgt && tgt.actualRoleId === 'damsel') {
+            const inPlayIds = new Set((baseSeats || []).map(x => x.actualRoleId).filter(Boolean));
+            const scriptIds = (state.characterIds || []);
+            const candidates = scriptIds
+              .map(id => CHAR_BY_ID[id])
+              .filter(rc => rc && rc.team === 'townsfolk' && !inPlayIds.has(rc.id));
+            const pick = candidates.length > 0
+              ? candidates[Math.floor(Math.random() * candidates.length)]
+              : null;
+            if (pick) {
+              const seatsCopy = baseSeats.map(s => {
+                if (s.seatNum !== targetSeatNum) return s;
+                return { ...s,
+                  actualRoleId: pick.id,
+                  perceivedRoleId: pick.id,
+                  reminders: [...(s.reminders || []), { charId: 'huntsman', label: 'Was Damsel', fromPrompt: true }] };
+              });
+              next.__seatsCopy = seatsCopy;
+              const tgtLabel = tgt.playerName ? tgt.playerName + ' (seat #' + tgt.seatNum + ')' : 'seat #' + tgt.seatNum;
+              setTimeout(() => addCornerPrompt({
+                kind: 'success',
+                title: 'Huntsman hit the Damsel',
+                body: tgtLabel + ' was the Damsel and is now the ' + pick.name + ' (random not-in-play Townsfolk). Wake them — their phone will show the new role.',
+                actions: [{ label: 'OK', primary: true }],
+              }), 0);
+              // Push a role-alignment reveal prompt to the converted player.
+              next[String(targetSeatNum)] = {
+                roleId: pick.id,
+                action: 'info-st',
+                instruction: 'Your role has changed — see below.',
+                reminderLabel: '',
+                eligible: 'all',
+                status: 'awaiting',
+                targets: null,
+                infoPayload: { type: 'role-alignment', roleId: pick.id, alignment: 'good' },
+                ceremony: 'huntsman-convert',
+                startedAt: Date.now(),
+                nightIdx: state.grimoire.viewingDayIndex || 0,
+              };
+            } else {
+              setTimeout(() => addCornerPrompt({
+                kind: 'warn',
+                title: 'Huntsman hit the Damsel — no swap available',
+                body: 'Damsel can\'t be swapped — no spare Townsfolk in the script. Handle manually.',
+                actions: [{ label: 'OK', primary: true }],
+              }), 0);
+            }
+          }
+          next[seatStr] = { ...next[seatStr], huntsmanResolved: true };
         }
         // Philosopher: player picked a TF/Outsider role on their phone.
         // Swap the Philosopher's actualRoleId to the picked role, drop a
@@ -4623,7 +4682,78 @@ function App() {
   // Slayer / Psychopath: claim + target. If real + sober → target dies +
   // "No ability" placed on claimant. If real + drunk/poisoned → ask ST. If
   // fake → dismissable banner only.
+  // Damsel guess — claimant is the minion making the guess, target is the
+  // player they guess is the Damsel. Special-case before generic kill flow.
+  const _resolveDamselGuess = ({ claimantSeatNum, targetSeatNum, dayIdx }) => {
+    const claimant = _seatBy(claimantSeatNum);
+    const target = _seatBy(targetSeatNum);
+    if (!claimant || !target) return;
+    const claimantLabel = _seatLabel(claimant);
+    const targetLabel = _seatLabel(target);
+    const claimantTeam = (CHAR_BY_ID[claimant.actualRoleId] || {}).team;
+    const isMinion = claimantTeam === 'minion';
+    const logAudit = (outcome) => appendDayEntry(dayIdx, {
+      kind: 'claim', roleId: 'damsel', claimantSeat: claimantSeatNum, targetSeat: targetSeatNum, outcome,
+    });
+    if (!isMinion) {
+      logAudit('damsel-no-minion');
+      addCornerPrompt({
+        kind: 'warn',
+        title: 'Damsel guess — not a Minion',
+        body: claimantLabel + ' is not a Minion. The guess has no effect.',
+        actions: [{ label: 'OK', primary: true }],
+      });
+      return;
+    }
+    const damselSeat = (state.grimoire.seats || []).find(s => s.actualRoleId === 'damsel');
+    if (!damselSeat) {
+      logAudit('damsel-not-in-play');
+      addCornerPrompt({
+        kind: 'warn',
+        title: 'Damsel guess — no Damsel in play',
+        body: 'No Damsel is currently in play (may have been swapped by Huntsman).',
+        actions: [{ label: 'OK', primary: true }],
+      });
+      return;
+    }
+    const alreadyGuessed = (damselSeat.reminders || []).some(r =>
+      r && r.charId === 'damsel' && /guess used/i.test(String(r.label || '')));
+    const targetIsDamsel = target.seatNum === damselSeat.seatNum;
+    if (targetIsDamsel && !alreadyGuessed) {
+      logAudit('damsel-correct-win');
+      addCornerPrompt({
+        kind: 'warn',
+        title: 'Damsel guessed correctly — Evil wins!',
+        body: claimantLabel + ' (Minion) correctly guessed ' + targetLabel + ' as the Damsel. The Evil team wins — announce the game end.',
+        actions: [{ label: 'OK', primary: true }],
+      });
+    } else if (targetIsDamsel && alreadyGuessed) {
+      logAudit('damsel-already-guessed');
+      addCornerPrompt({
+        kind: 'warn',
+        title: 'Damsel guess already used',
+        body: 'The Damsel guess has already been used this game (marker on the Damsel\'s seat). No further guesses can win.',
+        actions: [{ label: 'OK', primary: true }],
+      });
+    } else {
+      // Wrong guess — place 'Guess used' on damsel seat.
+      logAudit('damsel-wrong');
+      _placeReminderInline(damselSeat.seatNum, 'damsel', 'Guess used');
+      const damselLabel = damselSeat.playerName ? damselSeat.playerName + ' (seat #' + damselSeat.seatNum + ')' : 'seat #' + damselSeat.seatNum;
+      addCornerPrompt({
+        kind: 'success',
+        title: 'Damsel guess wrong',
+        body: claimantLabel + ' (Minion) guessed ' + targetLabel + ' — that is NOT the Damsel. "Guess used" reminder placed on the Damsel (' + damselLabel + '). No more Damsel guesses allowed.',
+        actions: [{ label: 'OK', primary: true }],
+      });
+    }
+  };
+
   const resolveClaimAndKill = ({ roleId, label, claimantSeatNum, targetSeatNum, dayIdx }) => {
+    // Damsel guess: dispatch to its own handler.
+    if (roleId === 'damsel') {
+      return _resolveDamselGuess({ claimantSeatNum, targetSeatNum, dayIdx });
+    }
     const claimant = _seatBy(claimantSeatNum);
     const target = _seatBy(targetSeatNum);
     if (!claimant || !target) return;
@@ -4777,6 +4907,41 @@ function App() {
       kind: afflicted ? 'warn' : 'success',
       title: afflicted ? 'Artist drunk/poisoned' : 'Artist used ability',
       body: claimantLabel + ' IS the Artist' + (afflicted ? ' (drunk/poisoned — they may receive false info).' : '. Answer their yes/no question truthfully.'),
+      actions: [{ label: 'OK', primary: true }],
+    });
+  };
+
+  // Fisherman: claim-only day ability, once per game (Artist-clone).
+  // Real Fisherman + sober → ST gives advice (private). Drunk/poisoned →
+  // popup notes the advice may be false. Fake claim → no effect.
+  const resolveFishermanClaim = ({ claimantSeatNum, dayIdx }) => {
+    const claimant = _seatBy(claimantSeatNum);
+    if (!claimant) return;
+    const claimantLabel = _seatLabel(claimant);
+    const isReal = claimant.actualRoleId === 'fisherman';
+    const afflicted = isDrunkOrPoisoned(claimant);
+    const alreadyUsed = (claimant.reminders || []).some(r =>
+      r && r.charId === 'fisherman' && /no ability|used/i.test(String(r.label || '')));
+    const logAudit = (outcome) => appendDayEntry(dayIdx, {
+      kind: 'claim', roleId: 'fisherman', claimantSeat: claimantSeatNum, targetSeat: null, outcome,
+    });
+    if (!isReal) { logAudit('fake'); return; }
+    if (alreadyUsed) {
+      logAudit('already-used');
+      addCornerPrompt({
+        kind: 'warn',
+        title: 'Fisherman already used',
+        body: claimantLabel + ' IS the Fisherman but the ability has already been used this game.',
+        actions: [{ label: 'OK', primary: true }],
+      });
+      return;
+    }
+    logAudit(afflicted ? 'fisherman-drunk' : 'fisherman-real');
+    _placeReminderInline(claimantSeatNum, 'fisherman', 'No ability');
+    addCornerPrompt({
+      kind: afflicted ? 'warn' : 'success',
+      title: afflicted ? 'Fisherman drunk/poisoned' : 'Fisherman used ability',
+      body: claimantLabel + ' IS the Fisherman' + (afflicted ? ' (drunk/poisoned — your advice may be wrong).' : '. Privately give them strategic advice.'),
       actions: [{ label: 'OK', primary: true }],
     });
   };
@@ -5159,6 +5324,7 @@ function App() {
           onResolveMutantClaim={resolveMutantClaim}
           onResolveArtistClaim={resolveArtistClaim}
           onResolveSavantClaim={resolveSavantClaim}
+          onResolveFishermanClaim={resolveFishermanClaim}
           onResolveJugglerClaim={resolveJugglerClaim}
         />
       )}
@@ -8565,7 +8731,7 @@ function DayTabs({ days, viewingDayIndex, onSelect }) {
 // ---------------- Nominations page ----------------
 
 function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onSetViewingDay, onJumpToGrimoire,
-                            onResolveClaimAndKill, onResolveMutantClaim, onResolveArtistClaim, onResolveSavantClaim, onResolveJugglerClaim, onAdvanceToNight }) {
+                            onResolveClaimAndKill, onResolveMutantClaim, onResolveArtistClaim, onResolveSavantClaim, onResolveFishermanClaim, onResolveJugglerClaim, onAdvanceToNight }) {
   const grim = state.grimoire;
   const [activeAbility, setActiveAbility] = useState(null);
   const [pendingClaimant, setPendingClaimant] = useState(null);
@@ -8581,6 +8747,8 @@ function NominationsPage({ state, onAdd, onUpdate, onRemove, onSetDayVoting, onS
         onResolveArtistClaim && onResolveArtistClaim({ claimantSeatNum: seatNum, dayIdx });
       } else if (activeAbility.id === 'savant') {
         onResolveSavantClaim && onResolveSavantClaim({ claimantSeatNum: seatNum, dayIdx });
+      } else if (activeAbility.id === 'fisherman') {
+        onResolveFishermanClaim && onResolveFishermanClaim({ claimantSeatNum: seatNum, dayIdx });
       }
       resetAbility();
     } else if (activeAbility.kind === 'claim-juggler') {
@@ -8969,6 +9137,13 @@ function NominationRow({ index, nom, seatById = {}, nominator, nominee, readOnly
       'artist-drunk':   'is the Artist but drunk/poisoned',
       'savant-real':    'is the Savant — ST delivers 2 facts (1 true, 1 false)',
       'savant-drunk':   'is the Savant but drunk/poisoned — both facts may be false',
+      'fisherman-real': 'is the Fisherman — ST gives advice',
+      'fisherman-drunk':'is the Fisherman but drunk/poisoned — advice may be false',
+      'damsel-correct-win':   'guessed the Damsel correctly — Evil wins',
+      'damsel-wrong':         'guessed wrong — "Guess used" marker placed on the Damsel',
+      'damsel-already-guessed': 'Damsel guess already used — no effect',
+      'damsel-no-minion':     'claimant is not a Minion — no effect',
+      'damsel-not-in-play':   'no Damsel in play (e.g. Huntsman swapped)',
       'juggler-real':   (nom.correctCount != null && nom.jugglerPicks ? (nom.correctCount + ' / ' + nom.jugglerPicks.length + ' correct') : 'guesses recorded'),
       'juggler-drunk':  'drunk/poisoned — no Correct markers placed',
     })[nom.outcome] || nom.outcome || '';
@@ -10518,6 +10693,8 @@ const NIGHT_ACTIONS = {
   sailor:        { action: 'target1+st-pick', reminder: '',         instruction: 'Choose an alive player. Either you or they are drunk until dusk. You cannot die.',
                    eligible: 'others' },
 
+  huntsman:      { action: 'target1any',  reminder: 'Used',        instruction: 'On the first night, choose a player. If you chose the Damsel, the Damsel becomes a not-in-play Townsfolk (ST will swap).',
+                   oncePerGame: true, canSkip: true, phase: 'first', eligible: 'all' },
   // ===== Sects & Violets =====
   dreamer:       { action: 'target1+role-pair', reminder: 'Showed', instruction: 'Choose a player (not yourself). You will learn 1 good and 1 evil character — 1 of them is correct.',
                    eligible: 'others',
@@ -10542,6 +10719,8 @@ const NIGHT_ACTIONS = {
   pithag:        { action: 'target1+role-claim', reminder: 'Was',  instruction: 'Choose a player (not yourself) and a character. If that character is not in play, the player becomes that character. Otherwise, they get a reminder marker.', eligible: 'others', roleClaimFilter: 'all' },
   clockmaker:    { action: 'info-st',     reminder: 'Saw',         instruction: 'On the first night, you learn how many steps clockwise from the Demon to the nearest Minion.', phase: 'first',
                    infoType: 'number',    infoConfig: { min: 1, max: 10, label: 'steps', display: 'Demon → nearest Minion (clockwise):' } },
+  puzzlemaster:  { action: 'target1any',  reminder: 'Used',        instruction: 'Choose a player — you learn who is drunk. If you guessed correctly, you learn nothing extra; if wrong, you get false info. ST reveals the seat with the Puzzlemaster: Drunk marker.',
+                   eligible: 'others', oncePerGame: true, canSkip: true, phase: 'other' },
   sage:          { action: 'info-st',     reminder: 'Shown',       instruction: 'If killed by the Demon, learn 2 players — one is the Demon.', phase: 'other',
                    requiresDeath: true, oncePerGame: true,
                    infoType: 'seats',     infoConfig: { numSeats: 2, display: 'One of these players is the demon:' } },
@@ -10628,6 +10807,8 @@ const PERMANENT_REMINDER_CHARS = new Set([
   'washerwoman', 'librarian', 'investigator', 'chef',
   // Once-per-game ability tracker roles
   'fool', 'philosopher', 'ravenkeeper', 'professor', 'sage',
+  // Huntsman: 'Was Damsel' marker on the converted Damsel seat.
+  'huntsman',
   // Passive trigger roles (their reminders mark a one-time event)
   'klutz', 'mutant', 'goon', 'lycanthrope',
   // Once-per-game evil
@@ -10644,6 +10825,8 @@ const PERMANENT_REMINDER_CHARS = new Set([
   // Snake Charmer: 'Poisoned' marker on the swapped player and 'Reveal: ...'
   // markers driving the synthetic post-swap reveal steps.
   'snakecharmer',
+  // Damsel: 'Guess used' marker — permanent (only 1 guess allowed per game).
+  'damsel',
   // Banshee: 'Triggered' marker placed when killed by Demon — permanent ability gain.
   'banshee',
   // Pit-Hag: 'Was X' marker tracks the previous role for converted players.
@@ -11516,6 +11699,36 @@ function listSetupReminders(seats, doneMap) {
       autoDetected: auto,
     });
   }
+  const pixieSeat = (seats || []).find(s => s.actualRoleId === 'pixie');
+  if (pixieSeat) {
+    const auto = (seats || []).some(s => (s.reminders || []).some(r =>
+      r && r.charId === 'pixie' && /^mad about/i.test(r.label || '')
+    ));
+    const manual = !!doneMap['pixie-madabout'];
+    items.push({
+      id: 'pixie-madabout',
+      title: 'Place the Pixie\'s "Mad about" marker',
+      description: 'Pick 1 in-play Townsfolk and place a "Pixie: Mad about <Role>" reminder on the Pixie\'s seat. The Pixie learns this character on the first night and inherits the ability if that player dies while the Pixie is mad about them.',
+      icon: 'pixie',
+      done: auto || manual,
+      autoDetected: auto,
+    });
+  }
+  const pmSeat = (seats || []).find(s => s.actualRoleId === 'puzzlemaster');
+  if (pmSeat) {
+    const auto = (seats || []).some(s => (s.reminders || []).some(r =>
+      r && r.charId === 'puzzlemaster' && /drunk/i.test(r.label || '')
+    ));
+    const manual = !!doneMap['puzzlemaster-drunk'];
+    items.push({
+      id: 'puzzlemaster-drunk',
+      title: 'Place the Puzzlemaster\'s Drunk marker',
+      description: 'Pick any good player (not the Puzzlemaster) and place a "Puzzlemaster: Drunk" reminder on their seat. They are drunk for the whole game; the Puzzlemaster learns who they are when they guess correctly.',
+      icon: 'puzzlemaster',
+      done: auto || manual,
+      autoDetected: auto,
+    });
+  }
   const gmSeat = (seats || []).find(s => s.actualRoleId === 'grandmother');
   if (gmSeat) {
     const auto = (seats || []).some(s => (s.reminders || []).some(r =>
@@ -12262,6 +12475,8 @@ const DAY_ABILITY_ROLES = [
   { id: 'mutant',     label: 'Mutant claim',     kind: 'claim-only',   icon: 'mutant',     hint: 'Public Outsider claim — checks if they\'re the Mutant.' },
   { id: 'artist',     label: 'Artist claim',     kind: 'claim-only',   icon: 'artist',     hint: 'Artist asks the ST a yes/no question (once per game).' },
   { id: 'savant',     label: 'Savant claim',     kind: 'claim-only',   icon: 'savant',     hint: 'Each day, the Savant asks the ST for 2 facts — 1 true, 1 false (repeatable).' },
+  { id: 'fisherman',  label: 'Fisherman claim',  kind: 'claim-only',   icon: 'fisherman',  hint: 'Fisherman asks the ST for advice (once per game).' },
+  { id: 'damsel',     label: 'Damsel guess',     kind: 'claim-target', icon: 'damsel',     hint: 'Pick the Minion claimant, then the player they guess is the Damsel.' },
   { id: 'juggler',    label: 'Juggler claim',    kind: 'claim-juggler', icon: 'juggler',   hint: 'Up to 5 (player + character) public guesses (once per game).' },
 ];
 
