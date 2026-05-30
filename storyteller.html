@@ -1723,6 +1723,9 @@ function App() {
   // Klutz: parallels Moonchild — when Klutz dies, the ST captures the public
   // pick via KlutzPickModal. Resolution is immediate (no separate night step).
   const [klutzPickSeat, setKlutzPickSeat] = useState(null);
+  // Vigormortis: ST opens a modal to pick 1 of the dying minion's 2 nearest
+  // Townsfolk neighbours to poison. { dyingSeatNum, dyingLabel, candidates }.
+  const [vigorPickData, setVigorPickData] = useState(null);
   // Evil Twin: ST opens a modal from the night row to wake both seats and
   // push pair-info prompts.
   const [evilTwinModalData, setEvilTwinModalData] = useState(null); // { etSeatNum, twinSeatNum }
@@ -1785,10 +1788,47 @@ function App() {
     });
   };
   const cancelKlutzPick = () => setKlutzPickSeat(null);
+  const cancelVigorPick = () => setVigorPickData(null);
+  const applyVigorPick = (pickedSeatNum) => {
+    if (pickedSeatNum == null) { setVigorPickData(null); return; }
+    update(s => {
+      const seats2 = (s.grimoire.seats || []).map(seat => {
+        if (seat.seatNum !== pickedSeatNum) return seat;
+        const has = (seat.reminders || []).some(r =>
+          r && r.charId === 'vigormortis' && /poisoned/i.test(String(r.label || '')));
+        if (has) return seat;
+        return { ...seat, reminders: [...(seat.reminders || []), { charId: 'vigormortis', label: 'Poisoned', fromPrompt: true }] };
+      });
+      return { grimoire: { ...s.grimoire, seats: seats2 } };
+    });
+    setVigorPickData(null);
+  };
   const openEvilTwinModal = (etSeatNum, twinSeatNum) => setEvilTwinModalData({ etSeatNum, twinSeatNum });
   const cancelEvilTwinModal = () => setEvilTwinModalData(null);
   // Barber flow — push the Yes/No prompt to the Demon. Decision handled
   // by submitted-prompts effect (barber-ask → barber-pick → ST popup).
+  // Sweetheart: ST-only resolution from the night row's InfoPickerModal.
+  const applySweetheartPick = (swSeatNum, pickedSeatNum) => {
+    if (swSeatNum == null || pickedSeatNum == null) return;
+    update(s => {
+      const seats2 = (s.grimoire.seats || []).map(seat => {
+        if (seat.seatNum === pickedSeatNum) {
+          const has = (seat.reminders || []).some(r =>
+            r && r.charId === 'sweetheart' && /drunk/i.test(String(r.label || '')));
+          if (has) return seat;
+          return { ...seat, reminders: [...(seat.reminders || []), { charId: 'sweetheart', label: 'Drunk', fromPrompt: true }] };
+        }
+        if (seat.seatNum === swSeatNum) {
+          const has = (seat.reminders || []).some(r =>
+            r && /^no ability$/i.test(String(r.label || '')));
+          if (has) return seat;
+          return { ...seat, reminders: [...(seat.reminders || []), { charId: 'sweetheart', label: 'No ability', fromPrompt: true }] };
+        }
+        return seat;
+      });
+      return { grimoire: { ...s.grimoire, seats: seats2 } };
+    });
+  };
   const openBarberFlow = (barberSeatNum) => {
     const seats0 = state.grimoire.seats || [];
     const demonSeat = seats0.find(s => (CHAR_BY_ID[s.actualRoleId] || {}).team === 'demon');
@@ -4213,9 +4253,11 @@ function App() {
         actions: [{ label: 'OK', primary: true }],
       }), 0);
     }
-    // Vigormortis — killed a Minion: Minion keeps ability + 1 of their
-    // Townsfolk neighbours is poisoned. Place 'Keeps ability' marker on the
-    // dying Minion + popup for ST to pick a TF neighbour to poison.
+    // Vigormortis — killed a Minion: Minion keeps ability + ST may pick 1
+    // of their Townsfolk neighbours to poison. Popup is Ignore + Make
+    // selection (the latter opens VigormortisPickModal with the 2 nearest
+    // Townsfolk on each side — skipping non-Townsfolk seats but including
+    // dead Townsfolk).
     if (causeCharId === 'vigormortis' && !isDayDeath) {
       const cDef = CHAR_BY_ID[dyingSeat.actualRoleId];
       if (cDef && cDef.team === 'minion') {
@@ -4230,11 +4272,41 @@ function App() {
             });
             return { grimoire: { ...s.grimoire, seats: newSeats } };
           });
+          const findTownsfolkNeighbour = (allSeats, originNum, direction) => {
+            if (!allSeats || allSeats.length < 2) return null;
+            const sorted = [...allSeats].sort((a, b) => a.seatNum - b.seatNum);
+            const n = sorted.length;
+            const startIdx = sorted.findIndex(x => x.seatNum === originNum);
+            if (startIdx === -1) return null;
+            for (let step = 1; step < n; step++) {
+              const idx = direction === 'cw' ? (startIdx + step) % n : (startIdx - step + n) % n;
+              const cand = sorted[idx];
+              if (!cand || !cand.actualRoleId) continue;
+              const team = (CHAR_BY_ID[cand.actualRoleId] || {}).team;
+              if (team === 'townsfolk') return cand;
+            }
+            return null;
+          };
+          const liveSeats = state.grimoire.seats || [];
+          const cw = findTownsfolkNeighbour(liveSeats, dyingSeat.seatNum, 'cw');
+          const ccw = findTownsfolkNeighbour(liveSeats, dyingSeat.seatNum, 'ccw');
+          const candidates = [];
+          if (ccw) candidates.push(ccw);
+          if (cw && (!ccw || cw.seatNum !== ccw.seatNum)) candidates.push(cw);
           addCornerPrompt({
             kind: 'warn',
             title: 'Vigormortis hit a Minion',
-            body: seatLabel + ' was killed by the Vigormortis. They KEEP their ability (marker placed). Pick one of their Townsfolk neighbours and place a "Vigormortis: Poisoned" reminder on them.',
-            actions: [{ label: 'OK', primary: true }],
+            body: seatLabel + ' was killed by the Vigormortis and KEEPS their ability (marker placed). Optionally poison one of their nearest Townsfolk neighbours.',
+            actions: [
+              { label: 'Make selection', primary: true, onClick: () => {
+                setVigorPickData({
+                  dyingSeatNum: dyingSeat.seatNum,
+                  dyingLabel: seatLabel,
+                  candidates,
+                });
+              } },
+              { label: 'Ignore' },
+            ],
           });
         }, 0);
       }
@@ -5087,6 +5159,7 @@ function App() {
           onResolveMoonchild={resolveMoonchild}
           onOpenEvilTwinModal={openEvilTwinModal}
           onOpenBarberFlow={openBarberFlow}
+          onSweetheartPick={applySweetheartPick}
           onOpenLocalPrompt={openLocalPrompt}
           onMarkSetupReminder={markSetupReminder}
           onSkipSetupReminders={setSetupRemindersSkipped}
@@ -5184,7 +5257,7 @@ function App() {
           ability fired" leaking that they just targeted the Fool).
           The popups reappear the moment the ST taps "Return to
           storyteller" and the overlay closes. */}
-      {cornerPrompts.length > 0 && localOverlayStep == null && localGrimoireSeat == null && moonchildPickSeat == null && klutzPickSeat == null && evilTwinModalData == null && lunaticPickerData == null && (
+      {cornerPrompts.length > 0 && localOverlayStep == null && localGrimoireSeat == null && moonchildPickSeat == null && klutzPickSeat == null && vigorPickData == null && evilTwinModalData == null && lunaticPickerData == null && (
         <STCornerPrompts
           prompts={cornerPrompts}
           onAction={(promptId, actionIdx) => {
@@ -5216,6 +5289,13 @@ function App() {
           seats={state.grimoire.seats || []}
           onApply={applyKlutzPick}
           onCancel={cancelKlutzPick}
+        />
+      )}
+      {vigorPickData != null && (
+        <VigormortisPickModal
+          data={vigorPickData}
+          onApply={applyVigorPick}
+          onCancel={cancelVigorPick}
         />
       )}
       {evilTwinModalData != null && (
@@ -6391,7 +6471,7 @@ function eligibleSeatsForPending(roleId, seats) {
 
 function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
                         nightToasts = [], onDismissNightToast,
-                        onStartNightPrompt, onCancelNightPrompt, onMarkStepDone, onClearAllNightPrompts, onOpenMoonchildCapture, onResolveMoonchild, onOpenEvilTwinModal, onOpenBarberFlow, onOpenLocalPrompt,
+                        onStartNightPrompt, onCancelNightPrompt, onMarkStepDone, onClearAllNightPrompts, onOpenMoonchildCapture, onResolveMoonchild, onOpenEvilTwinModal, onOpenBarberFlow, onSweetheartPick, onOpenLocalPrompt,
                         onMarkSetupReminder, onSkipSetupReminders, onRespondToNightPrompt,
                         dismissedResponses, onDismissResponsePopup, onPromoteScarletWoman, onStartShowGrimoire, onSendCeremonyInfo,
                         dayBanners = [], onDismissDayBanner,
@@ -6743,6 +6823,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         onOpenMoonchildCapture={onOpenMoonchildCapture}
         onOpenEvilTwinModal={onOpenEvilTwinModal}
         onOpenBarberFlow={onOpenBarberFlow}
+        onSweetheartPick={onSweetheartPick}
         onResolveMoonchild={onResolveMoonchild}
         nominationsByDay={grim.nominationsByDay || {}}
         onPromoteScarletWoman={onPromoteScarletWoman}
@@ -12718,6 +12799,77 @@ function EvilTwinStartModal({ etSeat, twinSeat, seats, onAccept, onCancel }) {
   );
 }
 
+function VigormortisPickModal({ data, onApply, onCancel }) {
+  const [picked, setPicked] = useState(null);
+  if (!data) return null;
+  const cands = data.candidates || [];
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-950/85 flex items-start sm:items-center justify-center p-2 sm:p-4 overflow-y-auto">
+      <div className="parchment rounded-lg p-4 sm:p-5 max-w-lg w-full space-y-3 my-4 border-2 border-amber-600/70">
+        <div className="flex items-center gap-3">
+          {iconUrl('vigormortis') && (
+            <img src={iconUrl('vigormortis')} alt=""
+              className="w-12 h-12 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
+          )}
+          <div className="flex-1 min-w-0">
+            <div className="text-[10px] uppercase tracking-wider text-amber-300">Demon · poison neighbour</div>
+            <div className="text-amber-200 text-lg font-bold leading-tight">Vigormortis killed a Minion</div>
+            <div className="text-xs text-stone-400 mt-0.5">{data.dyingLabel} — nearest Townsfolk on each side shown below.</div>
+          </div>
+        </div>
+        <div className="text-[11px] text-stone-300 leading-snug border-l-2 border-amber-700/50 pl-2">
+          Pick one of the two nearest Townsfolk neighbours (skipping non-Townsfolk seats; dead Townsfolk still count) and place a "Vigormortis: Poisoned" reminder on them.
+        </div>
+        {cands.length === 0 ? (
+          <div className="text-sm text-stone-400 italic text-center py-3">No Townsfolk neighbours found.</div>
+        ) : (
+          <ul className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {cands.map(c => {
+              const rc = CHAR_BY_ID[c.actualRoleId];
+              const isP = picked === c.seatNum;
+              return (
+                <li key={c.seatNum}>
+                  <button onClick={() => setPicked(c.seatNum)}
+                    className={`w-full card rounded p-2 flex items-center gap-2 text-left
+                      ${isP ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}`}>
+                    <span className="text-amber-200/80 text-xs w-7 text-center font-semibold">#{c.seatNum}</span>
+                    {iconUrl(c.actualRoleId) && (
+                      <img src={iconUrl(c.actualRoleId)} alt=""
+                        className="w-8 h-8 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                    )}
+                    <div className="flex-1 min-w-0 leading-tight">
+                      <div className="text-sm truncate">{c.playerName || <span className="text-stone-500 italic">—</span>}</div>
+                      <div className={`text-[10px] uppercase tracking-wider truncate team-${rc?.team || 'townsfolk'}`}>
+                        {rc?.name || '(no role)'}
+                        {c.isDead && <span className="ml-1 text-red-400">· dead</span>}
+                      </div>
+                    </div>
+                    {isP && <span className="text-amber-300 text-base">✓</span>}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        <div className="grid grid-cols-2 gap-2 pt-1">
+          <button onClick={onCancel}
+            className="py-2.5 rounded-lg text-sm font-semibold bg-stone-800 hover:bg-stone-700 text-stone-300 border border-stone-700">
+            Cancel
+          </button>
+          <button onClick={() => picked != null && onApply(picked)}
+            disabled={picked == null}
+            className={`py-2.5 rounded-lg text-sm font-bold transition
+              ${picked != null
+                ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40'
+                : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+            Accept →
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function KlutzPickModal({ klSeat, seats, onApply, onCancel }) {
   const [picked, setPicked] = useState(null);
   if (!klSeat) return null;
@@ -13772,7 +13924,7 @@ function InfoPickerModal({ step, seats, scriptCharIds, viewingDayIndex, nominati
               ${canSend
                 ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40'
                 : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
-            Send to player's phone →
+            {step.char && step.char.id === 'sweetheart' ? 'Place drunk marker →' : "Send to player's phone →"}
           </button>
         </div>
       </div>
@@ -14653,7 +14805,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                               onStartPrompt, onCancelPrompt, onMarkDone, onClearAllPrompts,
                               scriptCharIds = [], onOpenLocalPrompt,
                               nominationsByDay = {}, onPromoteScarletWoman, onStartShowGrimoire,
-                              onOpenMoonchildCapture, onResolveMoonchild, onOpenEvilTwinModal, onOpenBarberFlow,
+                              onOpenMoonchildCapture, onResolveMoonchild, onOpenEvilTwinModal, onOpenBarberFlow, onSweetheartPick,
                               onSendCeremony,
                               lastExecution = null }) {
   // Auto-expand when automation is on so the ST sees the interactive panel immediately.
@@ -15294,7 +15446,15 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                 // 'Haircuts tonight' reminder (placed on death by the passive
                 // trigger). Without it, the Barber row stays dim.
                 const barberActive = (s.char && s.char.id === 'barber' && s.barberHasHaircut);
-                const dim = barberActive
+                // Sweetheart: row is ACTIVE (un-dim) only when Sweetheart is
+                // dead AND the ability hasn't been used. Alive or used → dim.
+                const sweetheartActive = (s.char && s.char.id === 'sweetheart' && s.seat?.isDead && !noAbility);
+                const sweetheartInactive = (s.char && s.char.id === 'sweetheart' && (!s.seat?.isDead || noAbility));
+                const dim = sweetheartActive
+                  ? false
+                  : sweetheartInactive
+                  ? true
+                  : barberActive
                   ? false
                   : jugglerWrongNight
                   ? true
@@ -15406,26 +15566,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
             // seat (oncePerGame tracker). Do NOT push a prompt to the
             // sweetheart's phone — they're dead.
             if (infoPickerStep.char && infoPickerStep.char.id === 'sweetheart' && payload && payload.type === 'seat') {
-              const swSeatNum = infoPickerStep.seat.seatNum;
-              const pickedSeatNum = payload.askSeat;
-              update(s => {
-                const seats2 = (s.grimoire.seats || []).map(seat => {
-                  if (seat.seatNum === pickedSeatNum) {
-                    const has = (seat.reminders || []).some(r =>
-                      r && r.charId === 'sweetheart' && /drunk/i.test(String(r.label || '')));
-                    if (has) return seat;
-                    return { ...seat, reminders: [...(seat.reminders || []), { charId: 'sweetheart', label: 'Drunk', fromPrompt: true }] };
-                  }
-                  if (seat.seatNum === swSeatNum) {
-                    const has = (seat.reminders || []).some(r =>
-                      r && /^no ability$/i.test(String(r.label || '')));
-                    if (has) return seat;
-                    return { ...seat, reminders: [...(seat.reminders || []), { charId: 'sweetheart', label: 'No ability', fromPrompt: true }] };
-                  }
-                  return seat;
-                });
-                return { grimoire: { ...s.grimoire, seats: seats2 } };
-              });
+              onSweetheartPick && onSweetheartPick(infoPickerStep.seat.seatNum, payload.askSeat);
               closeInfoPicker();
               return;
             }
