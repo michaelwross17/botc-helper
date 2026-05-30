@@ -657,10 +657,15 @@ function WaitingForGame({ seat, onChangeName, onLeaveSeat }) {
 }
 
 function RoleReveal({ seat, grimoire, bagCharacterIds, onAccept, onAsk }) {
+  // Cannibal stealth: if the seat has a 'Was Cannibal' marker (we swapped
+  // their actualRoleId to a borrowed role), show the Cannibal token instead
+  // — the player should never see what they ate.
+  const _swappedFromCannibal = (seat.reminders || []).some(r =>
+    r && r.charId === 'cannibal' && /^was cannibal/i.test(String(r.label || '')));
   // Players see their PERCEIVED role (what they think they are).
   // For Drunk-as-Chef, the player sees Chef. The Drunk-ness is the storyteller's secret.
-  const role = CHAR_BY_ID[seat.perceivedRoleId];
-  const actual = CHAR_BY_ID[seat.actualRoleId];
+  const role = _swappedFromCannibal ? CHAR_BY_ID['cannibal'] : CHAR_BY_ID[seat.perceivedRoleId];
+  const actual = _swappedFromCannibal ? CHAR_BY_ID['cannibal'] : CHAR_BY_ID[seat.actualRoleId];
   // Anyone holding a demon-team token sees bluffs. If they're actually the Lunatic,
   // those bluffs come from grimoire.lunaticBluffs (fake info). Otherwise (real demon),
   // grimoire.demonBluffs.
@@ -745,8 +750,8 @@ function RoleReveal({ seat, grimoire, bagCharacterIds, onAccept, onAsk }) {
         <div className="mx-auto rounded-full overflow-hidden border-4 border-amber-700 relative shadow-xl"
           style={{ width: 'min(220px, 60vw)', aspectRatio: '1 / 1',
                    backgroundImage: 'url(data/tokens/character-token-noise.webp)', backgroundSize: 'cover' }}>
-          {iconUrl(seat.perceivedRoleId) && (
-            <img src={iconUrl(seat.perceivedRoleId)} alt={role?.name || ''} className="w-full h-full object-cover" />
+          {iconUrl(_swappedFromCannibal ? 'cannibal' : seat.perceivedRoleId) && (
+            <img src={iconUrl(_swappedFromCannibal ? 'cannibal' : seat.perceivedRoleId)} alt={role?.name || ''} className="w-full h-full object-cover" />
           )}
           <div className="absolute inset-x-0 bottom-0 bg-stone-950/85 px-2 py-2 text-center"
             style={{ minHeight: '42%' }}>
@@ -1581,24 +1586,35 @@ function NightInfoScreen({ mySeat, seats, prompt, onAck, onQuestion }) {
     body = <div className="text-stone-400 italic text-center">(no info)</div>;
   }
 
+  const _cannibalStealth = (mySeat.reminders || []).some(r =>
+    r && r.charId === 'cannibal' && /^was cannibal/i.test(String(r.label || '')));
   return (
     <ScreenShell>
       <section className="parchment rounded-lg p-4 sm:p-5 space-y-3 border-2 border-amber-600/70">
-        <div className="flex items-center gap-3">
-          {iconUrl(_displayRoleId) && (
-            <img src={iconUrl(_displayRoleId)} alt=""
-              className="w-14 h-14 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
-          )}
-          <div className="min-w-0">
-            <div className={`text-xs uppercase tracking-wider team-${c?.team || 'townsfolk'}`}>
-              {c?.team || 'role'}
-            </div>
-            <div className="text-amber-200 text-lg font-bold">{c?.name || _displayRoleId}</div>
+        {_cannibalStealth ? (
+          <div className="text-center">
+            <div className="text-xs uppercase tracking-wider text-amber-300/70">Storyteller info</div>
+            <div className="text-amber-200 text-lg font-bold mt-1">See below</div>
           </div>
-        </div>
-        <div className="text-sm text-stone-300/90 leading-relaxed border-l-2 border-amber-700/50 pl-3">
-          {prompt.instruction || c?.ability}
-        </div>
+        ) : (
+          <>
+            <div className="flex items-center gap-3">
+              {iconUrl(_displayRoleId) && (
+                <img src={iconUrl(_displayRoleId)} alt=""
+                  className="w-14 h-14 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
+              )}
+              <div className="min-w-0">
+                <div className={`text-xs uppercase tracking-wider team-${c?.team || 'townsfolk'}`}>
+                  {c?.team || 'role'}
+                </div>
+                <div className="text-amber-200 text-lg font-bold">{c?.name || _displayRoleId}</div>
+              </div>
+            </div>
+            <div className="text-sm text-stone-300/90 leading-relaxed border-l-2 border-amber-700/50 pl-3">
+              {prompt.instruction || c?.ability}
+            </div>
+          </>
+        )}
       </section>
 
       <section className="parchment rounded-lg p-5">
@@ -1786,21 +1802,37 @@ function NightPromptScreen({ mySeat, seats, prompt, onSubmit, onQuestion, onUseA
   return (
     <ScreenShell>
       <section className="parchment rounded-lg p-4 sm:p-5 space-y-3 border-2 border-amber-600/70">
-        <div className="flex items-center gap-3">
-          {iconUrl(prompt.roleId) && (
-            <img src={iconUrl(prompt.roleId)} alt=""
-              className="w-14 h-14 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
-          )}
-          <div className="min-w-0">
-            <div className={`text-xs uppercase tracking-wider team-${c?.team || 'townsfolk'}`}>
-              {c?.team || 'role'}
-            </div>
-            <div className="text-amber-200 text-lg font-bold">{c?.name || prompt.roleId}</div>
-          </div>
-        </div>
-        <div className="text-sm text-stone-200 leading-relaxed border-l-2 border-amber-700/50 pl-3">
-          {prompt.instruction || c?.ability}
-        </div>
+        {(() => {
+          const cannibalStealth = (mySeat.reminders || []).some(r =>
+            r && r.charId === 'cannibal' && /^was cannibal/i.test(String(r.label || '')));
+          if (cannibalStealth) {
+            return (
+              <div className="text-center">
+                <div className="text-xs uppercase tracking-wider text-amber-300/70">Storyteller request</div>
+                <div className="text-amber-200 text-lg font-bold mt-1">Make your selection</div>
+              </div>
+            );
+          }
+          return (
+            <>
+              <div className="flex items-center gap-3">
+                {iconUrl(prompt.roleId) && (
+                  <img src={iconUrl(prompt.roleId)} alt=""
+                    className="w-14 h-14 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
+                )}
+                <div className="min-w-0">
+                  <div className={`text-xs uppercase tracking-wider team-${c?.team || 'townsfolk'}`}>
+                    {c?.team || 'role'}
+                  </div>
+                  <div className="text-amber-200 text-lg font-bold">{c?.name || prompt.roleId}</div>
+                </div>
+              </div>
+              <div className="text-sm text-stone-200 leading-relaxed border-l-2 border-amber-700/50 pl-3">
+                {prompt.instruction || c?.ability}
+              </div>
+            </>
+          );
+        })()}
       </section>
 
       {!isRoleOnly && (

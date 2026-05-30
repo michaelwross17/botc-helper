@@ -1816,6 +1816,16 @@ function App() {
   // Boomdandy: ST picks players to execute so 3 remain alive.
   // { dyingLabel, candidates, needKill }.
   const [boomdandyPickData, setBoomdandyPickData] = useState(null);
+  // Cannibal Choose role picker — opened from the evil-execution popup.
+  // { canSeatNum, canLabel, candidates, onPick }.
+  const [cannibalChooseData, setCannibalChooseData] = useState(null);
+  const cancelCannibalChoose = () => setCannibalChooseData(null);
+  const applyCannibalChoose = (roleId) => {
+    if (cannibalChooseData && typeof cannibalChooseData.onPick === 'function') {
+      cannibalChooseData.onPick(roleId);
+    }
+    setCannibalChooseData(null);
+  };
   const cancelBoomdandyPick = () => setBoomdandyPickData(null);
   const applyBoomdandyPick = (seatNums) => {
     if (!Array.isArray(seatNums) || seatNums.length === 0) { setBoomdandyPickData(null); return; }
@@ -4812,54 +4822,19 @@ function App() {
         const isGoodTeam = execTeam === 'townsfolk' || execTeam === 'outsider';
         const isEvilTeam = execTeam === 'minion' || execTeam === 'demon';
         if (isGoodTeam || isEvilTeam) {
-          // Find any existing 'Was Cannibal · <OrigRole>' marker on the
-          // current cannibal seat to compute the original role for revert.
+          // Compute original Cannibal role for revert (from prior marker).
           const priorMarker = (canSeat.reminders || []).find(r =>
             r && r.charId === 'cannibal' && /^was cannibal/i.test(String(r.label || '')));
           let originalRoleId = 'cannibal';
           if (priorMarker) {
-            // Marker label format: 'Was Cannibal · <Name>' — look up by name.
             const namePart = String(priorMarker.label).replace(/^was cannibal[^\w]*/i, '').trim();
             if (namePart) {
               const match = Object.values(CHAR_BY_ID).find(c => c && c.name && c.name.toLowerCase() === namePart.toLowerCase());
               originalRoleId = (match && match.id) || 'cannibal';
             }
           }
-          // Revert: strip prior swap markers (Was Cannibal · ..., Cannibal:
-          // Drunk, and any 'No ability' on the previously-borrowed role).
-          // Then apply new state.
           const canSeatNum = canSeat.seatNum;
-          const newRoleId = isGoodTeam ? execRoleId : originalRoleId; // evil → revert only
-          const newRole = CHAR_BY_ID[newRoleId];
           const canOriginalName = (CHAR_BY_ID['cannibal'] || {}).name || 'Cannibal';
-          update(s => {
-            const seats2 = (s.grimoire.seats || []).map(seat => {
-              if (seat.seatNum !== canSeatNum) return seat;
-              // Strip all prior cannibal markers + any No ability tracker
-              // (cannibal re-uses once-per-game roles fresh each cycle).
-              const reminders = (seat.reminders || []).filter(r => {
-                if (!r) return true;
-                if (r.charId === 'cannibal') return false;
-                if (/^no ability$/i.test(String(r.label || ''))) return false;
-                return true;
-              });
-              const next = {
-                ...seat,
-                actualRoleId: newRoleId,
-                perceivedRoleId: newRoleId,
-                reminders,
-              };
-              if (isGoodTeam) {
-                // Place new Was Cannibal marker (stores original Cannibal).
-                next.reminders = [...reminders, { charId: 'cannibal', label: 'Was ' + canOriginalName, fromPrompt: true }];
-              } else if (isEvilTeam) {
-                // Revert + drunk.
-                next.reminders = [...reminders, { charId: 'cannibal', label: 'Drunk', fromPrompt: true }];
-              }
-              return next;
-            });
-            return { grimoire: { ...s.grimoire, seats: seats2 } };
-          });
           const canLabel = canSeat.playerName
             ? canSeat.playerName + ' (seat #' + canSeat.seatNum + ')'
             : 'seat #' + canSeat.seatNum;
@@ -4867,7 +4842,56 @@ function App() {
             ? dyingExecuted.playerName + ' (seat #' + dyingExecuted.seatNum + ')'
             : 'seat #' + dyingExecuted.seatNum;
           const execName = (CHAR_BY_ID[execRoleId] || {}).name || execRoleId;
+          // Helper that performs the swap + marker placement (used by both
+          // the auto good-execution path and the Choose role popup action).
+          const applyCannibalSwap = (newRoleId, addDrunk) => {
+            update(s => {
+              const seats2 = (s.grimoire.seats || []).map(seat => {
+                if (seat.seatNum !== canSeatNum) return seat;
+                const reminders = (seat.reminders || []).filter(r => {
+                  if (!r) return true;
+                  if (r.charId === 'cannibal') return false;
+                  if (/^no ability$/i.test(String(r.label || ''))) return false;
+                  return true;
+                });
+                const newReminders = [...reminders,
+                  { charId: 'cannibal', label: 'Was ' + canOriginalName, fromPrompt: true }];
+                if (addDrunk) {
+                  newReminders.push({ charId: 'cannibal', label: 'Drunk', fromPrompt: true });
+                }
+                return {
+                  ...seat,
+                  actualRoleId: newRoleId,
+                  perceivedRoleId: newRoleId,
+                  reminders: newReminders,
+                };
+              });
+              return { grimoire: { ...s.grimoire, seats: seats2 } };
+            });
+          };
+          const applyCannibalRevertAndDrunk = () => {
+            // Revert to original role + place drunk marker only.
+            update(s => {
+              const seats2 = (s.grimoire.seats || []).map(seat => {
+                if (seat.seatNum !== canSeatNum) return seat;
+                const reminders = (seat.reminders || []).filter(r => {
+                  if (!r) return true;
+                  if (r.charId === 'cannibal') return false;
+                  if (/^no ability$/i.test(String(r.label || ''))) return false;
+                  return true;
+                });
+                return {
+                  ...seat,
+                  actualRoleId: originalRoleId,
+                  perceivedRoleId: originalRoleId,
+                  reminders: [...reminders, { charId: 'cannibal', label: 'Drunk', fromPrompt: true }],
+                };
+              });
+              return { grimoire: { ...s.grimoire, seats: seats2 } };
+            });
+          };
           if (isGoodTeam) {
+            applyCannibalSwap(execRoleId, false);
             setTimeout(() => addCornerPrompt({
               kind: 'success',
               title: 'Cannibal: gained ' + execName,
@@ -4875,11 +4899,44 @@ function App() {
               actions: [{ label: 'OK', primary: true }],
             }), 0);
           } else {
+            // Evil execution: ST chooses to either let the Cannibal go drunk
+            // (default) or pick a good role to swap them into (for false-info).
             setTimeout(() => addCornerPrompt({
               kind: 'warn',
-              title: 'Cannibal: ate evil — now drunk',
-              body: 'The Cannibal (' + canLabel + ') ate ' + execLabel + ' (' + execName + ', evil). They are now drunk until the next execution. Any prior borrowed role has been reverted.',
-              actions: [{ label: 'OK', primary: true }],
+              title: 'Cannibal ate an evil player',
+              body: 'The Cannibal (' + canLabel + ') ate ' + execLabel + ' (' + execName + ', evil). Ignore makes them drunk only; Choose role lets you pick any good role for them (they will still be drunk — useful for false info).',
+              actions: [
+                { label: 'Choose role', primary: true, onClick: () => {
+                  const scriptIds = state.characterIds || [];
+                  const candidates = scriptIds
+                    .map(id => CHAR_BY_ID[id])
+                    .filter(rc => rc && (rc.team === 'townsfolk' || rc.team === 'outsider'));
+                  setCannibalChooseData({
+                    canSeatNum,
+                    canLabel,
+                    candidates,
+                    onPick: (pickedRoleId) => {
+                      applyCannibalSwap(pickedRoleId, true);
+                      const pickName = (CHAR_BY_ID[pickedRoleId] || {}).name || pickedRoleId;
+                      addCornerPrompt({
+                        kind: 'success',
+                        title: 'Cannibal: swapped to ' + pickName + ' (drunk)',
+                        body: 'The Cannibal is now treated as the ' + pickName + ' and is drunk — they will receive false info from this role\'s abilities.',
+                        actions: [{ label: 'OK', primary: true }],
+                      });
+                    },
+                  });
+                } },
+                { label: 'Ignore', onClick: () => {
+                  applyCannibalRevertAndDrunk();
+                  addCornerPrompt({
+                    kind: 'warn',
+                    title: 'Cannibal drunk',
+                    body: 'The Cannibal is now drunk until the next execution. Any prior borrowed role has been reverted.',
+                    actions: [{ label: 'OK', primary: true }],
+                  });
+                } },
+              ],
             }), 0);
           }
         }
@@ -5726,7 +5783,7 @@ function App() {
           ability fired" leaking that they just targeted the Fool).
           The popups reappear the moment the ST taps "Return to
           storyteller" and the overlay closes. */}
-      {cornerPrompts.length > 0 && localOverlayStep == null && localGrimoireSeat == null && moonchildPickSeat == null && klutzPickSeat == null && vigorPickData == null && pixiePickData == null && huntsmanPickData == null && boomdandyPickData == null && evilTwinModalData == null && lunaticPickerData == null && (
+      {cornerPrompts.length > 0 && localOverlayStep == null && localGrimoireSeat == null && moonchildPickSeat == null && klutzPickSeat == null && vigorPickData == null && pixiePickData == null && huntsmanPickData == null && boomdandyPickData == null && cannibalChooseData == null && evilTwinModalData == null && lunaticPickerData == null && (
         <STCornerPrompts
           prompts={cornerPrompts}
           onAction={(promptId, actionIdx) => {
@@ -5786,6 +5843,13 @@ function App() {
           data={boomdandyPickData}
           onApply={applyBoomdandyPick}
           onCancel={cancelBoomdandyPick}
+        />
+      )}
+      {cannibalChooseData != null && (
+        <CannibalChoosePickModal
+          data={cannibalChooseData}
+          onApply={applyCannibalChoose}
+          onCancel={cancelCannibalChoose}
         />
       )}
       {evilTwinModalData != null && (
@@ -13414,6 +13478,66 @@ function PixiePickerModal({ data, onApply, onCancel }) {
   );
 }
 
+function CannibalChoosePickModal({ data, onApply, onCancel }) {
+  const [picked, setPicked] = useState(null);
+  if (!data) return null;
+  const cands = data.candidates || [];
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-950/85 flex items-start sm:items-center justify-center p-2 sm:p-4 overflow-y-auto">
+      <div className="parchment rounded-lg p-4 sm:p-5 max-w-lg w-full space-y-3 my-4 border-2 border-amber-600/70">
+        <div className="flex items-center gap-3">
+          {iconUrl('cannibal') && (
+            <img src={iconUrl('cannibal')} alt=""
+              className="w-12 h-12 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
+          )}
+          <div className="flex-1 min-w-0">
+            <div className="text-[10px] uppercase tracking-wider text-amber-300">Outsider · Cannibal</div>
+            <div className="text-amber-200 text-lg font-bold leading-tight">Pick a good role for the Cannibal</div>
+            <div className="text-xs text-stone-400 mt-0.5">{data.canLabel} — they will become this role and be drunk (false info source).</div>
+          </div>
+        </div>
+        {cands.length === 0 ? (
+          <div className="text-sm text-stone-400 italic text-center py-3">No good roles in the script.</div>
+        ) : (
+          <ul className="grid grid-cols-2 gap-2 max-h-80 overflow-y-auto">
+            {cands.map(rc => {
+              const isP = picked === rc.id;
+              return (
+                <li key={rc.id}>
+                  <button onClick={() => setPicked(rc.id)}
+                    className={`w-full card rounded p-2 flex items-center gap-2 text-left
+                      ${isP ? 'border-amber-500 bg-amber-900/30 ring-1 ring-amber-700' : 'hover:border-amber-500'}`}>
+                    {iconUrl(rc.id) && (
+                      <img src={iconUrl(rc.id)} alt=""
+                        className="w-9 h-9 rounded-full border border-stone-700 object-cover flex-shrink-0" />
+                    )}
+                    <span className={`flex-1 min-w-0 truncate text-sm team-${rc.team}`}>{rc.name}</span>
+                    {isP && <span className="text-amber-300 text-base">✓</span>}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        <div className="grid grid-cols-2 gap-2 pt-1">
+          <button onClick={onCancel}
+            className="py-2.5 rounded-lg text-sm font-semibold bg-stone-800 hover:bg-stone-700 text-stone-300 border border-stone-700">
+            Cancel
+          </button>
+          <button onClick={() => picked && onApply(picked)}
+            disabled={!picked}
+            className={`py-2.5 rounded-lg text-sm font-bold transition
+              ${picked
+                ? 'bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40'
+                : 'bg-stone-800 text-stone-500 cursor-not-allowed'}`}>
+            Apply →
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function BoomdandyPickModal({ data, onApply, onCancel }) {
   const [picked, setPicked] = useState([]);
   if (!data) return null;
@@ -15435,19 +15559,35 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
         </div>
 
         <section className="parchment rounded-lg p-4 sm:p-5 space-y-3 border-2 border-amber-600/70">
-          <div className="flex items-center gap-3">
-            {iconUrl(_displayCharId) && (
-              <img src={iconUrl(_displayCharId)} alt=""
-                className="w-14 h-14 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
-            )}
-            <div className="min-w-0">
-              <div className={`text-xs uppercase tracking-wider team-${c?.team || 'townsfolk'}`}>{c?.team || 'role'}</div>
-              <div className="text-amber-200 text-lg font-bold">{c?.name || _displayCharId}</div>
-            </div>
-          </div>
-          <div className="text-sm text-stone-200 leading-relaxed border-l-2 border-amber-700/50 pl-3">
-            {step.instruction || c?.ability}
-          </div>
+          {(() => {
+            const cannibalStealth = step.seat && (step.seat.reminders || []).some(r =>
+              r && r.charId === 'cannibal' && /^was cannibal/i.test(String(r.label || '')));
+            if (cannibalStealth) {
+              return (
+                <div className="text-center">
+                  <div className="text-xs uppercase tracking-wider text-amber-300/70">Storyteller request</div>
+                  <div className="text-amber-200 text-lg font-bold mt-1">{isInfo ? 'See below' : 'Make your selection'}</div>
+                </div>
+              );
+            }
+            return (
+              <>
+                <div className="flex items-center gap-3">
+                  {iconUrl(_displayCharId) && (
+                    <img src={iconUrl(_displayCharId)} alt=""
+                      className="w-14 h-14 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
+                  )}
+                  <div className="min-w-0">
+                    <div className={`text-xs uppercase tracking-wider team-${c?.team || 'townsfolk'}`}>{c?.team || 'role'}</div>
+                    <div className="text-amber-200 text-lg font-bold">{c?.name || _displayCharId}</div>
+                  </div>
+                </div>
+                <div className="text-sm text-stone-200 leading-relaxed border-l-2 border-amber-700/50 pl-3">
+                  {step.instruction || c?.ability}
+                </div>
+              </>
+            );
+          })()}
         </section>
 
         {isInfo ? (
