@@ -3329,8 +3329,18 @@ function App() {
         }
         // Lunatic: park at 'awaiting-st-response' so STResponseCard renders
         // with a Send-to-Demon button. All other roles flip straight to 'done'.
+        //
+        // BUT: if an upstream handler in this loop replaced next[seatStr]
+        // with a new prompt (e.g. Barber YES → barber-pick target2) or
+        // deleted it (e.g. Barber NO), don't clobber that with status='done'.
+        // Detect via startedAt mismatch / absence of next[seatStr].
+        const _curr = next[seatStr];
+        const _replaced = _curr && _curr !== p && (_curr.startedAt !== p.startedAt || _curr.action !== p.action || _curr.ceremony !== p.ceremony);
+        const _deleted = !(seatStr in next);
         if (isLunaticActor) {
           next[seatStr] = { ...p, status: 'awaiting-st-response', respondedAt: Date.now() };
+        } else if (_replaced || _deleted) {
+          // Leave the upstream replacement/delete in place.
         } else {
           next[seatStr] = { ...p, status: 'done', doneAt: Date.now() };
         }
