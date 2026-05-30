@@ -1325,11 +1325,11 @@ function NightInfoScreen({ mySeat, seats, prompt, onAck, onQuestion }) {
         <div className="grid grid-cols-2 gap-3 pt-2">
           <button onClick={() => { try { window.__barberAnswer = 'no'; } catch (e) {} ; onAck && onAck(); }}
             className="py-4 rounded-lg text-base font-bold transition bg-red-700 hover:bg-red-600 text-stone-100">
-            NO — kill as usual
+            NO
           </button>
           <button onClick={() => { try { window.__barberAnswer = 'yes'; } catch (e) {} ; onAck && onAck(); }}
             className="py-4 rounded-lg text-base font-bold transition bg-emerald-600 hover:bg-emerald-500 text-stone-950">
-            YES — swap 2 roles
+            YES
           </button>
         </div>
         <div className="text-[10px] text-stone-500 pt-2">Tap one option above.</div>

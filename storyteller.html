@@ -14345,11 +14345,11 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
           <div className="grid grid-cols-2 gap-3 pt-2">
             <button onClick={() => { setSubmittedValue('no'); setPhase('confirmed'); onSubmit([]); }}
               className="py-4 rounded-lg text-base font-bold transition bg-red-700 hover:bg-red-600 text-stone-100">
-              NO — kill as usual
+              NO
             </button>
             <button onClick={() => { setSubmittedValue('yes'); setPhase('confirmed'); onSubmit([1]); }}
               className="py-4 rounded-lg text-base font-bold transition bg-emerald-600 hover:bg-emerald-500 text-stone-950">
-              YES — swap 2 roles
+              YES
             </button>
           </div>
           <div className="text-[10px] text-stone-500 pt-2">Tap one option above.</div>
@@ -14840,7 +14840,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
           reminder: 'Show new role to swapped seat',
           isExtra: false,
           action: 'sc-reveal',
-          instruction: 'Wake this player and reveal their new role and alignment. Do not mention the Barber.',
+          instruction: 'Wake this player and reveal their new role and alignment.',
           reminderLabel: '',
           requiresDeath: false,
           oncePerGame: false,
@@ -14981,6 +14981,41 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
       for (const s of steps) {
         if (s.type === 'char') { n += 1; s.stepNum = n; }
       }
+    }
+  }
+  // Klutz after-dawn injection. When any Klutz seat carries the 'Triggered'
+  // reminder (placed on night death by firePassiveDeathTriggers), splice a
+  // synthetic klutz-capture step right after Dawn so the ST opens the picker
+  // alongside the morning death announcement.
+  {
+    const triggeredKl = (seats || []).find(s =>
+      s.actualRoleId === 'klutz' &&
+      (s.reminders || []).some(r => r && r.charId === 'klutz' && /^triggered$/i.test(String(r.label || ''))) &&
+      !(s.reminders || []).some(r => r && r.charId === 'klutz' && /^chosen$/i.test(String(r.label || '')))
+    );
+    if (triggeredKl) {
+      const klChar = CHAR_BY_ID['klutz'] || { id: 'klutz', name: 'Klutz', team: 'outsider' };
+      const klDawnIdx = steps.findIndex(s => s.type === 'ceremony' && s.id === 'dawn');
+      const klStep = {
+        type: 'char',
+        char: klChar,
+        seat: triggeredKl,
+        reminder: '',
+        isExtra: false,
+        action: 'klutz-capture',
+        instruction: 'The Klutz died last night — capture the player they publicly chose. A corner popup will announce the result.',
+        reminderLabel: '',
+        requiresDeath: true,
+        oncePerGame: false,
+        canSkip: false,
+      };
+      if (klDawnIdx >= 0) {
+        steps.splice(klDawnIdx + 1, 0, klStep);
+      } else {
+        steps.push(klStep);
+      }
+      let n = 0;
+      for (const s of steps) { if (s.type === 'char') { n += 1; s.stepNum = n; } }
     }
   }
   // Moonchild after-dawn injection. When any Moonchild seat carries the
