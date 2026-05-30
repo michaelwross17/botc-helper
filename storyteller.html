@@ -2801,6 +2801,7 @@ function App() {
               if (!r) return true;
               if (r.charId === 'snakecharmer' && /^reveal:/i.test(String(r.label || ''))) return false;
               if (r.charId === 'barber' && /^reveal: new role$/i.test(String(r.label || ''))) return false;
+              if (r.charId === 'fanggu' && /^reveal: new fanggu$/i.test(String(r.label || ''))) return false;
               return true;
             });
             if (reminders.length === (sx.reminders || []).length) return sx;
@@ -4244,24 +4245,68 @@ function App() {
         }, 0);
       }
     }
-    // Fang Gu — killed an Outsider for the first time: that Outsider should
-    // become the evil Fang Gu and the original Fang Gu dies. Place a
-    // 'fanggu' 'Swapped' marker on the original Fang Gu so the second kill
-    // skips this branch.
+    // Fang Gu — killed an Outsider. Two paths:
+    //   1. If ANY seat already carries the fanggu 'Changed' / 'Swapped'
+    //      marker (swap already happened earlier this game), the kill
+    //      stands and no popup fires.
+    //   2. Otherwise the ST sees an Ignore / Make Fang Gu popup. Make Fang
+    //      Gu un-dies the outsider, converts them to fanggu (evil), places
+    //      the permanent 'Changed' marker + a transient 'Reveal: new fanggu'
+    //      marker that drives the synthetic post-FG role-reveal step, and
+    //      kills the original demon directly.
     if (causeCharId === 'fanggu' && !isDayDeath) {
       const cDef = CHAR_BY_ID[dyingSeat.actualRoleId];
       if (cDef && cDef.team === 'outsider') {
         setTimeout(() => {
           const seats = state.grimoire.seats || [];
-          const fanggu = seats.find(s => s.actualRoleId === 'fanggu');
-          const alreadySwapped = fanggu && (fanggu.reminders || []).some(r =>
-            r && r.charId === 'fanggu' && /^swapped$/i.test(String(r.label || '')));
-          if (alreadySwapped) return;
+          const alreadyChanged = seats.some(s => (s.reminders || []).some(r =>
+            r && r.charId === 'fanggu' && /^(changed|swapped)$/i.test(String(r.label || ''))));
+          if (alreadyChanged) return;  // kill stands, no popup
+          const origFanggu = seats.find(s => s.actualRoleId === 'fanggu');
+          if (!origFanggu) return;
+          const origLabel = origFanggu.playerName
+            ? origFanggu.playerName + ' (seat #' + origFanggu.seatNum + ')'
+            : 'seat #' + origFanggu.seatNum;
           addCornerPrompt({
             kind: 'warn',
             title: 'Fang Gu hit an Outsider',
-            body: seatLabel + ' is an Outsider (the first one killed by Fang Gu). They should become the evil Fang Gu instead, and the original Fang Gu dies. Use "Change role" to swap the dying seat to Fang Gu + mark evil, then kill the original Fang Gu. Place a "Fang Gu: Swapped" reminder on the new Fang Gu to record the swap.',
-            actions: [{ label: 'OK', primary: true }],
+            body: seatLabel + ' is an Outsider. They may become the evil Fang Gu instead, and the original Fang Gu (' + origLabel + ') dies. Make Fang Gu performs both swaps + queues a wake step to reveal the new role and alignment.',
+            actions: [
+              { label: 'Make Fang Gu', primary: true, onClick: () => {
+                update(s => {
+                  const seats2 = (s.grimoire.seats || []).map(seat => {
+                    if (seat.seatNum === dyingSeat.seatNum) {
+                      // Un-die outsider, strip Dead reminder placed moments
+                      // ago by _killSeatDirect, swap to fanggu + evil, place
+                      // Changed (permanent) + Reveal: new fanggu (drives
+                      // the synthetic step).
+                      const reminders = (seat.reminders || []).filter(r =>
+                        !(r && r.label === 'Dead'));
+                      return { ...seat,
+                        isDead: false,
+                        actualRoleId: 'fanggu',
+                        perceivedRoleId: 'fanggu',
+                        alignment: 'evil',
+                        reminders: [...reminders,
+                          { charId: 'fanggu', label: 'Changed', fromPrompt: true },
+                          { charId: 'fanggu', label: 'Reveal: new fanggu', fromPrompt: true }] };
+                    }
+                    if (seat.seatNum === origFanggu.seatNum) {
+                      // Original Fang Gu dies. Place a Dead reminder by
+                      // 'fanggu' so it's clear they died via the swap, but
+                      // skip the trigger re-fire (the alreadyChanged guard
+                      // above prevents recursion regardless).
+                      const has = (seat.reminders || []).some(r =>
+                        r && r.charId === 'fanggu' && /^dead$/i.test(String(r.label || '')));
+                      return { ...seat, isDead: true, reminders: has ? seat.reminders : [...(seat.reminders || []), { charId: 'fanggu', label: 'Dead', fromPrompt: true }] };
+                    }
+                    return seat;
+                  });
+                  return { grimoire: { ...s.grimoire, seats: seats2 } };
+                });
+              } },
+              { label: 'Ignore' },
+            ],
           });
         }, 0);
       }
@@ -14858,6 +14903,38 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
           infoType: 'role-alignment',
           infoConfig: { roleId: newRoleId, alignment: newAlignment },
           scReveal: { kind: 'barber-' + rev.seatNum, seatNum: rev.seatNum, roleId: newRoleId, alignment: newAlignment },
+          prompt: isOurPrompt ? rawPrompt : null,
+        });
+      }
+    }
+    // Fang Gu post-swap reveal — emit a synthetic sc-reveal step below
+    // Fang Gu's row for each seat carrying a 'Reveal: new fanggu' marker.
+    if (id === 'fanggu') {
+      const fgRevealSeats = (seats || []).filter(sx =>
+        (sx.reminders || []).some(r => r && r.charId === 'fanggu' && /^reveal: new fanggu$/i.test(String(r.label || ''))));
+      for (const rev of fgRevealSeats) {
+        stepNum += 1;
+        const newRoleId = rev.actualRoleId; // 'fanggu' after swap
+        const newAlignment = 'evil';
+        const newRoleChar = CHAR_BY_ID[newRoleId] || { id: newRoleId, name: 'Fang Gu', team: 'demon' };
+        const rawPrompt = nightPrompts[rev.seatNum];
+        const isOurPrompt = !!(rawPrompt && rawPrompt.scRevealKind === 'fanggu-' + rev.seatNum);
+        steps.push({
+          type: 'char',
+          stepNum,
+          char: newRoleChar,
+          seat: rev,
+          reminder: 'Show new role + alignment',
+          isExtra: false,
+          action: 'sc-reveal',
+          instruction: 'Wake this player and reveal their new role and alignment.',
+          reminderLabel: '',
+          requiresDeath: false,
+          oncePerGame: false,
+          canSkip: false,
+          infoType: 'role-alignment',
+          infoConfig: { roleId: newRoleId, alignment: newAlignment },
+          scReveal: { kind: 'fanggu-' + rev.seatNum, seatNum: rev.seatNum, roleId: newRoleId, alignment: newAlignment },
           prompt: isOurPrompt ? rawPrompt : null,
         });
       }
