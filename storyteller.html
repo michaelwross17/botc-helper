@@ -4178,15 +4178,9 @@ function App() {
       ? dyingSeat.playerName + ' (seat #' + dyingSeat.seatNum + ')'
       : 'seat #' + dyingSeat.seatNum;
     const afflicted = isDrunkOrPoisoned(dyingSeat);
-    // Sweetheart — any death triggers a permanent Drunk on a chosen player.
-    if (dyingSeat.actualRoleId === 'sweetheart' && !afflicted) {
-      setTimeout(() => addCornerPrompt({
-        kind: 'warn',
-        title: 'Sweetheart died',
-        body: seatLabel + ' (Sweetheart) died. Pick any player and place a "Sweetheart: Drunk" reminder on them — they are drunk for the rest of the game (the reminder is permanent).',
-        actions: [{ label: 'OK', primary: true }],
-      }), 0);
-    }
+    // Sweetheart — death no longer triggers a popup. The sweetheart night
+    // row activates whenever the seat is dead and the ability is unused;
+    // the ST starts it there and picks the player to become drunk.
     // Barber — sober death (any cause). Auto-place 'Haircuts tonight' on
     // the Barber's seat (dayIdx-tagged so it persists exactly one Go-to-Night).
     if (dyingSeat.actualRoleId === 'barber' && !afflicted) {
@@ -10460,7 +10454,9 @@ const NIGHT_ACTIONS = {
 
   // ===== Sects & Violets — passive on death =====
   barber:        { action: 'passive',     instruction: 'Passive — if Barber dies during the day, tonight the Demon must swap 2 player roles (ST popup fires on Barber\'s day death).' },
-  sweetheart:    { action: 'passive',     instruction: 'Passive — when Sweetheart dies, 1 player is drunk from now on (ST popup picks).' },
+  sweetheart:    { action: 'info-st',     reminder: '',           instruction: 'When Sweetheart is dead, pick 1 player to become drunk for the rest of the game.',
+                   oncePerGame: true,
+                   infoType: 'seat',       infoConfig: { numSeats: 1, display: 'Pick a player to become drunk' } },
 
   // ===== Experimental — Townsfolk (info / target) =====
   highpriestess: { action: 'info-st',     reminder: 'Saw',         instruction: 'You learn which player the Storyteller thinks you should talk to most.',
@@ -11120,6 +11116,20 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
     }
     // Killed by demon — fall through to the normal info-st flow.
   }
+  // Sweetheart: activate only when DEAD (any death), regardless of whether a
+  // 'Dead' reminder is still on the seat. Comes BEFORE the generic
+  // requiresDeath / seat-dead gates so they don't reject a dead Sweetheart.
+  if (step.char && step.char.id === 'sweetheart') {
+    if (!seat.isDead) {
+      return (
+        <div className="mt-1.5 text-[11px] text-stone-500 italic">
+          Sweetheart is alive — no ability tonight. Activates once Sweetheart dies.
+        </div>
+      );
+    }
+    // Dead + ability used: handled by the generic oncePerGame check above.
+    // Dead + not used: fall through to the normal info-st flow below.
+  }
   if (requiresDeath && action !== 'moonchild-resolve' && !(seat.isDead && hasDeadReminder)) {
     return (
       <div className="mt-1.5 text-[11px] text-stone-500 italic">
@@ -11131,7 +11141,7 @@ function NightStepActionRow({ step, readOnly, onStartPrompt, onCancelPrompt, onM
   // this marker, their ability is still active despite being dead.
   const vigorKeepsAbility = (seat?.reminders || []).some(r =>
     r && r.charId === 'vigormortis' && /keeps ability/i.test(String(r.label || '')));
-  if (seat.isDead && action !== 'manual' && action !== 'moonchild-resolve' && !requiresDeath && (!step.char || step.char.id !== 'zombuul') && !vigorKeepsAbility) return (
+  if (seat.isDead && action !== 'manual' && action !== 'moonchild-resolve' && !requiresDeath && (!step.char || step.char.id !== 'zombuul') && (!step.char || step.char.id !== 'sweetheart') && !vigorKeepsAbility) return (
     <div className="mt-1.5 text-[11px] text-stone-500 italic">Seat is dead — skip.</div>
   );
   if (action === 'moonchild-resolve') {
@@ -15391,6 +15401,34 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
           lastExecution={lastExecution}
           onClose={closeInfoPicker}
           onSend={(payload) => {
+            // Sweetheart: ST-only resolution. Place 'Sweetheart: Drunk' on
+            // the picked seat (permanent) + 'No ability' on the sweetheart
+            // seat (oncePerGame tracker). Do NOT push a prompt to the
+            // sweetheart's phone — they're dead.
+            if (infoPickerStep.char && infoPickerStep.char.id === 'sweetheart' && payload && payload.type === 'seat') {
+              const swSeatNum = infoPickerStep.seat.seatNum;
+              const pickedSeatNum = payload.askSeat;
+              update(s => {
+                const seats2 = (s.grimoire.seats || []).map(seat => {
+                  if (seat.seatNum === pickedSeatNum) {
+                    const has = (seat.reminders || []).some(r =>
+                      r && r.charId === 'sweetheart' && /drunk/i.test(String(r.label || '')));
+                    if (has) return seat;
+                    return { ...seat, reminders: [...(seat.reminders || []), { charId: 'sweetheart', label: 'Drunk', fromPrompt: true }] };
+                  }
+                  if (seat.seatNum === swSeatNum) {
+                    const has = (seat.reminders || []).some(r =>
+                      r && /^no ability$/i.test(String(r.label || '')));
+                    if (has) return seat;
+                    return { ...seat, reminders: [...(seat.reminders || []), { charId: 'sweetheart', label: 'No ability', fromPrompt: true }] };
+                  }
+                  return seat;
+                });
+                return { grimoire: { ...s.grimoire, seats: seats2 } };
+              });
+              closeInfoPicker();
+              return;
+            }
             // For local players, don't push to a phone — open the on-ST overlay
             // with the chosen info so the local player can tap Got it on this device.
             if (infoPickerStep.seat?.isLocal) {
