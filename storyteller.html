@@ -1819,29 +1819,21 @@ function App() {
     const pick = CHAR_BY_ID[newRoleId];
     if (!pick) { setHuntsmanPickData(null); return; }
     const damselSeatNum = data.damselSeatNum;
+    // Swap role + place permanent 'Was Damsel' marker + transient
+    // 'Reveal: huntsman-converted' marker (drives the synthetic post-Huntsman
+    // reveal step in the night order). No prompt is pushed here — the ST
+    // starts the reveal step manually.
     update(s => {
       const seats2 = (s.grimoire.seats || []).map(seat => {
         if (seat.seatNum !== damselSeatNum) return seat;
         return { ...seat,
           actualRoleId: pick.id,
           perceivedRoleId: pick.id,
-          reminders: [...(seat.reminders || []), { charId: 'huntsman', label: 'Was Damsel', fromPrompt: true }] };
+          reminders: [...(seat.reminders || []),
+            { charId: 'huntsman', label: 'Was Damsel', fromPrompt: true },
+            { charId: 'huntsman', label: 'Reveal: huntsman-converted', fromPrompt: true }] };
       });
-      const np = { ...(s.grimoire.nightPrompts || {}) };
-      np[String(damselSeatNum)] = {
-        roleId: pick.id,
-        action: 'info-st',
-        instruction: 'Your role has changed — see below.',
-        reminderLabel: '',
-        eligible: 'all',
-        status: 'awaiting',
-        targets: null,
-        infoPayload: { type: 'role-alignment', roleId: pick.id, alignment: 'good' },
-        ceremony: 'huntsman-convert',
-        startedAt: Date.now(),
-        nightIdx: s.grimoire.viewingDayIndex || 0,
-      };
-      return { grimoire: { ...s.grimoire, seats: seats2, nightPrompts: np } };
+      return { grimoire: { ...s.grimoire, seats: seats2 } };
     });
     setHuntsmanPickData(null);
   };
@@ -2919,6 +2911,7 @@ function App() {
               if (r.charId === 'snakecharmer' && /^reveal:/i.test(String(r.label || ''))) return false;
               if (r.charId === 'barber' && /^reveal: new role$/i.test(String(r.label || ''))) return false;
               if (r.charId === 'fanggu' && /^reveal: new fanggu$/i.test(String(r.label || ''))) return false;
+              if (r.charId === 'huntsman' && /^reveal: huntsman-converted$/i.test(String(r.label || ''))) return false;
               return true;
             });
             if (reminders.length === (sx.reminders || []).length) return sx;
@@ -3064,10 +3057,18 @@ function App() {
               .map(id => CHAR_BY_ID[id])
               .filter(rc => rc && rc.team === 'townsfolk' && !inPlayIds.has(rc.id));
             const tgtLabel = tgt.playerName ? tgt.playerName + ' (seat #' + tgt.seatNum + ')' : 'seat #' + tgt.seatNum;
-            setTimeout(() => setHuntsmanPickData({
-              damselSeatNum: targetSeatNum,
-              damselLabel: tgtLabel,
-              candidates,
+            setTimeout(() => addCornerPrompt({
+              kind: 'warn',
+              title: 'Huntsman chose the Damsel',
+              body: 'The Huntsman picked ' + tgtLabel + ', who IS the Damsel. Choose to convert the Damsel to a not-in-play Townsfolk, or Ignore (no swap).',
+              actions: [
+                { label: 'Choose', primary: true, onClick: () => setHuntsmanPickData({
+                  damselSeatNum: targetSeatNum,
+                  damselLabel: tgtLabel,
+                  candidates,
+                }) },
+                { label: 'Ignore' },
+              ],
             }), 0);
           }
           next[seatStr] = { ...next[seatStr], huntsmanResolved: true };
@@ -10754,7 +10755,7 @@ const NIGHT_ACTIONS = {
   sailor:        { action: 'target1+st-pick', reminder: '',         instruction: 'Choose an alive player. Either you or they are drunk until dusk. You cannot die.',
                    eligible: 'others' },
 
-  huntsman:      { action: 'target1any',  reminder: 'Used',        instruction: 'On the first night, choose a player. If you chose the Damsel, the Damsel becomes a not-in-play Townsfolk (ST will swap).',
+  huntsman:      { action: 'target1any',  reminder: 'Used',        instruction: '',
                    oncePerGame: true, canSkip: true, phase: 'first', eligible: 'all' },
   // ===== Sects & Violets =====
   dreamer:       { action: 'target1+role-pair', reminder: 'Showed', instruction: 'Choose a player (not yourself). You will learn 1 good and 1 evil character — 1 of them is correct.',
@@ -14822,6 +14823,20 @@ function LocalNightPromptOverlay({ step, infoPayload, seats, onSubmit, onClose, 
               </ul>
             </div>
           )}
+          {!viewerIsDemon && info.damselInPlay && (
+            <div>
+              <div className="text-center text-xs text-stone-400 mb-2 uppercase tracking-wider">Damsel in play</div>
+              <div className="card rounded p-3 border-amber-700/60 bg-amber-950/30 mx-auto max-w-xs flex items-center justify-center gap-3">
+                {iconUrl('damsel') && (
+                  <img src={iconUrl('damsel')} alt="" className="w-14 h-14 rounded-full border-2 border-amber-700 object-cover flex-shrink-0" />
+                )}
+                <div className="text-left min-w-0">
+                  <div className="text-amber-100 text-base font-semibold">Damsel</div>
+                  <div className="text-stone-400 text-[11px]">If a Minion publicly guesses who they are, Evil wins.</div>
+                </div>
+              </div>
+            </div>
+          )}
           {viewerIsDemon && info.lunaticSeat && (
             <div>
               <div className="text-center text-xs text-stone-400 mb-2 uppercase tracking-wider">Lunatic in play</div>
@@ -15454,6 +15469,37 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                            r && r.charId === 'eviltwin' && /^twin$/i.test(String(r.label || '')))) || {}).seatNum || null)
                        : null,
                      prompt });
+      }
+    }
+    // Huntsman post-swap reveal — emit a synthetic sc-reveal step below
+    // Huntsman's row for each seat carrying 'Reveal: huntsman-converted'.
+    if (id === 'huntsman') {
+      const hRevealSeats = (seats || []).filter(sx =>
+        (sx.reminders || []).some(r => r && r.charId === 'huntsman' && /^reveal: huntsman-converted$/i.test(String(r.label || ''))));
+      for (const rev of hRevealSeats) {
+        stepNum += 1;
+        const newRoleId = rev.actualRoleId;
+        const newRoleChar = CHAR_BY_ID[newRoleId] || { id: newRoleId, name: newRoleId, team: 'townsfolk' };
+        const rawPrompt = nightPrompts[rev.seatNum];
+        const isOurPrompt = !!(rawPrompt && rawPrompt.scRevealKind === 'huntsman-' + rev.seatNum);
+        steps.push({
+          type: 'char',
+          stepNum,
+          char: newRoleChar,
+          seat: rev,
+          reminder: 'Show new role + alignment',
+          isExtra: false,
+          action: 'sc-reveal',
+          instruction: 'Wake this player and reveal their new role and alignment.',
+          reminderLabel: '',
+          requiresDeath: false,
+          oncePerGame: false,
+          canSkip: false,
+          infoType: 'role-alignment',
+          infoConfig: { roleId: newRoleId, alignment: 'good' },
+          scReveal: { kind: 'huntsman-' + rev.seatNum, seatNum: rev.seatNum, roleId: newRoleId, alignment: 'good' },
+          prompt: isOurPrompt ? rawPrompt : null,
+        });
       }
     }
     // Barber post-swap reveal steps — same pattern as SC reveal: emit 2
