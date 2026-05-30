@@ -1074,6 +1074,7 @@ function App() {
       grimoire: { generated: true, seats, pendingAssignments: pending, demonBluffs: [null, null, null],
                   rolesDealt: false, townSquareNotes: { above: '', below: '' },
                   gameStarted: false, days: [], viewingDayIndex: 0,
+                  nightChanges: [],
                   nominationsByDay: {}, nominationsViewingDayIndex: 0,
                   grimoireShownToSeat: null, lunaticBluffs: [null, null, null],
                   minionBluffs: {},          // tied to specific seats — wipe on reshuffle
@@ -1798,6 +1799,9 @@ function App() {
     });
   };
   const cancelKlutzPick = () => setKlutzPickSeat(null);
+  // Daytime reminders modal — shows the nightChanges accumulated since the
+  // last Go-to-Night so the ST can announce deaths/revives in the morning.
+  const [daytimeRemindersOpen, setDaytimeRemindersOpen] = useState(false);
   // Pixie setup picker — list of in-play TF, ST picks one, marker placed on
   // the Pixie seat. State holds { pixieSeatNum, candidates }.
   const [pixiePickData, setPixiePickData] = useState(null);
@@ -1904,6 +1908,36 @@ function App() {
   const cancelEvilTwinModal = () => setEvilTwinModalData(null);
   // Barber flow — push the Yes/No prompt to the Demon. Decision handled
   // by submitted-prompts effect (barber-ask → barber-pick → ST popup).
+  // Track isDead transitions and append to grimoire.nightChanges so the
+  // ST can review them on the Daytime reminders modal in the morning.
+  // Reset happens in advanceToNight.
+  const _prevSeatsRef = React.useRef(null);
+  useEffect(() => {
+    if (!loaded) return;
+    const cur = state.grimoire.seats || [];
+    const prev = _prevSeatsRef.current;
+    if (prev) {
+      const newEntries = [];
+      for (const c of cur) {
+        const p = prev.find(x => x.seatNum === c.seatNum);
+        if (!p) continue;
+        const prevDead = !!p.isDead;
+        const curDead = !!c.isDead;
+        if (!prevDead && curDead) {
+          newEntries.push({ seatNum: c.seatNum, playerName: c.playerName || '', type: 'died', at: Date.now() });
+        } else if (prevDead && !curDead) {
+          newEntries.push({ seatNum: c.seatNum, playerName: c.playerName || '', type: 'revived', at: Date.now() });
+        }
+      }
+      if (newEntries.length > 0) {
+        update(s => ({
+          grimoire: { ...s.grimoire, nightChanges: [...(s.grimoire.nightChanges || []), ...newEntries] }
+        }));
+      }
+    }
+    _prevSeatsRef.current = cur;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.grimoire.seats, loaded]);
   // Sweetheart: ST-only resolution from the night row's InfoPickerModal.
   const applySweetheartPick = (swSeatNum, pickedSeatNum) => {
     if (swSeatNum == null || pickedSeatNum == null) return;
@@ -3924,6 +3958,7 @@ function App() {
           seats: seatsWithShab,
           travellers: travellersForNewNight,
           nightPrompts: {},
+          nightChanges: [],
           days: [...(g.days || []), snapshot],
           townSquareNotes: { above: g.townSquareNotes?.above || '', below: '' },
           viewingDayIndex: (g.days || []).length + 1,
@@ -5692,6 +5727,7 @@ function App() {
           onOpenEvilTwinModal={openEvilTwinModal}
           onOpenBarberFlow={openBarberFlow}
           onSweetheartPick={applySweetheartPick}
+          onShowDaytimeReminders={() => setDaytimeRemindersOpen(true)}
           onOpenLocalPrompt={openLocalPrompt}
           onMarkSetupReminder={markSetupReminder}
           onSetupReminderAction={onSetupReminderActionApp}
@@ -5790,7 +5826,7 @@ function App() {
           ability fired" leaking that they just targeted the Fool).
           The popups reappear the moment the ST taps "Return to
           storyteller" and the overlay closes. */}
-      {cornerPrompts.length > 0 && localOverlayStep == null && localGrimoireSeat == null && moonchildPickSeat == null && klutzPickSeat == null && vigorPickData == null && pixiePickData == null && huntsmanPickData == null && boomdandyPickData == null && cannibalChooseData == null && evilTwinModalData == null && lunaticPickerData == null && (
+      {cornerPrompts.length > 0 && !daytimeRemindersOpen && localOverlayStep == null && localGrimoireSeat == null && moonchildPickSeat == null && klutzPickSeat == null && vigorPickData == null && pixiePickData == null && huntsmanPickData == null && boomdandyPickData == null && cannibalChooseData == null && evilTwinModalData == null && lunaticPickerData == null && (
         <STCornerPrompts
           prompts={cornerPrompts}
           onAction={(promptId, actionIdx) => {
@@ -5857,6 +5893,12 @@ function App() {
           data={cannibalChooseData}
           onApply={applyCannibalChoose}
           onCancel={cancelCannibalChoose}
+        />
+      )}
+      {daytimeRemindersOpen && (
+        <DaytimeRemindersModal
+          entries={state.grimoire.nightChanges || []}
+          onClose={() => setDaytimeRemindersOpen(false)}
         />
       )}
       {evilTwinModalData != null && (
@@ -7407,6 +7449,8 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         daysCount={(grim.days || []).length}
         onBegin={onBeginGame}
         onAdvance={onAdvanceToNight}
+        onShowDaytimeReminders={onShowDaytimeReminders}
+        nightChangesCount={(grim.nightChanges || []).length}
         setupReady={(() => {
           if ((grim.pendingAssignments || []).length > 0) return false;
           if (grim.setupRemindersSkipped) return true;
@@ -7415,6 +7459,7 @@ function GrimoirePage({ state, swapSourceSeat, assigningRoleId, forceReadOnly,
         })()}
         setupBlockReason="Finish the setup needs above before starting."
       />
+      <NightChangesTable entries={grim.nightChanges || []} />
 
       {pickerSeat != null && (
         <ReminderPicker
@@ -10485,7 +10530,7 @@ function BigRoleToken({ charId, compact }) {
 }
 
 // Begin Game / Go to Night phase control at the bottom of the grimoire page.
-function BeginOrAdvanceButton({ seats, gameStarted, daysCount, onBegin, onAdvance, setupReady = true, setupBlockReason = '' }) {
+function BeginOrAdvanceButton({ seats, gameStarted, daysCount, onBegin, onAdvance, onShowDaytimeReminders, nightChangesCount = 0, setupReady = true, setupBlockReason = '' }) {
   const acceptedCount = (seats || []).filter(s => s.playerStatus === 'accepted').length;
   const allAccepted = acceptedCount === seats.length && seats.length > 0;
   const currentLabel = `Night ${daysCount} / Day ${daysCount + 1}`;
@@ -10515,13 +10560,17 @@ function BeginOrAdvanceButton({ seats, gameStarted, daysCount, onBegin, onAdvanc
   }
 
   return (
-    <section className="parchment rounded-lg p-4">
+    <section className="parchment rounded-lg p-4 space-y-2">
+      <button onClick={onShowDaytimeReminders}
+        className="w-full py-2.5 rounded-lg text-sm font-semibold pill hover:border-amber-500 hover:text-amber-200 text-amber-300 transition">
+        ☀ Daytime reminders{nightChangesCount > 0 ? ` (${nightChangesCount})` : ''}
+      </button>
       <button onClick={onAdvance}
         className="w-full py-3 rounded-lg text-base font-semibold bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40">
         Go to night → ({nextLabel})
       </button>
       <p className="text-xs text-center text-stone-500 mt-2">
-        Currently on <span className="text-amber-300">{currentLabel}</span>. Past days are preserved as read-only tabs in the Town Square.
+        Currently on <span className="text-amber-300">{currentLabel}</span>. Past days are preserved as read-only tabs in the Town Square. Going to night clears the daytime reminders list.
       </p>
     </section>
   );
@@ -13505,6 +13554,73 @@ function PixiePickerModal({ data, onApply, onCancel }) {
   );
 }
 
+function NightChangesTable({ entries }) {
+  if (!entries || entries.length === 0) return null;
+  return (
+    <section className="parchment rounded-lg p-3 sm:p-4 border-amber-700/40">
+      <div className="flex items-baseline justify-between gap-2 mb-2">
+        <h3 className="text-amber-200 font-semibold text-sm">Night changes (since last Go to Night)</h3>
+        <span className="text-[10px] text-stone-500">{entries.length} entr{entries.length === 1 ? 'y' : 'ies'}</span>
+      </div>
+      <ul className="space-y-1">
+        {entries.map((e, i) => (
+          <li key={i} className="card rounded px-2.5 py-1.5 flex items-center gap-2 text-sm">
+            <span className="text-amber-200/80 text-xs w-7 text-center font-semibold">#{e.seatNum}</span>
+            <span className="flex-1 min-w-0 truncate">
+              {e.playerName || <span className="text-stone-500 italic">—</span>}
+            </span>
+            <span className={`text-xs uppercase tracking-wider font-bold ${e.type === 'died' ? 'text-red-300' : 'text-emerald-300'}`}>
+              {e.type === 'died' ? '☠ died' : '☆ revived'}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function DaytimeRemindersModal({ entries, onClose }) {
+  return (
+    <div className="fixed inset-0 z-50 bg-stone-950/85 flex items-start sm:items-center justify-center p-2 sm:p-4 overflow-y-auto">
+      <div className="parchment rounded-lg p-4 sm:p-5 max-w-lg w-full space-y-3 my-4 border-2 border-amber-600/70">
+        <div className="flex items-center gap-3">
+          <div className="text-3xl">☀</div>
+          <div className="flex-1 min-w-0">
+            <div className="text-[10px] uppercase tracking-wider text-amber-300">Morning announcement</div>
+            <div className="text-amber-200 text-lg font-bold leading-tight">Daytime reminders</div>
+            <div className="text-xs text-stone-400 mt-0.5">Read these out to the table. The list clears when you click Go to night.</div>
+          </div>
+        </div>
+        {(!entries || entries.length === 0) ? (
+          <div className="text-sm text-stone-400 italic text-center py-3">
+            No deaths or revives since the last Go to night.
+          </div>
+        ) : (
+          <ul className="space-y-1.5">
+            {entries.map((e, i) => (
+              <li key={i} className="card rounded p-2 flex items-center gap-2">
+                <span className="text-amber-200/80 text-xs w-7 text-center font-semibold">#{e.seatNum}</span>
+                <span className="flex-1 min-w-0 truncate text-sm">
+                  {e.playerName || <span className="text-stone-500 italic">—</span>}
+                </span>
+                <span className={`text-xs uppercase tracking-wider font-bold ${e.type === 'died' ? 'text-red-300' : 'text-emerald-300'}`}>
+                  {e.type === 'died' ? '☠ died' : '☆ revived'}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="pt-1">
+          <button onClick={onClose}
+            className="w-full py-2.5 rounded-lg text-sm font-bold bg-amber-600 hover:bg-amber-500 text-stone-950 shadow-lg shadow-amber-900/40">
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function CannibalChoosePickModal({ data, onApply, onCancel }) {
   const [picked, setPicked] = useState(null);
   if (!data) return null;
@@ -15745,7 +15861,7 @@ function NightPhaseSection({ seats, viewingDayIndex, daysSnapshots, gameStarted,
                               onStartPrompt, onCancelPrompt, onMarkDone, onClearAllPrompts,
                               scriptCharIds = [], onOpenLocalPrompt,
                               nominationsByDay = {}, onPromoteScarletWoman, onStartShowGrimoire,
-                              onOpenMoonchildCapture, onResolveMoonchild, onOpenEvilTwinModal, onOpenBarberFlow, onSweetheartPick,
+                              onOpenMoonchildCapture, onResolveMoonchild, onOpenEvilTwinModal, onOpenBarberFlow, onSweetheartPick, onShowDaytimeReminders,
                               onSendCeremony,
                               lastExecution = null }) {
   // Auto-expand when automation is on so the ST sees the interactive panel immediately.
