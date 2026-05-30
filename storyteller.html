@@ -3819,8 +3819,27 @@ function App() {
     const noms = dayRaw ? normalizeDayNoms(dayRaw).nominations : [];
     const aliveCount = (g.seats || []).filter(s => !s.isDead && s.actualRoleId).length;
     const { onBlock } = computeChoppingBlock(noms, aliveCount);
+    // Vortox win condition: "Each day, if no execution occurs, evil wins."
+    // Fire a corner popup when Go-to-Night happens with no execution AND a
+    // Vortox is in play (the ST decides whether to honor the trigger —
+    // e.g. dead Vortox, drunk/poisoned Vortox, jinxes).
+    const fireVortoxNoExecIfApplicable = () => {
+      const vortoxSeat = (g.seats || []).find(s => s.actualRoleId === 'vortox');
+      if (!vortoxSeat) return;
+      const vLabel = vortoxSeat.playerName
+        ? vortoxSeat.playerName + ' (seat #' + vortoxSeat.seatNum + ')'
+        : 'seat #' + vortoxSeat.seatNum;
+      const deadNote = vortoxSeat.isDead ? ' (note: the Vortox is dead — ability gone, this trigger does not apply)' : '';
+      addCornerPrompt({
+        kind: 'warn',
+        title: 'Vortox: no execution today',
+        body: 'No execution occurred on Day ' + (dayIdx + 1) + '. The Vortox (' + vLabel + ') wins for evil — announce the game end' + deadNote + '.',
+        actions: [{ label: 'OK', primary: true }],
+      });
+    };
     const proceed = () => {
       if (confirm(`Snapshot Night ${dayIdx} / Day ${dayIdx + 1} and move to Night ${dayIdx + 1} / Day ${dayIdx + 2}?`)) {
+        fireVortoxNoExecIfApplicable();
         advanceToNight();
       }
     };
@@ -3964,7 +3983,7 @@ function App() {
 
           advanceToNight();
         }},
-        { label: skipLabel, onClick: () => advanceToNight() },
+        { label: skipLabel, onClick: () => { fireVortoxNoExecIfApplicable(); advanceToNight(); } },
       ],
     });
   };
