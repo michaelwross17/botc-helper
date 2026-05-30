@@ -10930,8 +10930,9 @@ function computeFlowerGirlSuggestion(ctx) {
   const prev = (ctx?.viewingDayIndex || 0) - 1;
   if (prev < 0) return null;
   const raw = (ctx?.nominationsByDay || {})[prev];
-  if (!raw) return null;
-  const entry = normalizeDayNoms(raw);
+  // If there's no nominations entry for the previous day at all, default to
+  // "no demon vote" so the NO suggestion still fires (instead of going blank).
+  const entry = raw ? normalizeDayNoms(raw) : { demonVoted: false };
   return { value: !!entry.demonVoted, breakdown: { prevDayNumber: prev + 1 } };
 }
 
@@ -10943,8 +10944,9 @@ function computeTownCrierSuggestion(ctx) {
   const prev = (ctx?.viewingDayIndex || 0) - 1;
   if (prev < 0) return null;
   const raw = (ctx?.nominationsByDay || {})[prev];
-  if (!raw) return null;
-  const entry = normalizeDayNoms(raw);
+  // No nominations entry → no minion nominators by definition; still surface
+  // the NO suggestion instead of leaving the picker blank.
+  const entry = raw ? normalizeDayNoms(raw) : { nominations: [] };
   const prevSeats = (ctx?.daysSnapshots && ctx.daysSnapshots[prev]?.seats) || ctx?.seats || [];
   const seatById = Object.fromEntries(prevSeats.map(s => [s.seatNum, s]));
   const minionNominators = (entry.nominations || []).filter(n => {
